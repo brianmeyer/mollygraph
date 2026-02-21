@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE_DIR="$HOME/.graph-memory"
+STATE_DIR="${MOLLYGRAPH_HOME_DIR:-$HOME/.graph-memory}"
 VENV_DIR="$STATE_DIR/venv"
 
 mkdir -p "$STATE_DIR/models" "$STATE_DIR/training/gliner" "$STATE_DIR/logs" "$STATE_DIR/logs/maintenance" "$STATE_DIR/suggestions"
@@ -54,6 +54,7 @@ except Exception as exc:
 PY
 
 echo "Install complete."
-echo "Set GOOGLE_API_KEY and NEO4J_* env vars in $ROOT_DIR/.env (or shell env)."
+echo "Set NEO4J_* and at least one provider API key in $ROOT_DIR/.env (or shell env)."
+echo "Optional: set MOLLYGRAPH_HOME_DIR to isolate runtime state from ~/.graph-memory."
 echo "Optional: set MOLLYGRAPH_SPACY_ENRICHMENT=true to enable spaCy fallback enrichment."
 echo "Start service with: $ROOT_DIR/scripts/start.sh"

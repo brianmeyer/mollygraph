@@ -15,13 +15,13 @@ MollyGraph is a local knowledge graph system using:
 ## Installation
 
 ```bash
-cd ~/.openclaw/workspace/skills/graph-memory
+cd /Users/brianmeyer/mollygraph
 ./scripts/install.sh   # runtime venv at ~/.graph-memory/venv (Python 3.12)
 ./scripts/start.sh     # HTTP API on port 7422
 MOLLYGRAPH_SPACY_ENRICHMENT=true ~/.graph-memory/venv/bin/python service/mcp_server.py  # optional MCP on 7423
 ```
 
-## MCP Integration (like Graphiti/Mem0)
+## MCP Integration
 
 Add to OpenClaw config:
 
@@ -31,7 +31,7 @@ Add to OpenClaw config:
     "mollygraph": {
       "command": "python3",
       "args": [
-        "/Users/brianmeyer/.openclaw/workspace/skills/graph-memory/service/mcp_server.py"
+        "/Users/brianmeyer/mollygraph/service/mcp_server.py"
       ],
       "env": {
         "NEO4J_URI": "bolt://localhost:7687",
@@ -84,8 +84,8 @@ Set via env: `MOLLYGRAPH_API_KEY=your-key`
 ## Data Storage
 
 - Graph: Neo4j (Docker, port 7687)
-- Vectors: Zvec (embedded, `~/.openclaw/workspace/memory/zvec_collection`)
-- Queue: SQLite (`~/.openclaw/workspace/memory/extraction_queue.db`)
+- Vectors: Zvec (embedded, `~/.graph-memory/zvec_collection`)
+- Queue: SQLite (`~/.graph-memory/extraction_queue.db`)
 
 ## Architecture
 

@@ -29,6 +29,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+## Local env
+.env
+
 ## Testing
 .pytest_cache/
 .coverage

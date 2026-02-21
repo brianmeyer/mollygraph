@@ -1,88 +1,98 @@
-# MollyGraph v1 (OpenClaw-First)
+# MollyGraph
 
-**Status:** Active development  
-**Location:** `~/.openclaw/workspace/skills/graph-memory/`
+MCP-first memory layer for agents and RAG applications.
 
-## Quick Start
+## Integration Modes
+
+1. MCP adapter: connect MollyGraph tools to agent frameworks and MCP clients.
+2. Python SDK: call MollyGraph from RAG pipelines and application code.
+3. HTTP API: self-host the memory service for local or team deployments.
+
+## MCP Usage (Recommended for Agents)
+
+Install from source today:
 
 ```bash
-cd ~/.openclaw/workspace/skills/graph-memory
-./scripts/install.sh  # requires python3.12
-./scripts/start.sh    # starts HTTP API on port 7422
+pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk[mcp]"
 ```
 
-## Architecture
+Run MCP adapter:
 
-| Component | Technology | Port |
-|-----------|-----------|------|
-| HTTP API | FastAPI | 7422 |
-| MCP Server | Model Context Protocol | 7423 (optional) |
-| Graph DB | Neo4j | 7687 (Docker) |
-| Vector DB | Zvec (Alibaba) | Embedded |
-| Queue | SQLite | Embedded |
+```bash
+mollygraph-mcp --base-url http://localhost:7422 --api-key dev-key-change-in-production
+```
 
-## API Endpoints
+Example MCP server config:
 
-| Endpoint | Auth | Description |
-|----------|------|-------------|
-| `GET /health` | No | Health check |
-| `GET /stats` | Bearer | Graph statistics |
-| `POST /ingest` | Bearer | Queue text for extraction |
-| `GET /entity/{name}` | Bearer | Get entity facts |
-| `GET /query` | Bearer | Natural language query |
-| `POST /audit` | Bearer | Run nightly/weekly relationship audit |
-| `GET /suggestions/digest` | Bearer | View schema/hotspot suggestions |
-| `POST /train/gliner` | Bearer | Trigger GLiNER training cycle |
-| `GET /train/status` | Bearer | GLiNER training status |
-| `POST /maintenance/run` | Bearer | Trigger full maintenance cycle |
+```json
+{
+  "mcpServers": {
+    "mollygraph": {
+      "command": "mollygraph-mcp",
+      "args": [
+        "--base-url",
+        "http://localhost:7422"
+      ],
+      "env": {
+        "MOLLYGRAPH_API_KEY": "dev-key-change-in-production"
+      }
+    }
+  }
+}
+```
 
-## MCP Tools (like Graphiti/Mem0)
+Tools exposed by MCP adapter:
+- `add_episode`
+- `search_facts`
+- `search_nodes`
+- `get_entity_context`
+- `get_queue_status`
+- `run_audit`
+- `get_training_status`
 
-- `add_episode` - Queue text for extraction
-- `search_facts` - Search graph relationships
-- `search_nodes` - Find entities by name
-- `get_entity_context` - Get entity with 2-hop context
-- `get_queue_status` - Check queue depth
-- `run_audit` - Trigger graph audit from MCP
-- `get_training_status` - GLiNER training status snapshot
+## Python SDK Usage (RAG + App Code)
 
-## Files
+Install:
 
-### Service (`service/`)
-- `main.py` - FastAPI HTTP service
-- `mcp_server.py` - Standalone MCP server
-- `config.py` - Configuration
-- `memory/` - Graph and vector operations
-- `extraction/` - GLiNER2 pipeline and queue
-- `maintenance/` - Audit and cleanup
+```bash
+pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk"
+```
 
-### Documentation
-- `SKILL.md` - Skill documentation
-- `README.md` - This file
-- `.env.example` - Runtime env template
-- `docs/ARCHITECTURE.md` - System architecture and flow
-- `CONTRIBUTING.md` - Setup and contribution guide
+Use:
 
-### SDK
-- `sdk/mollygraph_sdk/` - Thin Python SDK (`ingest/query/get_entity/run_audit/train_gliner`)
+```python
+from mollygraph_sdk import MollyGraphClient
 
-### Plans (Archived)
-- `archive/old-plans/` - Old design documents
+client = MollyGraphClient(
+    base_url="http://localhost:7422",
+    api_key="dev-key-change-in-production",
+)
 
-## Current State
+print(client.ingest("Brian works at Databricks."))
+print(client.query("What do we know about Brian?"))
+client.close()
+```
 
-- ✅ Bi-temporal graph (observed_at, valid_at)
-- ✅ Zvec vector search (HNSW index)
-- ✅ GLiNER2 extraction (local, no API cost)
-- ✅ Optional spaCy enrichment fallback (`MOLLYGRAPH_SPACY_ENRICHMENT=true`)
-- ✅ API authentication (Bearer tokens)
-- ✅ Async job queue (SQLite WAL)
-- ✅ LLM-backed audit with deterministic cleanup
-- ✅ Suggestion digest + auto-adoption loop
-- ✅ GLiNER training pipeline with benchmark gate
+## Self-Host API Service
 
-## Next Steps
+```bash
+cd /Users/brianmeyer/mollygraph
+cp .env.example .env
+docker compose -f docker-compose.neo4j.yml up -d
+./scripts/install.sh
+./scripts/start.sh
+```
 
-1. Migration from old Molly data
-2. iMessage integration
-3. Voice skill (Pipecat)
+Service defaults:
+- API: `http://127.0.0.1:7422`
+- Runtime state: `~/.graph-memory`
+- Override state root with `MOLLYGRAPH_HOME_DIR=/custom/path`
+
+## HTTP API Contract
+
+Canonical endpoints are stable and legacy aliases are maintained for compatibility:
+- `POST /ingest` (`POST /extract`)
+- `POST /audit` (`POST /audit/run`, `POST /maintenance/audit`)
+- `GET /suggestions/digest` (`GET /suggestions_digest`)
+- `POST /train/gliner` (`POST /training/gliner`)
+- `GET /train/status` (`GET /training/status`)

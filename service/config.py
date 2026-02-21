@@ -5,13 +5,24 @@ import os
 from pathlib import Path
 
 # ── Core paths ────────────────────────────────────────────────────────────────
-GRAPH_MEMORY_DIR = Path.home() / ".graph-memory"
+GRAPH_MEMORY_DIR = Path(
+    os.environ.get("MOLLYGRAPH_HOME_DIR", str(Path.home() / ".graph-memory"))
+).expanduser()
 MODELS_DIR        = GRAPH_MEMORY_DIR / "models"
 TRAINING_DIR      = GRAPH_MEMORY_DIR / "training" / "gliner"
 LOGS_DIR          = GRAPH_MEMORY_DIR / "logs"
 MAINTENANCE_DIR   = LOGS_DIR / "maintenance"
 SUGGESTIONS_DIR   = GRAPH_MEMORY_DIR / "suggestions"
 STATE_FILE        = GRAPH_MEMORY_DIR / "state.json"
+QUEUE_DB_PATH     = Path(
+    os.environ.get("MOLLYGRAPH_QUEUE_DB", str(GRAPH_MEMORY_DIR / "extraction_queue.db"))
+).expanduser()
+SQLITE_VEC_DB_PATH = Path(
+    os.environ.get("MOLLYGRAPH_SQLITE_VEC_DB", str(GRAPH_MEMORY_DIR / "vectors.db"))
+).expanduser()
+ZVEC_COLLECTION_DIR = Path(
+    os.environ.get("MOLLYGRAPH_ZVEC_DIR", str(GRAPH_MEMORY_DIR / "zvec_collection"))
+).expanduser()
 
 # User-extensible relation schema (optional YAML file)
 RELATION_SCHEMA_FILE: Path | None = (
@@ -72,7 +83,17 @@ GLINER_BENCHMARK_EVAL_RATIO        = 0.2
 GLINER_BENCHMARK_THRESHOLD         = 0.4
 
 # ── Ensure runtime dirs exist ────────────────────────────────────────────────
-for _d in (GRAPH_MEMORY_DIR, MODELS_DIR, TRAINING_DIR, LOGS_DIR, MAINTENANCE_DIR, SUGGESTIONS_DIR):
+for _d in (
+    GRAPH_MEMORY_DIR,
+    MODELS_DIR,
+    TRAINING_DIR,
+    LOGS_DIR,
+    MAINTENANCE_DIR,
+    SUGGESTIONS_DIR,
+    QUEUE_DB_PATH.parent,
+    SQLITE_VEC_DB_PATH.parent,
+    ZVEC_COLLECTION_DIR.parent,
+):
     try:
         _d.mkdir(parents=True, exist_ok=True)
     except OSError:

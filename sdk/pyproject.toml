@@ -4,13 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mollygraph-sdk"
-version = "0.1.0"
-description = "Thin Python SDK for MollyGraph HTTP API"
+version = "1.0.0"
+description = "Python SDK and MCP adapter for MollyGraph"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "httpx>=0.28,<0.29",
 ]
+
+[project.optional-dependencies]
+mcp = [
+  "mcp",
+]
+
+[project.scripts]
+mollygraph-mcp = "mollygraph_sdk.mcp_proxy:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

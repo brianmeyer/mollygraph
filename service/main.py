@@ -267,8 +267,11 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     )
 
 
-@app.post("/ingest")
-@app.post("/extract")  # Legacy alias kept for older OpenClaw/Molly tool configs.
+@app.post("/ingest", operation_id="post_ingest")
+@app.post(
+    "/extract",
+    operation_id="post_extract_legacy",
+)  # Legacy alias kept for older OpenClaw/Molly tool configs.
 async def ingest(
     content: str,
     source: str = "manual",
@@ -356,9 +359,9 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
     )
 
 
-@app.post("/audit")
-@app.post("/audit/run")  # Legacy alias for older action-style mappings.
-@app.post("/maintenance/audit")  # Legacy alias from archived router naming.
+@app.post("/audit", operation_id="post_audit")
+@app.post("/audit/run", operation_id="post_audit_run_legacy")  # Legacy alias for older action-style mappings.
+@app.post("/maintenance/audit", operation_id="post_maintenance_audit_legacy")  # Legacy alias from archived router naming.
 async def audit(req: AuditRequest, _api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     schedule = (req.schedule or "nightly").strip().lower()
     if schedule not in {"nightly", "weekly"}:
@@ -372,8 +375,8 @@ async def audit(req: AuditRequest, _api_key: str = Depends(verify_api_key)) -> d
     )
 
 
-@app.get("/suggestions/digest")
-@app.get("/suggestions_digest")  # Legacy underscore alias.
+@app.get("/suggestions/digest", operation_id="get_suggestions_digest")
+@app.get("/suggestions_digest", operation_id="get_suggestions_digest_legacy")  # Legacy underscore alias.
 async def suggestions_digest(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     digest = build_suggestion_digest()
     return {
@@ -383,14 +386,14 @@ async def suggestions_digest(_api_key: str = Depends(verify_api_key)) -> dict[st
     }
 
 
-@app.post("/train/gliner")
-@app.post("/training/gliner")  # Legacy alias for train namespace drift.
+@app.post("/train/gliner", operation_id="post_train_gliner")
+@app.post("/training/gliner", operation_id="post_training_gliner_legacy")  # Legacy alias for train namespace drift.
 async def train_gliner(req: TrainRequest, _api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return await run_gliner_finetune_pipeline(force=req.force)
 
 
-@app.get("/train/status")
-@app.get("/training/status")  # Legacy alias for train namespace drift.
+@app.get("/train/status", operation_id="get_train_status")
+@app.get("/training/status", operation_id="get_training_status_legacy")  # Legacy alias for train namespace drift.
 async def train_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return {"gliner": get_gliner_stats()}
 

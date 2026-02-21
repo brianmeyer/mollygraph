@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_DIR="$ROOT_DIR/service"
-STATE_DIR="$HOME/.graph-memory"
+STATE_DIR="${MOLLYGRAPH_HOME_DIR:-$HOME/.graph-memory}"
 VENV_DIR="$STATE_DIR/venv"
 LOG_FILE="$STATE_DIR/logs/service.log"
 

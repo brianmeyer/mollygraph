@@ -9,6 +9,8 @@ from typing import List, Dict, Optional
 from pathlib import Path
 import logging
 
+import config as service_config
+
 log = logging.getLogger(__name__)
 
 # Try to import Zvec
@@ -52,12 +54,16 @@ class VectorStoreBackend(ABC):
 class SqliteVecBackend(VectorStoreBackend):
     """sqlite-vec implementation."""
     
-    def __init__(self, db_path: str = "~/.openclaw/workspace/memory/vectors.db"):
+    def __init__(self, db_path: str | Path | None = None):
         import sqlite3
         import sqlite_vec
         import numpy as np
         
-        self.db_path = Path(db_path).expanduser()
+        self.db_path = (
+            Path(db_path).expanduser()
+            if db_path is not None
+            else service_config.SQLITE_VEC_DB_PATH
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.np = np
         
@@ -180,11 +186,14 @@ class SqliteVecBackend(VectorStoreBackend):
 class ZvecBackend(VectorStoreBackend):
     """Zvec implementation using proper API."""
     
-    def __init__(self, db_path: str = "~/.openclaw/workspace/memory/zvec_collection"):
-        from pathlib import Path
+    def __init__(self, db_path: str | Path | None = None):
         import numpy as np
         
-        self.db_path = Path(db_path).expanduser()
+        self.db_path = (
+            Path(db_path).expanduser()
+            if db_path is not None
+            else service_config.ZVEC_COLLECTION_DIR
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.np = np
         

@@ -8,7 +8,7 @@
 - Graph: Neo4j (`service/memory/bitemporal_graph.py` for ingest/query and `service/memory/graph.py` for audit/training ops)
 - Vector: Zvec preferred with sqlite-vec fallback (`service/memory/vector_store.py`)
 - Queue: SQLite WAL (`service/extraction/queue.py`)
-- State: `~/.graph-memory/state.json` (GLiNER training loop)
+- State: `~/.graph-memory/state.json` (override root via `MOLLYGRAPH_HOME_DIR`)
 
 ## Processing flow
 1. `POST /ingest` enqueues an `ExtractionJob`.

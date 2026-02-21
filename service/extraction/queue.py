@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Callable
 from contextlib import contextmanager
 
+import config as service_config
 from memory.models import ExtractionJob
 
 log = logging.getLogger(__name__)
@@ -27,8 +28,12 @@ class ExtractionQueue:
     - Minimal resource usage on Mac Mini
     """
     
-    def __init__(self, db_path: str = "~/.openclaw/workspace/memory/extraction_queue.db"):
-        self.db_path = Path(db_path).expanduser()
+    def __init__(self, db_path: str | Path | None = None):
+        self.db_path = (
+            Path(db_path).expanduser()
+            if db_path is not None
+            else service_config.QUEUE_DB_PATH
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
     
