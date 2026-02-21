@@ -1,21 +1,64 @@
 # MollyGraph
 
-Local-first memory layer for agents and RAG applications.
+Memory that gets better as your agents run.
 
-MollyGraph can be used as:
-- an MCP server adapter (`mollygraph-mcp`)
-- a Python SDK (`mollygraph-sdk`)
-- a self-hosted HTTP memory service
+MollyGraph is a local-first memory layer for agentic systems and RAG apps.  
+Use it as MCP, Python SDK, or a self-hosted API.
 
-## Why MollyGraph
+## Why It Hits
 
-- Local-first by default (no cloud dependency required).
-- Model-agnostic runtime configuration.
-- Optional local model support (Ollama, sentence-transformers).
-- Optional LLM audit pipeline (disabled by default).
-- Stable API contract with legacy aliases preserved.
+- Drop-in memory for agents and tools via MCP.
+- Local by default. No cloud dependency required.
+- Model-agnostic configuration (local + cloud optional).
+- Self-improving extraction pipeline with benchmark-gated model upgrades.
+- Continuous graph-quality suggestions for better entities + relationships.
 
-## Quick Start (Local Service)
+## The Good Stuff
+
+### 1) Self-evolving extraction (GLiNER)
+
+MollyGraph continuously accumulates real episodes into training data, then runs a fine-tune cycle:
+
+- accumulates examples from your own graph history
+- chooses training strategy (`lora` vs `full`) based on data and prior performance
+- benchmarks candidate vs active model on held-out eval data
+- deploys only if improvement clears threshold (`GLINER_FINETUNE_BENCHMARK_THRESHOLD`)
+
+Endpoints:
+- `POST /train/gliner`
+- `GET /train/status`
+
+### 2) Entity + relationship improvement suggestions
+
+MollyGraph tracks schema misses and relationship uncertainty in production:
+
+- relationship fallback events (unknown relation -> `RELATED_TO`)
+- `RELATED_TO` hotspots that should be upgraded to precise relation types
+- suggestion digests for nightly review
+- optional auto-adoption rules over repeated patterns
+
+Endpoint:
+- `GET /suggestions/digest`
+
+### 3) Local-first quality loop
+
+Deterministic cleanup + optional LLM audit:
+
+- orphan/self-reference cleanup
+- strength decay maintenance
+- optional LLM audit pipeline (`AUDIT_LLM_ENABLED=false` by default)
+- provider chain can be local (`ollama`) or cloud add-ons
+
+Endpoint:
+- `POST /audit`
+
+## Integration Modes
+
+1. MCP adapter (`mollygraph-mcp`) for agents
+2. Python SDK (`mollygraph-sdk`) for app/RAG code
+3. HTTP API for self-hosting
+
+## Quick Start (Self-Hosted)
 
 ```bash
 cd /Users/brianmeyer/mollygraph
@@ -25,12 +68,12 @@ docker compose -f docker-compose.neo4j.yml up -d
 ./scripts/start.sh
 ```
 
-Service defaults:
+Defaults:
 - API: `http://127.0.0.1:7422`
 - Runtime state: `~/.graph-memory`
 - API key: `dev-key-change-in-production`
 
-## Use as MCP
+## Use As MCP
 
 Install:
 
@@ -44,22 +87,6 @@ Run:
 mollygraph-mcp --base-url http://localhost:7422 --api-key dev-key-change-in-production
 ```
 
-Example MCP config:
-
-```json
-{
-  "mcpServers": {
-    "mollygraph": {
-      "command": "mollygraph-mcp",
-      "args": ["--base-url", "http://localhost:7422"],
-      "env": {
-        "MOLLYGRAPH_API_KEY": "dev-key-change-in-production"
-      }
-    }
-  }
-}
-```
-
 MCP tools:
 - `add_episode`
 - `search_facts`
@@ -69,7 +96,7 @@ MCP tools:
 - `run_audit`
 - `get_training_status`
 
-## Use as Python SDK
+## Use As Python SDK
 
 Install:
 
@@ -82,28 +109,24 @@ Example:
 ```python
 from mollygraph_sdk import MollyGraphClient
 
-client = MollyGraphClient(
-    base_url="http://localhost:7422",
-    api_key="dev-key-change-in-production",
-)
-
+client = MollyGraphClient(base_url="http://localhost:7422", api_key="dev-key-change-in-production")
 client.ingest("Brian works at Databricks.", source="manual")
 print(client.query("What do we know about Brian?"))
 client.close()
 ```
 
-## Local Model Configuration
+## Local Model Options
 
 Embeddings:
-- `MOLLYGRAPH_EMBEDDING_BACKEND=hash` (default, no extra model runtime)
+- `MOLLYGRAPH_EMBEDDING_BACKEND=hash` (default, dependency-free)
 - `MOLLYGRAPH_EMBEDDING_BACKEND=sentence-transformers`
 - `MOLLYGRAPH_EMBEDDING_BACKEND=ollama`
 
-Embedding model vars:
+Models:
 - `MOLLYGRAPH_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`
 - `MOLLYGRAPH_OLLAMA_EMBED_MODEL=nomic-embed-text`
 
-Optional local LLM audit with Ollama:
+Optional local audit with Ollama:
 
 ```env
 AUDIT_LLM_ENABLED=true
@@ -112,14 +135,18 @@ AUDIT_MODEL_LOCAL=llama3.1:8b
 OLLAMA_CHAT_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
-## Optional Cloud LLM Add-ons
+## Optional Cloud Add-ons
 
-Cloud providers are optional and off-path by default.
-Set `AUDIT_LLM_ENABLED=true`, choose `AUDIT_PROVIDER_ORDER`, then provide relevant API keys.
+Cloud providers are optional, not required for core operation.
+Enable only if you want them:
+
+- set `AUDIT_LLM_ENABLED=true`
+- set `AUDIT_PROVIDER_ORDER`
+- configure provider keys in `.env`
 
 ## HTTP API Contract
 
-Canonical endpoints:
+Canonical:
 - `GET /health`
 - `GET /stats`
 - `POST /ingest`
@@ -138,19 +165,3 @@ Legacy aliases retained:
 - `GET /suggestions_digest` -> `GET /suggestions/digest`
 - `POST /training/gliner` -> `POST /train/gliner`
 - `GET /training/status` -> `GET /train/status`
-
-## Development
-
-Run tests:
-
-```bash
-MOLLYGRAPH_TEST_MODE=1 ~/.graph-memory/venv/bin/pytest -q
-```
-
-## Repository Layout
-
-- `service/`: FastAPI service and core memory pipeline
-- `sdk/`: Python SDK + MCP adapter package
-- `scripts/`: install/start scripts
-- `tests/`: smoke + integration API contract tests
-- `docs/`: architecture docs
