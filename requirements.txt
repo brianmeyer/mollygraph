@@ -1,0 +1,17 @@
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+mcp
+neo4j==5.*
+httpx==0.28.*
+pydantic==2.*
+python-dotenv==1.*
+pyyaml==6.*
+gliner2
+zvec
+spacy<3.9
+torch
+transformers
+peft
+accelerate
+datasets
+pytest==8.*
