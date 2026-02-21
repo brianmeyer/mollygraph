@@ -39,25 +39,27 @@ GOOGLE_API_KEY      = os.environ.get("GOOGLE_API_KEY", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 MOONSHOT_API_KEY    = os.environ.get("MOONSHOT_API_KEY", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
-
-OPENCLAW_GATEWAY_URL = os.environ.get("OPENCLAW_GATEWAY_URL", "ws://127.0.0.1:18789")
-OPENCLAW_GATEWAY_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY", "")
 
 # ── Audit models ──────────────────────────────────────────────────────────────
-# OpenClaw-first defaults: lightweight model chain with explicit fallback order.
-AUDIT_MODEL_NIGHTLY = os.environ.get("AUDIT_MODEL_NIGHTLY", "gemini-2.5-flash-lite")
-AUDIT_MODEL_PRETRAIN = os.environ.get("AUDIT_MODEL_PRETRAIN", "kimi-k2.5")
-AUDIT_MODEL_WEEKLY = os.environ.get("AUDIT_MODEL_WEEKLY", "gemini-2.5-flash-lite")
+# Local-first defaults: LLM audit is optional and disabled by default.
+AUDIT_LLM_ENABLED = os.environ.get("AUDIT_LLM_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUDIT_MODEL_NIGHTLY = os.environ.get("AUDIT_MODEL_NIGHTLY", "llama3.1:8b")
+AUDIT_MODEL_PRETRAIN = os.environ.get("AUDIT_MODEL_PRETRAIN", "llama3.1:8b")
+AUDIT_MODEL_WEEKLY = os.environ.get("AUDIT_MODEL_WEEKLY", "llama3.1:8b")
+AUDIT_MODEL_LOCAL = os.environ.get("AUDIT_MODEL_LOCAL", "llama3.1:8b")
 
 # Provider/model chain used by audit fallback registry.
 AUDIT_MODEL_PRIMARY = os.environ.get("AUDIT_MODEL_PRIMARY", AUDIT_MODEL_NIGHTLY)
-AUDIT_MODEL_SECONDARY = os.environ.get("AUDIT_MODEL_SECONDARY", "kimi-k2.5")
+AUDIT_MODEL_SECONDARY = os.environ.get("AUDIT_MODEL_SECONDARY", "llama3.1:8b")
 AUDIT_MODEL_TERTIARY = os.environ.get("AUDIT_MODEL_TERTIARY", "gpt-oss-120b")
-AUDIT_PROVIDER_ORDER = os.environ.get("AUDIT_PROVIDER_ORDER", "gemini,kimi,groq")
+AUDIT_PROVIDER_ORDER = os.environ.get("AUDIT_PROVIDER_ORDER", "none")
 
 GEMINI_BASE_URL    = "https://generativelanguage.googleapis.com/v1beta/openai"
 MOONSHOT_BASE_URL  = os.environ.get("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
 GROQ_BASE_URL      = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+OLLAMA_BASE_URL    = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_CHAT_BASE_URL = os.environ.get("OLLAMA_CHAT_BASE_URL", f"{OLLAMA_BASE_URL}/v1")
 
 # ── Service ───────────────────────────────────────────────────────────────────
 HOST = os.environ.get("GRAPH_MEMORY_HOST", "127.0.0.1")
@@ -68,6 +70,9 @@ VECTOR_BACKEND = os.environ.get("MOLLYGRAPH_VECTOR_BACKEND", "zvec")
 SPACY_ENRICHMENT = os.environ.get("MOLLYGRAPH_SPACY_ENRICHMENT", "0").strip().lower() in {"1", "true", "yes", "on"}
 SPACY_MODEL = os.environ.get("MOLLYGRAPH_SPACY_MODEL", "en_core_web_sm")
 SPACY_MIN_GLINER_ENTITIES = int(os.environ.get("MOLLYGRAPH_SPACY_MIN_GLINER_ENTITIES", "2"))
+EMBEDDING_BACKEND = os.environ.get("MOLLYGRAPH_EMBEDDING_BACKEND", "hash").strip().lower()
+EMBEDDING_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+OLLAMA_EMBED_MODEL = os.environ.get("MOLLYGRAPH_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")

@@ -34,7 +34,7 @@ security = HTTPBearer(auto_error=False)
 
 app = FastAPI(
     title="MollyGraph",
-    description="OpenClaw-first graph + vector memory service",
+    description="Local-first graph + vector memory service",
     version="1.0.0",
 )
 
@@ -271,7 +271,7 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
 @app.post(
     "/extract",
     operation_id="post_extract_legacy",
-)  # Legacy alias kept for older OpenClaw/Molly tool configs.
+)  # Legacy alias kept for older integrations.
 async def ingest(
     content: str,
     source: str = "manual",

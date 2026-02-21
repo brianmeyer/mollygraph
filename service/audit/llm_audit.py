@@ -1,12 +1,7 @@
-"""LLM-powered relationship audit pipeline.
+"""Relationship audit pipeline.
 
-Nightly schedule (Mon-Sat):
-- Kimi (Moonshot) for quality audit before LoRA training
-- Falls back to Gemini if Kimi unavailable
-
-Weekly schedule (Sunday):
-- Opus (Anthropic) for deep audit before full training
-- Falls back to Gemini if Anthropic key is absent.
+Local-only mode is the default. LLM-backed audit is optional and can be
+enabled with provider/model configuration (including local Ollama models).
 """
 from __future__ import annotations
 
@@ -156,173 +151,104 @@ def parse_verdicts(raw: str, batch_len: int) -> list[dict[str, Any]]:
     return verdicts
 
 
+async def _invoke_openai_compatible(
+    provider: str,
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str = "",
+    require_api_key: bool = True,
+    max_tokens: int = 4096,
+) -> tuple[str, int]:
+    import httpx
+
+    if require_api_key and not api_key:
+        raise RuntimeError(f"{provider} API key is not set")
+
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    started = time.monotonic()
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    async with httpx.AsyncClient(timeout=180) as client:
+        for attempt in range(3):
+            try:
+                resp = await client.post(endpoint, headers=headers, json=body)
+                if resp.status_code >= 400:
+                    log.warning("%s audit HTTP %s: %s", provider, resp.status_code, resp.text[:500])
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                return str(content), int((time.monotonic() - started) * 1000)
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2 * (attempt + 1))
+                log.debug("%s audit retry %d: %s", provider, attempt + 1, exc)
+
+    return "", int((time.monotonic() - started) * 1000)
+
+
 async def _invoke_gemini(prompt: str, model: str) -> tuple[str, int]:
-    import httpx
-
-    if not config.GOOGLE_API_KEY:
-        raise RuntimeError("GOOGLE_API_KEY is not set")
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 8192,
-    }
-
-    started = time.monotonic()
-    async with httpx.AsyncClient(timeout=180) as client:
-        for attempt in range(3):
-            try:
-                resp = await client.post(
-                    f"{config.GEMINI_BASE_URL}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {config.GOOGLE_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
-                )
-                if resp.status_code >= 400:
-                    log.warning("Gemini audit HTTP %s: %s", resp.status_code, resp.text[:500])
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                latency_ms = int((time.monotonic() - started) * 1000)
-                return str(content), latency_ms
-            except Exception as exc:
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(2 * (attempt + 1))
-                log.debug("Gemini audit retry %d: %s", attempt + 1, exc)
-
-    return "", int((time.monotonic() - started) * 1000)
+    return await _invoke_openai_compatible(
+        provider="gemini",
+        prompt=prompt,
+        model=model,
+        base_url=config.GEMINI_BASE_URL,
+        api_key=config.GOOGLE_API_KEY,
+        require_api_key=True,
+        max_tokens=8192,
+    )
 
 
-async def _invoke_kimi(prompt: str, model: str) -> tuple[str, int]:
-    """Invoke Kimi via OpenClaw gateway first, then Moonshot API."""
-    import httpx
-
-    gateway_url = config.OPENCLAW_GATEWAY_URL
-    gateway_token = config.OPENCLAW_GATEWAY_TOKEN
-
-    http_url = gateway_url.replace("ws://", "http://").replace("wss://", "https://")
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 8192,
-    }
-
-    started = time.monotonic()
-    async with httpx.AsyncClient(timeout=180) as client:
-        # OpenClaw gateway path.
-        for attempt in range(2):
-            try:
-                headers = {"Content-Type": "application/json"}
-                if gateway_token:
-                    headers["Authorization"] = f"Bearer {gateway_token}"
-                resp = await client.post(
-                    f"{http_url}/agent/turn",
-                    headers=headers,
-                    json=body,
-                )
-                if resp.status_code >= 400:
-                    log.warning("Kimi gateway HTTP %s: %s", resp.status_code, resp.text[:500])
-                resp.raise_for_status()
-                data = resp.json()
-                content = data.get("content") or data.get("message", {}).get("content", "")
-                return str(content), int((time.monotonic() - started) * 1000)
-            except Exception as exc:
-                if attempt == 1:
-                    log.debug("Kimi gateway unavailable; trying Moonshot fallback: %s", exc)
-                else:
-                    await asyncio.sleep(1)
-
-        # Moonshot API fallback.
-        if not config.MOONSHOT_API_KEY:
-            raise RuntimeError("MOONSHOT_API_KEY is not set and OpenClaw gateway failed")
-
-        moonshot_body = {
-            "model": model,
-            "messages": body["messages"],
-            "temperature": 0.1,
-            "max_tokens": 4096,
-        }
-        for attempt in range(3):
-            try:
-                resp = await client.post(
-                    f"{config.MOONSHOT_BASE_URL}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {config.MOONSHOT_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=moonshot_body,
-                )
-                if resp.status_code >= 400:
-                    log.warning("Moonshot audit HTTP %s: %s", resp.status_code, resp.text[:500])
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return str(content), int((time.monotonic() - started) * 1000)
-            except Exception as exc:
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(2 * (attempt + 1))
-                log.debug("Moonshot retry %d: %s", attempt + 1, exc)
-
-    return "", int((time.monotonic() - started) * 1000)
+async def _invoke_moonshot(prompt: str, model: str) -> tuple[str, int]:
+    return await _invoke_openai_compatible(
+        provider="moonshot",
+        prompt=prompt,
+        model=model,
+        base_url=config.MOONSHOT_BASE_URL,
+        api_key=config.MOONSHOT_API_KEY,
+        require_api_key=True,
+        max_tokens=4096,
+    )
 
 
 async def _invoke_groq(prompt: str, model: str) -> tuple[str, int]:
-    import httpx
-
-    if not config.GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not set")
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 4096,
-    }
-
-    started = time.monotonic()
-    async with httpx.AsyncClient(timeout=180) as client:
-        for attempt in range(3):
-            try:
-                resp = await client.post(
-                    f"{config.GROQ_BASE_URL}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {config.GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
-                )
-                if resp.status_code >= 400:
-                    log.warning("Groq audit HTTP %s: %s", resp.status_code, resp.text[:500])
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return str(content), int((time.monotonic() - started) * 1000)
-            except Exception as exc:
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(2 * (attempt + 1))
-                log.debug("Groq retry %d: %s", attempt + 1, exc)
-
-    return "", int((time.monotonic() - started) * 1000)
+    return await _invoke_openai_compatible(
+        provider="groq",
+        prompt=prompt,
+        model=model,
+        base_url=config.GROQ_BASE_URL,
+        api_key=config.GROQ_API_KEY,
+        require_api_key=True,
+        max_tokens=4096,
+    )
 
 
-async def _invoke_opus(prompt: str, model: str) -> tuple[str, int]:
+async def _invoke_ollama(prompt: str, model: str) -> tuple[str, int]:
+    return await _invoke_openai_compatible(
+        provider="ollama",
+        prompt=prompt,
+        model=model,
+        base_url=config.OLLAMA_CHAT_BASE_URL,
+        api_key=config.OLLAMA_API_KEY,
+        require_api_key=False,
+        max_tokens=4096,
+    )
+
+
+async def _invoke_anthropic(prompt: str, model: str) -> tuple[str, int]:
     import httpx
 
     if not config.ANTHROPIC_API_KEY:
@@ -355,7 +281,7 @@ async def _invoke_opus(prompt: str, model: str) -> tuple[str, int]:
                     json=body,
                 )
                 if resp.status_code >= 400:
-                    log.warning("Opus audit HTTP %s: %s", resp.status_code, resp.text[:500])
+                    log.warning("Anthropic audit HTTP %s: %s", resp.status_code, resp.text[:500])
                 resp.raise_for_status()
                 data = resp.json()
                 blocks = data.get("content", [])
@@ -371,113 +297,132 @@ async def _invoke_opus(prompt: str, model: str) -> tuple[str, int]:
                 if attempt == 2:
                     raise
                 await asyncio.sleep(3 * (attempt + 1))
-                log.debug("Opus audit retry %d: %s", attempt + 1, exc)
+                log.debug("Anthropic audit retry %d: %s", attempt + 1, exc)
 
     return "", int((time.monotonic() - started) * 1000)
 
 
 async def call_audit_model(prompt: str, schedule: str, model_override: str | None = None) -> dict[str, Any]:
-    """Call audit model using configured lightweight fallback chain."""
+    """Call audit model using configured provider chain."""
     normalized = schedule.strip().lower()
+    order = [p.strip().lower() for p in str(config.AUDIT_PROVIDER_ORDER).split(",") if p.strip()]
+    if not order:
+        order = ["none"]
+
+    def _default_model_for(provider: str) -> str:
+        default_model = config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_NIGHTLY
+        gemini_model = (config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_PRIMARY) or default_model
+        provider_to_model = {
+            "gemini": gemini_model,
+            "moonshot": config.AUDIT_MODEL_SECONDARY or "kimi-k2.5",
+            "kimi": config.AUDIT_MODEL_SECONDARY or "kimi-k2.5",
+            "groq": config.AUDIT_MODEL_TERTIARY or "gpt-oss-120b",
+            "anthropic": config.AUDIT_MODEL_WEEKLY or "claude-3-5-sonnet-latest",
+            "opus": config.AUDIT_MODEL_WEEKLY or "claude-3-opus-latest",
+            "ollama": config.AUDIT_MODEL_LOCAL or default_model,
+            "local": config.AUDIT_MODEL_LOCAL or default_model,
+        }
+        return str(provider_to_model.get(provider) or default_model).strip()
+
+    async def _run_provider(provider: str, model: str) -> tuple[str, int, str]:
+        if provider in {"gemini"}:
+            content, latency_ms = await _invoke_gemini(prompt, model)
+            return content, latency_ms, "gemini"
+        if provider in {"moonshot", "kimi"}:
+            content, latency_ms = await _invoke_moonshot(prompt, model)
+            return content, latency_ms, "moonshot"
+        if provider in {"groq"}:
+            content, latency_ms = await _invoke_groq(prompt, model)
+            return content, latency_ms, "groq"
+        if provider in {"anthropic", "opus"}:
+            content, latency_ms = await _invoke_anthropic(prompt, model)
+            return content, latency_ms, "anthropic"
+        if provider in {"ollama", "local"}:
+            content, latency_ms = await _invoke_ollama(prompt, model)
+            return content, latency_ms, "ollama"
+        raise RuntimeError(f"Unsupported audit provider: {provider}")
+
+    if not config.AUDIT_LLM_ENABLED and not model_override:
+        return {
+            "provider": "disabled",
+            "model": "",
+            "latency_ms": 0,
+            "content": "",
+            "fallback": "",
+            "skipped": True,
+        }
 
     if model_override:
-        lowered = model_override.lower()
-        if "kimi" in lowered:
-            content, latency_ms = await _invoke_kimi(prompt, model_override)
+        raw_override = model_override.strip()
+        lowered = raw_override.lower()
+        provider = ""
+        model = raw_override
+        if "/" in raw_override:
+            maybe_provider, maybe_model = raw_override.split("/", 1)
+            if maybe_provider.strip().lower() in {"gemini", "moonshot", "kimi", "groq", "anthropic", "opus", "ollama", "local"}:
+                provider = maybe_provider.strip().lower()
+                model = maybe_model.strip()
+
+        if not provider:
+            if "ollama" in lowered or lowered.startswith("local:"):
+                provider = "ollama"
+            elif "moonshot" in lowered or "kimi" in lowered:
+                provider = "moonshot"
+            elif "groq" in lowered:
+                provider = "groq"
+            elif "claude" in lowered or "anthropic" in lowered or "opus" in lowered:
+                provider = "anthropic"
+            elif "gemini" in lowered:
+                provider = "gemini"
+            else:
+                provider = next((p for p in order if p not in {"none", "disabled"}), "ollama")
+
+        if provider in {"none", "disabled"}:
             return {
-                "provider": "moonshot",
-                "model": model_override,
-                "latency_ms": latency_ms,
-                "content": content,
+                "provider": "disabled",
+                "model": "",
+                "latency_ms": 0,
+                "content": "",
                 "fallback": "",
+                "skipped": True,
             }
-        if "gpt-oss" in lowered or "llama" in lowered or "groq" in lowered:
-            content, latency_ms = await _invoke_groq(prompt, model_override)
-            return {
-                "provider": "groq",
-                "model": model_override,
-                "latency_ms": latency_ms,
-                "content": content,
-                "fallback": "",
-            }
-        content, latency_ms = await _invoke_gemini(prompt, model_override)
+
+        content, latency_ms, resolved_provider = await _run_provider(provider, model)
         return {
-            "provider": "gemini",
-            "model": model_override,
+            "provider": resolved_provider,
+            "model": model,
             "latency_ms": latency_ms,
             "content": content,
             "fallback": "",
+            "skipped": False,
         }
-
-    default_model = config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_NIGHTLY
-    order = [p.strip().lower() for p in str(config.AUDIT_PROVIDER_ORDER).split(",") if p.strip()]
-    if not order:
-        order = ["gemini", "kimi", "groq"]
-
-    gemini_model = (config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_PRIMARY) or default_model
-    provider_to_model = {
-        "gemini": gemini_model,
-        "kimi": config.AUDIT_MODEL_SECONDARY or "kimi-k2.5",
-        "groq": config.AUDIT_MODEL_TERTIARY or "gpt-oss-120b",
-        "opus": config.AUDIT_MODEL_WEEKLY,
-        "anthropic": config.AUDIT_MODEL_WEEKLY,
-    }
 
     errors: list[str] = []
     for idx, provider in enumerate(order):
-        model = str(provider_to_model.get(provider) or default_model).strip()
-        if provider in {"gemini"}:
-            try:
-                content, latency_ms = await _invoke_gemini(prompt, model)
-                return {
-                    "provider": "gemini",
-                    "model": model,
-                    "latency_ms": latency_ms,
-                    "content": content,
-                    "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
-                }
-            except Exception as exc:
-                errors.append(f"gemini:{exc}")
-                continue
-        if provider in {"kimi", "moonshot"}:
-            try:
-                content, latency_ms = await _invoke_kimi(prompt, model)
-                return {
-                    "provider": "moonshot",
-                    "model": model,
-                    "latency_ms": latency_ms,
-                    "content": content,
-                    "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
-                }
-            except Exception as exc:
-                errors.append(f"kimi:{exc}")
-                continue
-        if provider in {"groq"}:
-            try:
-                content, latency_ms = await _invoke_groq(prompt, model)
-                return {
-                    "provider": "groq",
-                    "model": model,
-                    "latency_ms": latency_ms,
-                    "content": content,
-                    "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
-                }
-            except Exception as exc:
-                errors.append(f"groq:{exc}")
-                continue
-        if provider in {"opus", "anthropic"} and config.ANTHROPIC_API_KEY:
-            try:
-                content, latency_ms = await _invoke_opus(prompt, model)
-                return {
-                    "provider": "anthropic",
-                    "model": model,
-                    "latency_ms": latency_ms,
-                    "content": content,
-                    "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
-                }
-            except Exception as exc:
-                errors.append(f"anthropic:{exc}")
-                continue
+        if provider in {"none", "disabled"}:
+            return {
+                "provider": "disabled",
+                "model": "",
+                "latency_ms": 0,
+                "content": "",
+                "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
+                "skipped": True,
+            }
+
+        model = _default_model_for(provider)
+        try:
+            content, latency_ms, resolved_provider = await _run_provider(provider, model)
+            return {
+                "provider": resolved_provider,
+                "model": model,
+                "latency_ms": latency_ms,
+                "content": content,
+                "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
+                "skipped": False,
+            }
+        except Exception as exc:
+            errors.append(f"{provider}:{exc}")
+            continue
 
     raise RuntimeError(f"All audit providers failed: {' | '.join(errors)}")
 
@@ -592,7 +537,7 @@ async def run_llm_audit(
     schedule: str = "nightly",
     model_override: str | None = None,
 ) -> dict[str, Any]:
-    """Run cleanup + LLM audit + suggestion tracking."""
+    """Run cleanup + optional LLM audit + suggestion tracking."""
     started = time.monotonic()
 
     self_refs_deleted = delete_self_referencing_rels()
@@ -611,6 +556,7 @@ async def run_llm_audit(
     chosen_model = ""
     chosen_provider = ""
     fallback_note = ""
+    llm_enabled = bool(config.AUDIT_LLM_ENABLED or model_override)
 
     if rels:
         for batch in _chunked(rels, _BATCH_SIZE):
@@ -622,6 +568,8 @@ async def run_llm_audit(
                 chosen_provider = str(llm_result.get("provider") or chosen_provider)
                 fallback_note = str(llm_result.get("fallback") or fallback_note)
                 total_latency_ms += int(llm_result.get("latency_ms") or 0)
+                if bool(llm_result.get("skipped")):
+                    continue
 
                 verdicts = parse_verdicts(str(llm_result.get("content") or ""), len(batch))
                 if not verdicts:
@@ -644,6 +592,11 @@ async def run_llm_audit(
         f"Reviewed {len(rels)} relationships: "
         f"{auto_fixed} auto-fixed, {quarantined} quarantined, {verified} verified"
     )
+    if not llm_enabled:
+        summary = (
+            f"Reviewed {len(rels)} relationships in local-only mode: "
+            "LLM audit is disabled (set AUDIT_LLM_ENABLED=true to enable provider calls)."
+        )
 
     status = "pass" if parse_failures == 0 else "warn"
     duration_seconds = round(time.monotonic() - started, 3)
@@ -659,13 +612,14 @@ async def run_llm_audit(
         "self_refs_deleted": self_refs_deleted,
         "orphans_deleted": orphans_deleted,
         "strength_decay_updated": strength_decay_updated,
-        "audit_model_model": chosen_model or (model_override or config.AUDIT_MODEL_NIGHTLY),
-        "audit_provider": chosen_provider or "gemini",
+        "audit_model_model": chosen_model or (model_override or (config.AUDIT_MODEL_LOCAL if llm_enabled else "")),
+        "audit_provider": chosen_provider or ("disabled" if not llm_enabled else "unknown"),
         "audit_model_latency_ms": total_latency_ms,
         "batches": batches,
         "parse_failures": parse_failures,
         "dry_run": bool(dry_run),
         "schedule": schedule,
+        "llm_enabled": llm_enabled,
         "fallback": fallback_note,
         "suggestion_digest": suggestion_digest,
         "auto_adoption_result": auto_adoption_result,

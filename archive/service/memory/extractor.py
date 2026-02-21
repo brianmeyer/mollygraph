@@ -1,7 +1,7 @@
 """GLiNER2 entity and relationship extraction — adapted from Molly memory/extractor.py.
 
 Changes from original:
-- Remove MESSAGE_LABELS classification (OpenClaw handles routing)
+- Remove MESSAGE_LABELS classification (Agent Runtime handles routing)
 - Update active model path to ~/.graph-memory/models/gliner_active/
 - Import from service config instead of Molly config
 - Dropped _build_full_schema / message_type output (entities + relations only)

@@ -2,7 +2,7 @@
 set -e
 
 echo "📦 Setting up Python environment..."
-cd ~/.openclaw/workspace/skills/graph-memory/service
+cd ~/.agent/workspace/skills/graph-memory/service
 if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi

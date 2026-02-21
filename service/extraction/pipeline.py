@@ -1,6 +1,6 @@
 """Extraction pipeline for MollyGraph v1.
 
-This implementation is OpenClaw-first:
+This implementation is local-first:
 - Uses local GLiNER2 extractor (memory.extractor)
 - Writes entities/relationships into bi-temporal Neo4j graph
 - Emits suggestion signals for unknown relationship types
@@ -13,6 +13,7 @@ import hashlib
 import logging
 import math
 import re
+import threading
 import uuid
 from datetime import datetime
 from typing import Any
@@ -70,6 +71,9 @@ _SPACY_LABEL_MAP = {
 
 class ExtractionPipeline:
     """End-to-end extraction and graph/vector persistence."""
+    _st_model: Any | None = None
+    _st_lock = threading.Lock()
+    _embed_warning_emitted = False
 
     def __init__(self, graph: BiTemporalGraph, vector_store: VectorStore):
         self.graph = graph
@@ -306,7 +310,7 @@ class ExtractionPipeline:
     @staticmethod
     def _normalize_source(source: str) -> str:
         normalized = (source or "manual").strip().lower()
-        allowed = {"manual", "whatsapp", "voice", "email", "imessage", "mcp", "openclaw"}
+        allowed = {"manual", "whatsapp", "voice", "email", "imessage", "mcp", "agent"}
         if normalized in allowed:
             return normalized
         return "manual"
@@ -332,10 +336,56 @@ class ExtractionPipeline:
 
     @staticmethod
     def _text_embedding(text: str, dim: int = 768) -> list[float]:
-        """Deterministic local embedding for indexing without API calls.
+        """Compute embedding using local-first backend with deterministic fallback."""
+        backend = service_config.EMBEDDING_BACKEND
 
-        This is intentionally simple and cheap for local-first debugging.
-        """
+        if backend in {"sentence-transformers", "sentence_transformers", "st"}:
+            try:
+                with ExtractionPipeline._st_lock:
+                    if ExtractionPipeline._st_model is None:
+                        from sentence_transformers import SentenceTransformer
+
+                        ExtractionPipeline._st_model = SentenceTransformer(service_config.EMBEDDING_MODEL)
+                vector = ExtractionPipeline._st_model.encode(
+                    text,
+                    normalize_embeddings=True,
+                )
+                return ExtractionPipeline._resize_and_normalize_embedding(vector, dim)
+            except Exception:
+                if not ExtractionPipeline._embed_warning_emitted:
+                    log.warning(
+                        "sentence-transformers embedding unavailable; falling back to hash backend",
+                        exc_info=True,
+                    )
+                    ExtractionPipeline._embed_warning_emitted = True
+
+        if backend in {"ollama"}:
+            try:
+                import httpx
+
+                url = f"{service_config.OLLAMA_BASE_URL.rstrip('/')}/api/embeddings"
+                payload = {"model": service_config.OLLAMA_EMBED_MODEL, "prompt": text}
+                headers: dict[str, str] = {"Content-Type": "application/json"}
+                if service_config.OLLAMA_API_KEY:
+                    headers["Authorization"] = f"Bearer {service_config.OLLAMA_API_KEY}"
+
+                with httpx.Client(timeout=10.0) as client:
+                    resp = client.post(url, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    vector = data.get("embedding")
+                    if isinstance(vector, list):
+                        return ExtractionPipeline._resize_and_normalize_embedding(vector, dim)
+            except Exception:
+                if not ExtractionPipeline._embed_warning_emitted:
+                    log.warning("Ollama embedding unavailable; falling back to hash backend", exc_info=True)
+                    ExtractionPipeline._embed_warning_emitted = True
+
+        # Default: deterministic local hash embedding (no model server required).
+        return ExtractionPipeline._hash_embedding(text, dim)
+
+    @staticmethod
+    def _hash_embedding(text: str, dim: int = 768) -> list[float]:
         tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
         vector = [0.0] * dim
         if not tokens:
@@ -353,3 +403,16 @@ class ExtractionPipeline:
         if norm == 0:
             return vector
         return [v / norm for v in vector]
+
+    @staticmethod
+    def _resize_and_normalize_embedding(vector: Any, dim: int = 768) -> list[float]:
+        values = [float(v) for v in vector]
+        if len(values) < dim:
+            values.extend([0.0] * (dim - len(values)))
+        elif len(values) > dim:
+            values = values[:dim]
+
+        norm = math.sqrt(sum(v * v for v in values))
+        if norm == 0:
+            return values
+        return [v / norm for v in values]

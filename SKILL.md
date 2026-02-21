@@ -23,7 +23,7 @@ MOLLYGRAPH_SPACY_ENRICHMENT=true ~/.graph-memory/venv/bin/python service/mcp_ser
 
 ## MCP Integration
 
-Add to OpenClaw config:
+Add to your MCP client config:
 
 ```json
 {

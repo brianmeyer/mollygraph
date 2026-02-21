@@ -27,6 +27,14 @@
 ## Audit provider fallback
 Default order is env-configurable via `AUDIT_PROVIDER_ORDER`.
 Default chain:
-- Gemini Flash Lite
-- Kimi 2.5
-- Groq gpt-oss-120b
+- disabled (`none`)
+
+Optional local-first chain example:
+- Ollama (`ollama`)
+- disabled (`none`)
+
+Optional cloud add-ons:
+- Gemini
+- Moonshot
+- Groq
+- Anthropic

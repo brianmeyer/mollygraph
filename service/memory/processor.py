@@ -3,7 +3,7 @@
 Changes from original:
 - Removed embed_and_store / batch_embed_and_store (no vectorstore)
 - Removed process_conversation / _append_daily_log (WhatsApp specific)
-- Extended _ENTITY_BLOCKLIST with OpenClaw-specific terms
+- Extended _ENTITY_BLOCKLIST with agent-runtime noise terms
 - Added public process_text() function as the service's main entry point
 - extract_to_graph now takes (content, source) without chat_jid
 """
@@ -15,10 +15,10 @@ import re
 
 log = logging.getLogger(__name__)
 
-# Extended blocklist: system artifacts, pronouns, OpenClaw-specific noise
+# Extended blocklist: system artifacts, pronouns, agent-runtime noise
 _ENTITY_BLOCKLIST = {
     # System artifacts
-    "molly", "openclaw", "user", "heartbeat", "brian's approval", "approval",
+    "molly", "agent", "user", "heartbeat", "brian's approval", "approval",
     "context", "system", "assistant", "claude", "opus", "haiku", "sonnet",
     "grok", "gemini",
     # Pronouns / generic words that GLiNER2 over-extracts
@@ -78,7 +78,7 @@ def _is_junk_chunk(content: str) -> bool:
     return False
 
 
-async def extract_to_graph(content: str, source: str = "openclaw", threshold: float = 0.4) -> dict:
+async def extract_to_graph(content: str, source: str = "agent", threshold: float = 0.4) -> dict:
     """Extract entities/relations from text and upsert to Neo4j.
 
     Returns summary dict with counts and episode_id.
@@ -176,7 +176,7 @@ async def extract_to_graph(content: str, source: str = "openclaw", threshold: fl
         raise
 
 
-async def process_text(content: str, source: str = "openclaw", threshold: float = 0.4) -> dict:
+async def process_text(content: str, source: str = "agent", threshold: float = 0.4) -> dict:
     """Public API: extract entities/rels from text, upsert to Neo4j, return summary.
 
     This is the main entry point called by POST /extract.

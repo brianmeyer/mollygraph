@@ -202,12 +202,12 @@ async def _invoke_gemini(prompt: str, model: str) -> tuple[str, int]:
 
 
 async def _invoke_kimi(prompt: str, model: str) -> tuple[str, int]:
-    """Invoke Kimi via OpenClaw Gateway or Moonshot API."""
+    """Invoke Kimi via Agent Runtime Gateway or Moonshot API."""
     import httpx
 
-    # Try OpenClaw Gateway first (preferred for integrated deployment)
-    gateway_url = os.environ.get("OPENCLAW_GATEWAY_URL", "ws://127.0.0.1:18789")
-    gateway_token = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+    # Try Agent Runtime Gateway first (preferred for integrated deployment)
+    gateway_url = os.environ.get("AGENT_GATEWAY_URL", "ws://127.0.0.1:18789")
+    gateway_token = os.environ.get("AGENT_GATEWAY_TOKEN", "")
 
     # Convert ws:// to http:// for API calls
     http_url = gateway_url.replace("ws://", "http://").replace("wss://", "https://")
@@ -226,7 +226,7 @@ async def _invoke_kimi(prompt: str, model: str) -> tuple[str, int]:
     async with httpx.AsyncClient(timeout=180) as client:
         for attempt in range(3):
             try:
-                # Try OpenClaw Gateway agent endpoint
+                # Try Agent Runtime Gateway agent endpoint
                 headers = {"Content-Type": "application/json"}
                 if gateway_token:
                     headers["Authorization"] = f"Bearer {gateway_token}"

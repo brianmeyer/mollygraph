@@ -54,7 +54,8 @@ except Exception as exc:
 PY
 
 echo "Install complete."
-echo "Set NEO4J_* and at least one provider API key in $ROOT_DIR/.env (or shell env)."
+echo "Set NEO4J_* in $ROOT_DIR/.env (or shell env)."
+echo "Optional: enable LLM audit with AUDIT_LLM_ENABLED=true and a provider configuration."
 echo "Optional: set MOLLYGRAPH_HOME_DIR to isolate runtime state from ~/.graph-memory."
 echo "Optional: set MOLLYGRAPH_SPACY_ENRICHMENT=true to enable spaCy fallback enrichment."
 echo "Start service with: $ROOT_DIR/scripts/start.sh"
