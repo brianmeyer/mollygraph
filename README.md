@@ -1,29 +1,44 @@
 # MollyGraph
 
-Local-first memory for agents and RAG solutions, exposed as MCP, Python SDK, and HTTP API.
+Local-first memory layer for agents and RAG applications.
 
-## Product Stance
+MollyGraph can be used as:
+- an MCP server adapter (`mollygraph-mcp`)
+- a Python SDK (`mollygraph-sdk`)
+- a self-hosted HTTP memory service
 
-- Local by default.
-- Model agnostic.
-- LLM audit is optional (off by default).
-- Works with local models (for example Ollama and sentence-transformers).
+## Why MollyGraph
 
-## Integration Modes
+- Local-first by default (no cloud dependency required).
+- Model-agnostic runtime configuration.
+- Optional local model support (Ollama, sentence-transformers).
+- Optional LLM audit pipeline (disabled by default).
+- Stable API contract with legacy aliases preserved.
 
-1. MCP adapter for agent runtimes and MCP clients.
-2. Python SDK for RAG pipelines and app code.
-3. HTTP API for self-hosted deployments.
+## Quick Start (Local Service)
 
-## MCP Usage
+```bash
+cd /Users/brianmeyer/mollygraph
+cp .env.example .env
+docker compose -f docker-compose.neo4j.yml up -d
+./scripts/install.sh
+./scripts/start.sh
+```
 
-Install SDK + MCP adapter:
+Service defaults:
+- API: `http://127.0.0.1:7422`
+- Runtime state: `~/.graph-memory`
+- API key: `dev-key-change-in-production`
+
+## Use as MCP
+
+Install:
 
 ```bash
 pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk[mcp]"
 ```
 
-Run MCP adapter:
+Run:
 
 ```bash
 mollygraph-mcp --base-url http://localhost:7422 --api-key dev-key-change-in-production
@@ -54,7 +69,7 @@ MCP tools:
 - `run_audit`
 - `get_training_status`
 
-## Python SDK Usage
+## Use as Python SDK
 
 Install:
 
@@ -62,56 +77,80 @@ Install:
 pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk"
 ```
 
-Use:
+Example:
 
 ```python
 from mollygraph_sdk import MollyGraphClient
 
-client = MollyGraphClient(base_url="http://localhost:7422", api_key="dev-key-change-in-production")
-print(client.ingest("Brian works at Databricks."))
+client = MollyGraphClient(
+    base_url="http://localhost:7422",
+    api_key="dev-key-change-in-production",
+)
+
+client.ingest("Brian works at Databricks.", source="manual")
 print(client.query("What do we know about Brian?"))
 client.close()
 ```
 
-## Self-Host Service
+## Local Model Configuration
 
-```bash
-cd /Users/brianmeyer/mollygraph
-cp .env.example .env
-docker compose -f docker-compose.neo4j.yml up -d
-./scripts/install.sh
-./scripts/start.sh
-```
-
-Defaults:
-- API: `http://127.0.0.1:7422`
-- Runtime state: `~/.graph-memory`
-- Override state root: `MOLLYGRAPH_HOME_DIR=/custom/path`
-
-## Local Model Options
-
-Embedding backends:
-- `MOLLYGRAPH_EMBEDDING_BACKEND=hash` (default, zero dependencies)
+Embeddings:
+- `MOLLYGRAPH_EMBEDDING_BACKEND=hash` (default, no extra model runtime)
 - `MOLLYGRAPH_EMBEDDING_BACKEND=sentence-transformers`
 - `MOLLYGRAPH_EMBEDDING_BACKEND=ollama`
 
-Embedding model settings:
+Embedding model vars:
 - `MOLLYGRAPH_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`
 - `MOLLYGRAPH_OLLAMA_EMBED_MODEL=nomic-embed-text`
 
-Optional LLM audit:
-- `AUDIT_LLM_ENABLED=false` by default
-- Local provider example:
-  - `AUDIT_LLM_ENABLED=true`
-  - `AUDIT_PROVIDER_ORDER=ollama,none`
-  - `AUDIT_MODEL_LOCAL=llama3.1:8b`
-  - `OLLAMA_CHAT_BASE_URL=http://127.0.0.1:11434/v1`
+Optional local LLM audit with Ollama:
+
+```env
+AUDIT_LLM_ENABLED=true
+AUDIT_PROVIDER_ORDER=ollama,none
+AUDIT_MODEL_LOCAL=llama3.1:8b
+OLLAMA_CHAT_BASE_URL=http://127.0.0.1:11434/v1
+```
+
+## Optional Cloud LLM Add-ons
+
+Cloud providers are optional and off-path by default.
+Set `AUDIT_LLM_ENABLED=true`, choose `AUDIT_PROVIDER_ORDER`, then provide relevant API keys.
 
 ## HTTP API Contract
 
-Canonical endpoints are stable, with legacy aliases kept for compatibility:
-- `POST /ingest` (`POST /extract`)
-- `POST /audit` (`POST /audit/run`, `POST /maintenance/audit`)
-- `GET /suggestions/digest` (`GET /suggestions_digest`)
-- `POST /train/gliner` (`POST /training/gliner`)
-- `GET /train/status` (`GET /training/status`)
+Canonical endpoints:
+- `GET /health`
+- `GET /stats`
+- `POST /ingest`
+- `GET /entity/{name}`
+- `GET /query`
+- `POST /audit`
+- `GET /suggestions/digest`
+- `POST /train/gliner`
+- `GET /train/status`
+- `POST /maintenance/run`
+
+Legacy aliases retained:
+- `POST /extract` -> `POST /ingest`
+- `POST /audit/run` -> `POST /audit`
+- `POST /maintenance/audit` -> `POST /audit`
+- `GET /suggestions_digest` -> `GET /suggestions/digest`
+- `POST /training/gliner` -> `POST /train/gliner`
+- `GET /training/status` -> `GET /train/status`
+
+## Development
+
+Run tests:
+
+```bash
+MOLLYGRAPH_TEST_MODE=1 ~/.graph-memory/venv/bin/pytest -q
+```
+
+## Repository Layout
+
+- `service/`: FastAPI service and core memory pipeline
+- `sdk/`: Python SDK + MCP adapter package
+- `scripts/`: install/start scripts
+- `tests/`: smoke + integration API contract tests
+- `docs/`: architecture docs
