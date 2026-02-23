@@ -1,6 +1,7 @@
 """Entity operations for the bi-temporal graph."""
 from __future__ import annotations
 
+import re as _re
 import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -9,6 +10,13 @@ from typing import Any, Dict, List, Tuple
 from memory.models import Entity
 
 from .constants import ENTITY_BLOCKLIST, _SAFE_PROPERTY_KEY, log
+
+_DOC_ID_RE = _re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_doc_id(raw: str) -> str:
+    """Sanitize a string into a valid Zvec doc_id (alphanumeric, _, -)."""
+    return _DOC_ID_RE.sub("_", raw.strip().lower()) or "unknown"
 
 
 class EntityMixin:
@@ -305,7 +313,7 @@ class EntityMixin:
             result = session.run(
                 """
                 MATCH (e:Entity)
-                RETURN coalesce(e.id, replace(toLower(e.name), ' ', '_')) AS entity_id,
+                RETURN coalesce(e.id, toLower(e.name)) AS entity_id,
                        e.name AS name,
                        coalesce(e.entity_type, 'Concept') AS entity_type,
                        coalesce(e.summary, e.description, '') AS content,
@@ -323,7 +331,7 @@ class EntityMixin:
                     continue
                 rows.append(
                     {
-                        "entity_id": str(record.get("entity_id") or name.lower()).replace(" ", "_"),
+                        "entity_id": _sanitize_doc_id(str(record.get("entity_id") or name.lower())),
                         "name": name,
                         "entity_type": str(record.get("entity_type") or "Concept"),
                         "content": str(record.get("content") or ""),
