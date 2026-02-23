@@ -1,6 +1,6 @@
 """Extraction pipeline for MollyGraph v1.
 
-This implementation is local-first:
+This implementation is OpenClaw-first:
 - Uses local GLiNER2 extractor (memory.extractor)
 - Writes entities/relationships into bi-temporal Neo4j graph
 - Emits suggestion signals for unknown relationship types
@@ -13,7 +13,6 @@ import hashlib
 import logging
 import math
 import re
-import threading
 import time
 import uuid
 from datetime import datetime
@@ -32,6 +31,21 @@ except Exception:  # pragma: no cover
     _log_extraction = None  # type: ignore
 
 try:
+    from metrics.model_health import model_health_monitor as _model_health_monitor
+except Exception:  # pragma: no cover
+    _model_health_monitor = None  # type: ignore
+
+
+def _get_gliner_model():
+    """Return the active GLiNER2 model (hot-reload aware).
+
+    Delegates to ``memory.extractor._get_model()`` which implements mtime-based
+    hot-reload whenever the active model directory changes on disk.  The mtime
+    check adds only a single O(1) stat() call per invocation.
+    """
+    return gliner_extractor._get_model()
+
+try:
     import spacy  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     spacy = None
@@ -48,34 +62,49 @@ _ALLOWED_ENTITY_TYPES = {
     "Event",
 }
 
-_ALLOWED_REL_TYPES = {
-    "WORKS_ON",
-    "WORKS_AT",
-    "KNOWS",
-    "USES",
-    "LOCATED_IN",
-    "DISCUSSED_WITH",
-    "INTERESTED_IN",
-    "CREATED",
-    "MANAGES",
-    "DEPENDS_ON",
-    "RELATED_TO",
-    "MENTIONS",
-    # Education / school relationships
-    "ATTENDS",          # kids → school
-    "TEACHES_AT",       # teacher → school
-    "ALUMNI_OF",        # person → school (alma mater)
-    "STUDIED_AT",       # person → school (attended)
-    # Family relationships
-    "PARENT_OF",        # parent → child
-    "CHILD_OF",         # child → parent
-    # Workplace / professional
-    "REPORTS_TO",       # employee → manager
-    "CUSTOMER_OF",      # person → company
-    # Social / peer
-    "CLASSMATE_OF",     # person → person
-    "MENTORED_BY",      # person → mentor
-}
+# Derive the allowed relation type set from the canonical extractor schema so
+# the two definitions can never silently diverge.  Keys in RELATION_SCHEMA are
+# lowercase-with-spaces (e.g. "works on"); we normalise to UPPER_UNDERSCORE.
+# A small set of pipeline-only types (MENTIONS, TEACHES_AT) is unioned in
+# as they have no extractor counterpart but are valid graph edges.
+try:
+    from memory.extractor import RELATION_SCHEMA as _rel_schema
+    _ALLOWED_REL_TYPES: set[str] = {
+        key.upper().replace(" ", "_") for key in _rel_schema.keys()
+    } | {
+        "MENTIONS",       # pipeline-internal; not in extractor schema
+        "TEACHES_AT",     # pipeline-internal; not in extractor schema
+    }
+except ImportError:
+    # Fallback: hardcoded set kept in sync manually.
+    _ALLOWED_REL_TYPES = {
+        "WORKS_ON",
+        "WORKS_AT",
+        "KNOWS",
+        "USES",
+        "LOCATED_IN",
+        "DISCUSSED_WITH",
+        "INTERESTED_IN",
+        "CREATED",
+        "MANAGES",
+        "DEPENDS_ON",
+        "RELATED_TO",
+        "MENTIONS",
+        "ATTENDS",
+        "TEACHES_AT",
+        "ALUMNI_OF",
+        "STUDIED_AT",
+        "PARENT_OF",
+        "CHILD_OF",
+        "REPORTS_TO",
+        "CUSTOMER_OF",
+        "CLASSMATE_OF",
+        "MENTORED_BY",
+        "MENTORS",
+        "COLLABORATES_WITH",
+        "RECEIVED_FROM",
+        "CONTACT_OF",
+    }
 
 _SPACY_LABEL_MAP = {
     "PERSON": "Person",
@@ -91,17 +120,17 @@ _SPACY_LABEL_MAP = {
 
 class ExtractionPipeline:
     """End-to-end extraction and graph/vector persistence."""
-    _st_model: Any | None = None
-    _st_model_ref: str = ""
-    _st_lock = threading.Lock()
-    _embed_warning_emitted = False
 
     def __init__(self, graph: BiTemporalGraph, vector_store: VectorStore):
         self.graph = graph
         self.vector_store = vector_store
         self._spacy_nlp: Any | None = None
         self._spacy_attempted = False
-        self._spacy_strict_notice_emitted = False
+
+    def vector_search(self, query: str, top_k: int = 10):
+        """Proxy to vector store search."""
+        embedding = self._text_embedding(query)
+        return self.vector_store.similarity_search(embedding, top_k=top_k)
 
     async def process_job(self, job: ExtractionJob) -> ExtractionJob:
         _t_start = time.perf_counter()
@@ -113,17 +142,13 @@ class ExtractionPipeline:
             raw_entities = extracted.get("entities", []) if isinstance(extracted, dict) else []
             raw_relations = extracted.get("relations", []) if isinstance(extracted, dict) else []
 
-            if service_config.SPACY_ENRICHMENT and not service_config.STRICT_AI:
+            if service_config.SPACY_ENRICHMENT:
                 raw_entities.extend(
                     self._spacy_enrich_entities(
                         content=job.content,
                         gliner_entity_count=len(raw_entities),
                     )
                 )
-            elif service_config.SPACY_ENRICHMENT and service_config.STRICT_AI:
-                if not self._spacy_strict_notice_emitted:
-                    log.info("strict_ai mode enabled; skipping spaCy enrichment fallback")
-                    self._spacy_strict_notice_emitted = True
 
             entities = self._build_entities(raw_entities)
             canonical_names: dict[str, str] = {}
@@ -164,6 +189,21 @@ class ExtractionPipeline:
                 entities_extracted=[entity.name for entity in stored_entities],
             )
             self.graph.create_episode(episode)
+
+            # Embed episode into vector store for semantic search
+            try:
+                import re as _re
+                ep_embedding = self._text_embedding(job.content[:512])
+                ep_slug = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"ep_{episode.id}")
+                self.vector_store.add_entity(
+                    entity_id=ep_slug,
+                    name=f"Episode {episode.id[:8]}",
+                    entity_type="Episode",
+                    dense_embedding=ep_embedding,
+                    content=episode.content_preview,
+                )
+            except Exception:
+                log.debug("Vector index upsert failed for episode %s", episode.id, exc_info=True)
 
             for rel in relationships:
                 rel.episode_ids = [episode.id]
@@ -215,6 +255,16 @@ class ExtractionPipeline:
                     )
                 except Exception:
                     log.debug("metrics log_extraction failed", exc_info=True)
+
+            # ── Model health monitoring (auto-rollback on degradation) ────────
+            if _model_health_monitor is not None:
+                try:
+                    _model_health_monitor.record_extraction(
+                        total_relations=len(relationships),
+                        fallback_count=fallback_count,
+                    )
+                except Exception:
+                    log.debug("model_health record_extraction failed", exc_info=True)
 
             return job
 
@@ -382,7 +432,7 @@ class ExtractionPipeline:
     @staticmethod
     def _normalize_source(source: str) -> str:
         normalized = (source or "manual").strip().lower()
-        allowed = {"manual", "whatsapp", "voice", "email", "imessage", "mcp", "agent"}
+        allowed = {"manual", "whatsapp", "voice", "email", "imessage"}
         if normalized in allowed:
             return normalized
         return "manual"
@@ -406,94 +456,38 @@ class ExtractionPipeline:
         except (TypeError, ValueError):
             return default
 
-    @staticmethod
-    def invalidate_embedding_cache() -> None:
-        with ExtractionPipeline._st_lock:
-            ExtractionPipeline._st_model = None
-            ExtractionPipeline._st_model_ref = ""
-        ExtractionPipeline._embed_warning_emitted = False
+    # ── Embedding model (lazy singleton) ─────────────────────────────────
+    _embedding_model = None
+
+    @classmethod
+    def _get_embedding_model(cls):
+        if cls._embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                cls._embedding_model = SentenceTransformer("google/embeddinggemma-300m")
+                log.info("Loaded embedding model: google/embeddinggemma-300m")
+            except Exception as exc:
+                log.warning("Failed to load embeddinggemma-300m: %s — falling back to hash", exc)
+                cls._embedding_model = "hash"  # sentinel for fallback
+        return cls._embedding_model
 
     @staticmethod
     def _text_embedding(text: str, dim: int = 768) -> list[float]:
-        """Compute embedding using local-first backend with deterministic fallback."""
-        backend = service_config.EMBEDDING_BACKEND
-
-        if service_config.STRICT_AI and backend == "hash":
-            raise RuntimeError(
-                "strict_ai mode does not allow hash embeddings. "
-                "Choose huggingface or ollama via /embeddings/config."
-            )
-
-        if backend in {"sentence-transformers", "sentence_transformers", "st", "huggingface", "hf"}:
+        """Embed text using google/embeddinggemma-300m (with hash fallback)."""
+        model = ExtractionPipeline._get_embedding_model()
+        
+        if model != "hash":
             try:
-                with ExtractionPipeline._st_lock:
-                    current_model_ref = str(service_config.EMBEDDING_MODEL or "").strip()
-                    if (
-                        ExtractionPipeline._st_model is None
-                        or ExtractionPipeline._st_model_ref != current_model_ref
-                    ):
-                        from sentence_transformers import SentenceTransformer
-
-                        ExtractionPipeline._st_model = SentenceTransformer(current_model_ref)
-                        ExtractionPipeline._st_model_ref = current_model_ref
-                vector = ExtractionPipeline._st_model.encode(
-                    text,
-                    normalize_embeddings=True,
-                )
-                return ExtractionPipeline._resize_and_normalize_embedding(vector, dim)
-            except Exception as exc:
-                if service_config.STRICT_AI:
-                    raise RuntimeError(
-                        "Sentence-transformers embedding backend failed in strict_ai mode."
-                    ) from exc
-                if not ExtractionPipeline._embed_warning_emitted:
-                    log.warning(
-                        "sentence-transformers embedding unavailable; falling back to hash backend",
-                        exc_info=True,
-                    )
-                    ExtractionPipeline._embed_warning_emitted = True
-
-        if backend in {"ollama"}:
-            try:
-                import httpx
-
-                url = f"{service_config.OLLAMA_BASE_URL.rstrip('/')}/api/embeddings"
-                payload = {"model": service_config.OLLAMA_EMBED_MODEL, "prompt": text}
-                headers: dict[str, str] = {"Content-Type": "application/json"}
-                if service_config.OLLAMA_API_KEY:
-                    headers["Authorization"] = f"Bearer {service_config.OLLAMA_API_KEY}"
-
-                with httpx.Client(timeout=10.0) as client:
-                    resp = client.post(url, json=payload, headers=headers)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    vector = data.get("embedding")
-                    if isinstance(vector, list):
-                        return ExtractionPipeline._resize_and_normalize_embedding(vector, dim)
-            except Exception as exc:
-                if service_config.STRICT_AI:
-                    raise RuntimeError(
-                        "Ollama embedding backend failed in strict_ai mode."
-                    ) from exc
-                if not ExtractionPipeline._embed_warning_emitted:
-                    log.warning("Ollama embedding unavailable; falling back to hash backend", exc_info=True)
-                    ExtractionPipeline._embed_warning_emitted = True
-
-        if service_config.STRICT_AI:
-            raise RuntimeError(
-                f"No embedding backend output available for backend '{backend}' in strict_ai mode."
-            )
-
-        # Default: deterministic local hash embedding (no model server required).
-        return ExtractionPipeline._hash_embedding(text, dim)
-
-    @staticmethod
-    def _hash_embedding(text: str, dim: int = 768) -> list[float]:
+                vec = model.encode(text, normalize_embeddings=True).tolist()
+                return vec
+            except Exception:
+                pass
+        
+        # Hash fallback (shouldn't normally be hit)
         tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
         vector = [0.0] * dim
         if not tokens:
             return vector
-
         for token in tokens:
             digest = hashlib.sha256(token.encode("utf-8")).digest()
             for i in range(0, len(digest), 4):
@@ -501,21 +495,7 @@ class ExtractionPipeline:
                 idx = int.from_bytes(chunk, "little", signed=False) % dim
                 sign = 1.0 if (chunk[0] % 2 == 0) else -1.0
                 vector[idx] += sign
-
         norm = math.sqrt(sum(v * v for v in vector))
         if norm == 0:
             return vector
         return [v / norm for v in vector]
-
-    @staticmethod
-    def _resize_and_normalize_embedding(vector: Any, dim: int = 768) -> list[float]:
-        values = [float(v) for v in vector]
-        if len(values) < dim:
-            values.extend([0.0] * (dim - len(values)))
-        elif len(values) > dim:
-            values = values[:dim]
-
-        norm = math.sqrt(sum(v * v for v in values))
-        if norm == 0:
-            return values
-        return [v / norm for v in values]
