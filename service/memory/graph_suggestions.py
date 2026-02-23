@@ -153,9 +153,9 @@ def get_suggestions(date_str: str | None = None) -> list[dict[str, Any]]:
 def get_related_to_hotspots(min_mentions: int = 3) -> list[dict[str, Any]]:
     """Query RELATED_TO hotspots directly from Neo4j."""
     try:
-        from memory.graph import get_driver
+        from runtime_graph import require_graph_instance
 
-        driver = get_driver()
+        driver = require_graph_instance().driver
         with driver.session() as session:
             result = session.run(
                 """MATCH (h:Entity)-[r:RELATED_TO]->(t:Entity)

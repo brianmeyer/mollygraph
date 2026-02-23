@@ -7,12 +7,8 @@ from typing import Any
 
 from audit.llm_audit import run_llm_audit
 from evolution.gliner_training import run_gliner_finetune_pipeline
-from memory.graph import (
-    delete_orphan_entities_sync,
-    delete_self_referencing_rels,
-    run_strength_decay_sync,
-)
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
+from runtime_graph import require_graph_instance
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +16,7 @@ log = logging.getLogger(__name__)
 async def run_maintenance_cycle() -> dict[str, Any]:
     """Run deterministic cleanup + audit + suggestions + GLiNER cycle."""
     started_at = datetime.now(timezone.utc).isoformat()
+    graph = require_graph_instance()
 
     cleanup = {
         "strength_decay_updates": 0,
@@ -28,17 +25,17 @@ async def run_maintenance_cycle() -> dict[str, Any]:
     }
 
     try:
-        cleanup["strength_decay_updates"] = run_strength_decay_sync()
+        cleanup["strength_decay_updates"] = graph.run_strength_decay_sync()
     except Exception:
         log.warning("Strength decay failed", exc_info=True)
 
     try:
-        cleanup["orphans_deleted"] = delete_orphan_entities_sync()
+        cleanup["orphans_deleted"] = graph.delete_orphan_entities_sync()
     except Exception:
         log.warning("Orphan cleanup failed", exc_info=True)
 
     try:
-        cleanup["self_refs_deleted"] = delete_self_referencing_rels()
+        cleanup["self_refs_deleted"] = graph.delete_self_referencing_rels()
     except Exception:
         log.warning("Self-reference cleanup failed", exc_info=True)
 

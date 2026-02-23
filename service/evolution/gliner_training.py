@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import config
+from evolution.audit_feedback import load_audit_feedback_entries
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,16 @@ GLINER_BENCHMARK_EVAL_RATIO = config.GLINER_BENCHMARK_EVAL_RATIO
 GLINER_BENCHMARK_THRESHOLD = config.GLINER_BENCHMARK_THRESHOLD
 GLINER_FINETUNE_COOLDOWN_DAYS = config.GLINER_FINETUNE_COOLDOWN_DAYS
 GLINER_TRAINING_SCAN_LIMIT = config.GLINER_TRAINING_SCAN_LIMIT
+
+_ALLOWED_ENTITY_TYPES = {
+    "Person",
+    "Organization",
+    "Technology",
+    "Place",
+    "Project",
+    "Concept",
+    "Event",
+}
 
 
 class GLiNERTrainingService:
@@ -278,7 +289,7 @@ class GLiNERTrainingService:
         }
 
     def accumulate_gliner_training_data(self, limit: int = GLINER_TRAINING_SCAN_LIMIT) -> dict[str, Any]:
-        from memory.graph import get_driver
+        from runtime_graph import require_graph_instance
 
         training_dir = self.gliner_training_dir()
         training_dir.mkdir(parents=True, exist_ok=True)
@@ -296,7 +307,7 @@ class GLiNERTrainingService:
         if cursor:
             params["cursor"] = cursor
 
-        driver = get_driver()
+        driver = require_graph_instance().driver
         with driver.session() as session:
             rows = [
                 dict(record)
@@ -344,6 +355,13 @@ class GLiNERTrainingService:
                 if row.get("created_at"):
                     latest_seen_created_at = str(row["created_at"])
 
+        feedback_examples, feedback_stats = self.build_training_examples_from_feedback(
+            seen_episode_ids=seen_episode_ids,
+            limit=max(25, int(limit)),
+        )
+        if feedback_examples:
+            new_examples.extend(feedback_examples)
+
         batch_path: str | None = None
         if new_examples:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -368,6 +386,7 @@ class GLiNERTrainingService:
             "total_examples": total_examples,
             "batch_path": batch_path,
             "cursor": str(self.state.get("gliner_training_cursor", "")),
+            **feedback_stats,
         }
 
     def load_existing_gliner_episode_ids(self, training_dir: Path) -> set[str]:
@@ -515,14 +534,207 @@ class GLiNERTrainingService:
             seen_keys.add(key)
             relations.append({"head": head, "tail": tail, "label": label})
 
+        # ── Hard negative relations (quarantined / deleted audit_status) ───
+        negative_relation_rows = [
+            dict(record)
+            for record in session.run(
+                """
+                MATCH (h:Entity)-[r]->(t:Entity)
+                WHERE h.name IN $names AND t.name IN $names
+                  AND r.audit_status IN ['quarantined', 'deleted']
+                RETURN h.name AS head,
+                       t.name AS tail,
+                       type(r) AS label,
+                       r.audit_status AS audit_status
+                """,
+                names=selected_names,
+            )
+        ]
+
+        negative_relations: list[dict[str, Any]] = []
+        seen_neg_keys: set[tuple[str, str, str]] = set()
+        for rel in negative_relation_rows:
+            head = str(rel.get("head") or "").strip()
+            tail = str(rel.get("tail") or "").strip()
+            label = str(rel.get("label") or "").strip()
+            audit_status = str(rel.get("audit_status") or "").strip()
+            if not head or not tail or not label:
+                continue
+            key = (head, label, tail)
+            if key in seen_neg_keys:
+                continue
+            seen_neg_keys.add(key)
+            negative_relations.append({
+                "head": head,
+                "tail": tail,
+                "label": label,
+                "reason": audit_status,
+            })
+
+        # ── Also pull negatives from audit_signals.jsonl ───────────────────
+        try:
+            from pathlib import Path as _Path
+            signals_path = _Path.home() / ".graph-memory" / "training" / "audit_signals.jsonl"
+            if signals_path.exists():
+                with signals_path.open("r", encoding="utf-8") as _f:
+                    for _line in _f:
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _sig = json.loads(_line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(_sig, dict):
+                            continue
+                        if _sig.get("signal") != "negative":
+                            continue
+                        _head = str(_sig.get("head") or "").strip()
+                        _tail = str(_sig.get("tail") or "").strip()
+                        _label = str(_sig.get("relation") or "").strip()
+                        if _head not in selected_names or _tail not in selected_names:
+                            continue
+                        _key = (_head, _label, _tail)
+                        if _key in seen_neg_keys:
+                            continue
+                        seen_neg_keys.add(_key)
+                        neg_entry: dict[str, Any] = {
+                            "head": _head,
+                            "tail": _tail,
+                            "label": _label,
+                            "reason": str(_sig.get("source") or "audit"),
+                        }
+                        if _sig.get("corrected_to"):
+                            neg_entry["corrected_to"] = str(_sig["corrected_to"])
+                        negative_relations.append(neg_entry)
+        except Exception:
+            log.debug("Failed loading audit signals for negatives", exc_info=True)
+
         return {
             "episode_id": str(episode.get("episode_id") or ""),
             "created_at": str(episode.get("created_at") or ""),
             "source_text": source_text,
             "extracted_entities": selected_entities,
             "extracted_relations": relations,
+            "negative_relations": negative_relations,
             "quality_signals": signal_counts,
         }
+
+    @staticmethod
+    def _normalize_entity_type(label: Any) -> str:
+        value = str(label or "Concept").strip()
+        if value in _ALLOWED_ENTITY_TYPES:
+            return value
+        return "Concept"
+
+    def _build_feedback_training_example(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        feedback_id = str(row.get("feedback_id") or "").strip()
+        if not feedback_id:
+            return None
+
+        episode_id = f"audit-feedback:{feedback_id}"
+        decision = str(row.get("decision") or "").strip().lower()
+        if decision not in {"verify", "reclassify", "quarantine", "delete"}:
+            return None
+
+        head = str(row.get("head") or "").strip()
+        tail = str(row.get("tail") or "").strip()
+        if not head or not tail:
+            return None
+
+        source_text = " ".join(str(row.get("source_text") or "").split()).strip()
+        rel_type = str(row.get("rel_type") or "").strip()
+        corrected_rel_type = str(row.get("corrected_rel_type") or rel_type).strip()
+        if not source_text:
+            relation_phrase = corrected_rel_type or rel_type or "related to"
+            source_text = f"{head} {relation_phrase.replace('_', ' ').lower()} {tail}"
+
+        # Ensure entity names are present in text so GLiNER trainers can align spans.
+        text_norm = self.normalize_entity_text(source_text)
+        missing_entities: list[str] = []
+        if self.normalize_entity_text(head) not in text_norm:
+            missing_entities.append(head)
+        if self.normalize_entity_text(tail) not in text_norm:
+            missing_entities.append(tail)
+        if missing_entities:
+            source_text = f"{source_text} {' '.join(missing_entities)}".strip()
+
+        head_type = self._normalize_entity_type(row.get("head_type"))
+        tail_type = self._normalize_entity_type(row.get("tail_type"))
+        entities = [
+            {"text": head, "label": head_type},
+            {"text": tail, "label": tail_type},
+        ]
+
+        relations: list[dict[str, Any]] = []
+        hard_negative_relations: list[dict[str, Any]] = []
+
+        if decision == "verify":
+            if rel_type:
+                relations.append({"head": head, "tail": tail, "label": rel_type})
+        elif decision == "reclassify":
+            if rel_type:
+                hard_negative_relations.append({"head": head, "tail": tail, "label": rel_type})
+            if corrected_rel_type and corrected_rel_type != rel_type:
+                relations.append({"head": head, "tail": tail, "label": corrected_rel_type})
+        elif decision in {"quarantine", "delete"}:
+            if rel_type:
+                hard_negative_relations.append({"head": head, "tail": tail, "label": rel_type})
+
+        quality_signals = {
+            "audit_feedback": 1,
+            "audit_positive": 1 if relations else 0,
+            "audit_negative": 1 if hard_negative_relations else 0,
+        }
+
+        return {
+            "episode_id": episode_id,
+            "created_at": str(row.get("created_at") or ""),
+            "source_text": source_text,
+            "extracted_entities": entities,
+            "extracted_relations": relations,
+            "hard_negative_relations": hard_negative_relations,
+            "quality_signals": quality_signals,
+        }
+
+    def build_training_examples_from_feedback(
+        self,
+        seen_episode_ids: set[str],
+        limit: int = GLINER_TRAINING_SCAN_LIMIT,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        safe_limit = max(1, int(limit))
+        # Load a larger tail to account for dedupe against seen episode_ids.
+        feedback_rows = load_audit_feedback_entries(limit=safe_limit * 4)
+
+        out: list[dict[str, Any]] = []
+        stats = {
+            "feedback_rows_scanned": len(feedback_rows),
+            "feedback_examples_added": 0,
+            "feedback_positive_examples": 0,
+            "feedback_negative_examples": 0,
+        }
+
+        for row in feedback_rows:
+            example = self._build_feedback_training_example(row)
+            if not example:
+                continue
+
+            episode_id = str(example.get("episode_id") or "").strip()
+            if not episode_id or episode_id in seen_episode_ids:
+                continue
+
+            out.append(example)
+            seen_episode_ids.add(episode_id)
+            stats["feedback_examples_added"] += 1
+            if (example.get("extracted_relations") or []):
+                stats["feedback_positive_examples"] += 1
+            if (example.get("hard_negative_relations") or []):
+                stats["feedback_negative_examples"] += 1
+
+            if len(out) >= safe_limit:
+                break
+
+        return out, stats
 
     def count_accumulated_gliner_examples(self, training_dir: Path | None = None) -> int:
         target_dir = training_dir or self.gliner_training_dir()
@@ -571,6 +783,7 @@ class GLiNERTrainingService:
         text = str(payload.get("source_text") or payload.get("text") or "").strip()
         entities = payload.get("extracted_entities", payload.get("entities", []))
         relations = payload.get("extracted_relations", payload.get("relations", []))
+        negative_relations = payload.get("negative_relations", payload.get("hard_negative_relations", []))
 
         if not text or not isinstance(entities, list) or not entities:
             return None
@@ -581,6 +794,7 @@ class GLiNERTrainingService:
             "text": text,
             "entities": entities,
             "relations": relations if isinstance(relations, list) else [],
+            "negative_relations": negative_relations if isinstance(negative_relations, list) else [],
         }
 
     async def _run_pretraining_audit(self, mode: str) -> dict[str, Any]:
@@ -590,10 +804,10 @@ class GLiNERTrainingService:
         """
         try:
             from audit.llm_audit import call_audit_model, build_audit_prompt
-            from memory.graph import get_relationships_for_audit
+            from runtime_graph import require_graph_instance
             
             # Sample recent relationships for quality check
-            rels = get_relationships_for_audit(limit=100)
+            rels = require_graph_instance().get_relationships_for_audit(limit=100)
             if not rels:
                 return {"passed": True, "reason": "no_relationships_to_audit"}
             
@@ -689,11 +903,30 @@ class GLiNERTrainingService:
 
             relations_out.append({label: {"head": head, "tail": tail}})
 
+        # ── Hard negatives from quarantine/delete/reclassify audit verdicts ─
+        negative_relations_out: list[dict[str, Any]] = []
+        for rel in row.get("negative_relations") or row.get("hard_negative_relations") or []:
+            if not isinstance(rel, dict):
+                continue
+            head = str(rel.get("head") or "").strip()
+            tail = str(rel.get("tail") or "").strip()
+            label = str(rel.get("label") or "").strip().lower().replace("_", " ")
+
+            if not head or not tail or not label:
+                continue
+            # Negatives don't need to appear in text - they are hard negatives from audit
+            entry: dict[str, Any] = {label: {"head": head, "tail": tail}}
+            if rel.get("corrected_to"):
+                entry[label]["corrected_to"] = str(rel["corrected_to"]).lower().replace("_", " ")
+            negative_relations_out.append(entry)
+
         output: dict[str, Any] = {}
         if entities_map:
             output["entities"] = entities_map
         if relations_out:
             output["relations"] = relations_out
+        if negative_relations_out:
+            output["negative_relations"] = negative_relations_out
         if not output:
             return None
 
@@ -1061,10 +1294,11 @@ class GLiNERTrainingService:
 
     def load_gliner_entity_model(self, model_ref: str) -> tuple[Any, Any]:
         from gliner2 import GLiNER2
-        from memory.extractor import ENTITY_SCHEMA
+        from extractor_schema_registry import get_effective_extractor_schema
 
         model = GLiNER2.from_pretrained(model_ref)
-        schema = model.create_schema().entities(ENTITY_SCHEMA)
+        entity_schema = get_effective_extractor_schema().get("entities", {})
+        schema = model.create_schema().entities(entity_schema)
         return model, schema
 
     def evaluate_model_on_rows(

@@ -1,10 +1,8 @@
-"""GLiNER2 entity and relationship extraction — adapted from Molly memory/extractor.py.
+"""Pluggable entity/relationship extraction runtime.
 
-Changes from original:
-- Remove MESSAGE_LABELS classification (routing handled by caller)
-- Update active model path to ~/.graph-memory/models/gliner_active/
-- Import from service config instead of Molly config
-- Dropped _build_full_schema / message_type output (entities + relations only)
+Backends:
+- gliner2: entities + relations
+- hf_token_classification: entities + relations (with separate relation model)
 """
 from __future__ import annotations
 
@@ -13,295 +11,436 @@ import threading
 import time
 from typing import Any
 
-import yaml
-
 import config
+from extractor_schema_registry import get_effective_extractor_schema
 
 log = logging.getLogger(__name__)
 
-_model = None
+_model: Any | None = None
+_relation_model: Any | None = None
 _model_lock = threading.Lock()
+_model_backend: str = ""
+_model_ref: str = ""
+_relation_model_backend: str = ""
+_relation_model_ref: str = ""
 
-# Description-enriched entity types for conversational text
-ENTITY_SCHEMA = {
-    "Person": {
-        "description": "Full name or nickname of a person mentioned in conversation",
-        "threshold": 0.4,
-    },
-    "Technology": {
-        "description": "Programming language, framework, tool, platform, or technical system",
-        "threshold": 0.4,
-    },
-    "Organization": {
-        "description": "Company, institution, team, or named group",
-        "threshold": 0.5,
-    },
-    "Project": {
-        "description": "Named project, product, app, or initiative being worked on",
-        "threshold": 0.45,
-    },
-    "Place": {
-        "description": "City, country, region, office, or named location",
-        "threshold": 0.5,
-    },
-    "Concept": {
-        "description": "Abstract idea, field of study, methodology, or domain topic discussed",
-        "threshold": 0.5,
-    },
-}
-
-# Description-enriched relationship types
-_BASE_RELATION_SCHEMA = {
-    "works on": {
-        "description": "Person actively works on a project or task",
-        "threshold": 0.45,
-    },
-    "works at": {
-        "description": "Person is employed at or affiliated with an organization",
-        "threshold": 0.5,
-    },
-    "knows": {
-        "description": "Person knows or has a personal connection with another person",
-        "threshold": 0.5,
-    },
-    "uses": {
-        "description": "Person or project uses a technology, tool, or platform",
-        "threshold": 0.45,
-    },
-    "located in": {
-        "description": "Person, organization, or project is located in or based at a place",
-        "threshold": 0.5,
-    },
-    "discussed with": {
-        "description": "Person discussed a topic or entity with another person",
-        "threshold": 0.5,
-    },
-    "interested in": {
-        "description": "Person expressed interest in a topic, technology, or project",
-        "threshold": 0.45,
-    },
-    "created": {
-        "description": "Person or organization created or built a project or technology",
-        "threshold": 0.5,
-    },
-    "manages": {
-        "description": "Person manages or leads a project, team, or organization",
-        "threshold": 0.5,
-    },
-    "depends on": {
-        "description": "Project or technology depends on or requires another technology",
-        "threshold": 0.5,
-    },
-    "related to": {
-        "description": "General association between two entities discussed together",
-        "threshold": 0.4,
-    },
-    "classmate of": {
-        "description": "Person attended the same program, cohort, or school as another person",
-        "threshold": 0.45,
-    },
-    "studied at": {
-        "description": "Person attended or was enrolled at an educational institution",
-        "threshold": 0.45,
-    },
-    "alumni of": {
-        "description": "Person graduated from an educational institution or program",
-        "threshold": 0.45,
-    },
-    "mentors": {
-        "description": "Person mentors or advises another person",
-        "threshold": 0.5,
-    },
-    "mentored by": {
-        "description": "Person is mentored or advised by another person",
-        "threshold": 0.5,
-    },
-    "reports to": {
-        "description": "Person directly reports to another person in a management hierarchy",
-        "threshold": 0.5,
-    },
-    "collaborates with": {
-        "description": "Person works together with another person but not at the same organization",
-        "threshold": 0.45,
-    },
-    "customer of": {
-        "description": "Person is a customer, subscriber, or account holder at a company or service",
-        "threshold": 0.5,
-    },
-    "attends": {
-        "description": "Person attends or is enrolled at a school, program, or recurring event",
-        "threshold": 0.45,
-    },
-    "parent of": {
-        "description": "Person is the parent or guardian of another person (typically a child)",
-        "threshold": 0.5,
-    },
-    "child of": {
-        "description": "Person is the child of another person",
-        "threshold": 0.5,
-    },
-    "received from": {
-        "description": "Person received a delivery, package, email, or communication from an organization or person",
-        "threshold": 0.5,
-    },
-    "contact of": {
-        "description": "Person is a known contact of another person or organization",
-        "threshold": 0.5,
-    },
+_HF_LABEL_MAP = {
+    "PER": "Person",
+    "PERSON": "Person",
+    "ORG": "Organization",
+    "ORGANIZATION": "Organization",
+    "NORP": "Organization",
+    "GPE": "Place",
+    "LOC": "Place",
+    "LOCATION": "Place",
+    "FAC": "Place",
+    "EVENT": "Concept",
+    "PRODUCT": "Technology",
+    "WORK_OF_ART": "Concept",
+    "MISC": "Concept",
 }
 
 
-def _load_user_relation_schema() -> dict[str, dict[str, Any]]:
-    """Load user-extended relation schema from RELATION_SCHEMA_FILE config path."""
-    path = getattr(config, "RELATION_SCHEMA_FILE", None)
-    if path is None:
-        return {}
-    schema_path = path.expanduser()
-    if not schema_path.exists():
-        return {}
-
-    try:
-        payload = yaml.safe_load(schema_path.read_text())
-    except Exception:
-        log.warning("Failed to parse relation schema file: %s", schema_path, exc_info=True)
-        return {}
-
-    merged: dict[str, dict[str, Any]] = {}
-    if isinstance(payload, dict):
-        items = payload.items()
-    elif isinstance(payload, list):
-        items = [(str(item), {}) for item in payload]
-    else:
-        log.warning("Unsupported relation schema format at %s", schema_path)
-        return {}
-
-    for raw_name, raw_cfg in items:
-        name = str(raw_name or "").strip().lower()
-        if not name:
-            continue
-        cfg = raw_cfg if isinstance(raw_cfg, dict) else {}
-        description = str(cfg.get("description") or f"User-defined relation: {name}").strip()
-        threshold_raw = cfg.get("threshold", 0.45)
-        try:
-            threshold = float(threshold_raw)
-        except (TypeError, ValueError):
-            threshold = 0.45
-        merged[name] = {"description": description, "threshold": max(0.0, min(1.0, threshold))}
-    return merged
+def _normalize_backend(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"gliner", "gliner2"}:
+        return "gliner2"
+    if raw in {"hf", "ner", "uie", "token-classification", "token_classification", "hf_token_classification"}:
+        return "hf_token_classification"
+    return "gliner2"
 
 
-RELATION_SCHEMA = dict(_BASE_RELATION_SCHEMA)
-RELATION_SCHEMA.update(_load_user_relation_schema())
+def _active_backend() -> str:
+    return _normalize_backend(getattr(config, "EXTRACTOR_BACKEND", "gliner2"))
 
 
-def _get_model():
-    """Lazy-load the GLiNER2 model.
+def _active_model_ref() -> str:
+    return str(getattr(config, "EXTRACTOR_MODEL", "") or "").strip()
 
-    Checks for a fine-tuned active model first at ~/.graph-memory/models/gliner_active/.
-    Falls back to the base HuggingFace model if no active model exists.
-    """
-    global _model
-    if _model is not None:
-        return _model
+
+def _active_relation_model_ref() -> str:
+    return str(getattr(config, "EXTRACTOR_RELATION_MODEL", "") or "").strip()
+
+
+def invalidate_model_cache() -> None:
+    """Clear cached extractor model so runtime config changes take effect."""
+    global _model, _relation_model, _model_backend, _model_ref, _relation_model_backend, _relation_model_ref
     with _model_lock:
-        if _model is None:
+        _model = None
+        _relation_model = None
+        _model_backend = ""
+        _model_ref = ""
+        _relation_model_backend = ""
+        _relation_model_ref = ""
+
+
+def _resolve_gliner_model_ref(selected_model: str) -> str:
+    if selected_model:
+        return selected_model
+    active_dir = config.MODELS_DIR / "gliner_active"
+    if active_dir.exists() and (active_dir / "model.safetensors").exists():
+        return str(active_dir)
+    return str(config.GLINER_BASE_MODEL)
+
+
+def _get_model() -> Any:
+    """Load the active extractor model according to runtime config."""
+    global _model, _model_backend, _model_ref
+
+    backend = _active_backend()
+    requested_model = _active_model_ref()
+    resolved_ref = _resolve_gliner_model_ref(requested_model) if backend == "gliner2" else requested_model
+
+    if backend == "hf_token_classification" and not resolved_ref:
+        raise ValueError(
+            "No extractor model configured for hf_token_classification. "
+            "Set one via POST /extractors/config or POST /extractors/models."
+        )
+
+    if _model is not None and _model_backend == backend and _model_ref == resolved_ref:
+        return _model
+
+    with _model_lock:
+        if _model is not None and _model_backend == backend and _model_ref == resolved_ref:
+            return _model
+
+        if backend == "gliner2":
             from gliner2 import GLiNER2
 
-            active_dir = config.MODELS_DIR / "gliner_active"
-            if active_dir.exists() and (active_dir / "model.safetensors").exists():
-                log.info("Loading fine-tuned GLiNER2 model from %s ...", active_dir)
-                _model = GLiNER2.from_pretrained(str(active_dir))
-                log.info("Fine-tuned GLiNER2 model loaded.")
-            else:
-                log.info("Loading GLiNER2 base model (%s)...", config.GLINER_BASE_MODEL)
-                _model = GLiNER2.from_pretrained(config.GLINER_BASE_MODEL)
-                log.info("GLiNER2 base model loaded.")
-    return _model
+            log.info("Loading GLiNER2 model (%s)...", resolved_ref)
+            model = GLiNER2.from_pretrained(resolved_ref)
+            log.info("GLiNER2 model loaded.")
+        else:
+            from transformers import pipeline
+
+            log.info("Loading HF token-classification model (%s)...", resolved_ref)
+            model = pipeline(
+                "token-classification",
+                model=resolved_ref,
+                tokenizer=resolved_ref,
+                aggregation_strategy="simple",
+            )
+            log.info("HF token-classification model loaded.")
+
+        _model = model
+        _model_backend = backend
+        _model_ref = resolved_ref
+        return _model
+
+
+def _get_relation_model_hf() -> Any | None:
+    """Load relation extraction model for HF backend."""
+    global _relation_model, _relation_model_backend, _relation_model_ref
+
+    backend = _active_backend()
+    if backend != "hf_token_classification":
+        return None
+
+    relation_ref = _active_relation_model_ref()
+    if not relation_ref:
+        return None
+
+    if (
+        _relation_model is not None
+        and _relation_model_backend == backend
+        and _relation_model_ref == relation_ref
+    ):
+        return _relation_model
+
+    with _model_lock:
+        if (
+            _relation_model is not None
+            and _relation_model_backend == backend
+            and _relation_model_ref == relation_ref
+        ):
+            return _relation_model
+
+        from transformers import pipeline
+
+        log.info("Loading HF relation model (%s)...", relation_ref)
+        model = pipeline(
+            "text2text-generation",
+            model=relation_ref,
+            tokenizer=relation_ref,
+        )
+        log.info("HF relation model loaded.")
+
+        _relation_model = model
+        _relation_model_backend = backend
+        _relation_model_ref = relation_ref
+        return _relation_model
 
 
 def _build_schema():
-    """Build a combined schema for entities + relations (no message classification)."""
     model = _get_model()
-    return (
-        model.create_schema()
-        .entities(ENTITY_SCHEMA)
-        .relations(RELATION_SCHEMA)
-    )
+    schema = get_effective_extractor_schema()
+    return model.create_schema().entities(schema["entities"]).relations(schema["relations"])
 
 
 def _build_entity_schema():
-    """Build an entity-only schema (for lightweight extraction)."""
     model = _get_model()
-    return model.create_schema().entities(ENTITY_SCHEMA)
+    schema = get_effective_extractor_schema()
+    return model.create_schema().entities(schema["entities"])
+
+
+def _normalize_hf_label(raw_label: Any) -> str:
+    label = str(raw_label or "").strip().upper()
+    for prefix in ("B-", "I-", "L-", "U-", "S-", "E-"):
+        if label.startswith(prefix):
+            label = label[len(prefix) :]
+            break
+    if label.startswith("LABEL_"):
+        label = label[6:]
+    return _HF_LABEL_MAP.get(label, "Concept")
+
+
+def _normalize_hf_token_text(raw_text: Any) -> str:
+    text = str(raw_text or "")
+    text = text.replace("##", "")
+    text = text.replace("▁", " ")
+    return " ".join(text.split()).strip()
+
+
+def _extract_entities_hf(text: str, threshold: float = 0.4) -> list[dict[str, Any]]:
+    model = _get_model()
+    raw = model(text)
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        token_text = _normalize_hf_token_text(item.get("word"))
+        if not token_text:
+            continue
+        label = _normalize_hf_label(item.get("entity_group") or item.get("entity"))
+        score = float(item.get("score") or 0.5)
+        if score < threshold:
+            continue
+        key = (token_text.lower(), label)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"text": token_text, "label": label, "score": score})
+    return out
+
+
+def _parse_rebel_triplets(raw_text: str) -> list[dict[str, str]]:
+    """Parse REBEL-style generated text into triplets."""
+    cleaned = (
+        str(raw_text or "")
+        .replace("<s>", " ")
+        .replace("</s>", " ")
+        .replace("<pad>", " ")
+        .strip()
+    )
+    if not cleaned:
+        return []
+
+    tokens = cleaned.split()
+    triplets: list[dict[str, str]] = []
+    subject = ""
+    obj = ""
+    relation = ""
+    mode = ""
+
+    def flush() -> None:
+        nonlocal subject, obj, relation
+        subj_text = " ".join(subject.split()).strip()
+        obj_text = " ".join(obj.split()).strip()
+        rel_text = " ".join(relation.split()).strip()
+        if subj_text and obj_text and rel_text:
+            triplets.append({"head": subj_text, "tail": obj_text, "label": rel_text})
+        subject = ""
+        obj = ""
+        relation = ""
+
+    for token in tokens:
+        if token == "<triplet>":
+            flush()
+            mode = "subject"
+            continue
+        if token == "<subj>":
+            mode = "object"
+            continue
+        if token == "<obj>":
+            mode = "relation"
+            continue
+
+        if mode == "subject":
+            subject = f"{subject} {token}".strip()
+        elif mode == "object":
+            obj = f"{obj} {token}".strip()
+        elif mode == "relation":
+            relation = f"{relation} {token}".strip()
+
+    flush()
+    return triplets
+
+
+def _resolve_entity_name(candidate: str, entities: list[dict[str, Any]]) -> str:
+    text = " ".join(str(candidate or "").split()).strip()
+    if not text:
+        return ""
+    if not entities:
+        return text
+
+    lowered = text.lower()
+    for ent in entities:
+        name = str(ent.get("text") or "").strip()
+        if name and name.lower() == lowered:
+            return name
+
+    for ent in entities:
+        name = str(ent.get("text") or "").strip()
+        if not name:
+            continue
+        name_low = name.lower()
+        if lowered in name_low or name_low in lowered:
+            return name
+
+    return text
+
+
+def _extract_relations_hf(
+    text: str,
+    entities: list[dict[str, Any]],
+    threshold: float = 0.4,
+) -> list[dict[str, Any]]:
+    relation_model = _get_relation_model_hf()
+    if relation_model is None:
+        return []
+
+    try:
+        generations = relation_model(
+            text[:5000],
+            max_new_tokens=256,
+            do_sample=False,
+            truncation=True,
+        )
+    except Exception as exc:
+        if getattr(config, "STRICT_AI", False):
+            raise RuntimeError("HF relation extraction failed in strict_ai mode.") from exc
+        log.error("HF relation extraction failed", exc_info=True)
+        return []
+
+    if not isinstance(generations, list):
+        return []
+
+    relations: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    base_score = 0.6
+    if base_score < threshold:
+        return []
+
+    for item in generations:
+        if not isinstance(item, dict):
+            continue
+        raw_text = str(item.get("generated_text") or "").strip()
+        if not raw_text:
+            continue
+        for triplet in _parse_rebel_triplets(raw_text):
+            head = _resolve_entity_name(str(triplet.get("head") or ""), entities)
+            tail = _resolve_entity_name(str(triplet.get("tail") or ""), entities)
+            label = " ".join(str(triplet.get("label") or "").split()).strip().lower()
+
+            if not head or not tail or not label:
+                continue
+            if head.lower() == tail.lower():
+                continue
+
+            key = (head.lower(), label, tail.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            relations.append(
+                {
+                    "head": head,
+                    "tail": tail,
+                    "label": label,
+                    "score": base_score,
+                }
+            )
+    return relations
 
 
 def extract_entities(text: str, threshold: float = 0.4) -> list[dict[str, Any]]:
-    """Extract entities only (lightweight).
+    """Extract entities only.
 
     Returns list of {"text": str, "label": str, "score": float}.
     """
-    model = _get_model()
-    schema = _build_entity_schema()
-    result = model.extract(text, schema, threshold=threshold, include_confidence=True)
+    backend = _active_backend()
+    try:
+        if backend == "hf_token_classification":
+            return _extract_entities_hf(text, threshold=threshold)
+
+        model = _get_model()
+        schema = _build_entity_schema()
+        result = model.extract(text, schema, threshold=threshold, include_confidence=True)
+    except Exception as exc:
+        if getattr(config, "STRICT_AI", False):
+            raise RuntimeError("Entity extraction failed in strict_ai mode.") from exc
+        log.error("Entity extraction failed", exc_info=True)
+        return []
 
     entity_dict = result.get("entities", result)
-    entities = []
+    entities: list[dict[str, Any]] = []
     for etype, items in entity_dict.items():
         if not isinstance(items, list):
             continue
         for item in items:
             if isinstance(item, dict):
-                entities.append({
-                    "text": item.get("text", ""),
-                    "label": etype,
-                    "score": item.get("confidence", 0.5),
-                })
+                score = float(item.get("confidence", 0.5) or 0.5)
+                if score < threshold:
+                    continue
+                entities.append({"text": item.get("text", ""), "label": etype, "score": score})
     return entities
 
 
 def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
-    """Full extraction: entities + relationships.
+    """Full extraction entry point used by the pipeline."""
+    backend = _active_backend()
+    t0 = time.monotonic()
 
-    Returns {
-        "entities": [{"text", "label", "score"}, ...],
-        "relations": [{"head", "tail", "label", "score"}, ...],
-        "latency_ms": int,
-    }.
-    """
+    if backend == "hf_token_classification":
+        entities = extract_entities(text, threshold=threshold)
+        relations = _extract_relations_hf(text, entities=entities, threshold=threshold)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        return {"entities": entities, "relations": relations, "latency_ms": latency_ms}
+
     model = _get_model()
     schema = _build_schema()
 
-    t0 = time.monotonic()
-
     try:
-        result = model.extract(
-            text, schema,
-            threshold=threshold,
-            include_confidence=True,
-        )
-    except Exception:
+        result = model.extract(text, schema, threshold=threshold, include_confidence=True)
+    except Exception as exc:
+        if getattr(config, "STRICT_AI", False):
+            raise RuntimeError("Extraction failed in strict_ai mode.") from exc
         log.error("Extraction failed", exc_info=True)
         return {"entities": [], "relations": [], "latency_ms": 0}
 
     latency_ms = int((time.monotonic() - t0) * 1000)
 
-    # Parse entities
     entity_dict = result.get("entities", {})
-    entities = []
+    entities: list[dict[str, Any]] = []
     for etype, items in entity_dict.items():
         if not isinstance(items, list):
             continue
         for item in items:
             if isinstance(item, dict):
-                entities.append({
-                    "text": item.get("text", ""),
-                    "label": etype,
-                    "score": item.get("confidence", 0.5),
-                })
+                entities.append(
+                    {
+                        "text": item.get("text", ""),
+                        "label": etype,
+                        "score": item.get("confidence", 0.5),
+                    }
+                )
 
-    # Parse relations
     rel_dict = result.get("relation_extraction", {})
-    relations = []
+    relations: list[dict[str, Any]] = []
     for rtype, items in rel_dict.items():
         if not isinstance(items, list):
             continue
@@ -316,20 +455,59 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
             tail_conf = tail.get("confidence", 0.5) if isinstance(tail, dict) else 0.5
 
             if head_text and tail_text:
-                relations.append({
-                    "head": head_text,
-                    "tail": tail_text,
-                    "label": rtype,
-                    "score": min(head_conf, tail_conf),
-                })
+                relations.append(
+                    {
+                        "head": head_text,
+                        "tail": tail_text,
+                        "label": rtype,
+                        "score": min(head_conf, tail_conf),
+                    }
+                )
 
     log.debug(
         "Extracted %d entities, %d relations in %dms",
         len(entities), len(relations), latency_ms,
     )
 
+    return {"entities": entities, "relations": relations, "latency_ms": latency_ms}
+
+
+def prefetch_model(
+    backend: str | None = None,
+    model: str | None = None,
+    relation_model: str | None = None,
+) -> dict[str, Any]:
+    """Download/cache a model now without waiting for first extraction call."""
+    selected_backend = _normalize_backend(backend or _active_backend())
+    selected_model = str(model or "").strip()
+    selected_relation_model = str(relation_model or "").strip()
+
+    if selected_backend == "gliner2":
+        model_ref = _resolve_gliner_model_ref(selected_model)
+        from gliner2 import GLiNER2
+
+        GLiNER2.from_pretrained(model_ref)
+        return {"backend": selected_backend, "model": model_ref, "relation_model": "", "status": "ready"}
+
+    model_ref = selected_model or _active_model_ref()
+    if not model_ref:
+        raise ValueError(
+            "No model provided for hf_token_classification prefetch. "
+            "Set one via /extractors/config or pass a model explicitly."
+        )
+    relation_ref = selected_relation_model or _active_relation_model_ref()
+    if not relation_ref:
+        raise ValueError(
+            "No relation model provided for hf_token_classification prefetch. "
+            "Set one via /extractors/config or pass relation_model explicitly."
+        )
+    from transformers import pipeline
+
+    pipeline("token-classification", model=model_ref, tokenizer=model_ref, aggregation_strategy="simple")
+    pipeline("text2text-generation", model=relation_ref, tokenizer=relation_ref)
     return {
-        "entities": entities,
-        "relations": relations,
-        "latency_ms": latency_ms,
+        "backend": selected_backend,
+        "model": model_ref,
+        "relation_model": relation_ref,
+        "status": "ready",
     }

@@ -61,6 +61,25 @@ class FakeGraph:
             "two_hop_connections": [],
         }
 
+    def list_entities_for_embedding(self, limit: int = 5000):
+        rows = [
+            {
+                "entity_id": "entity-brian",
+                "name": "Brian",
+                "entity_type": "Person",
+                "content": "Brian works at Databricks.",
+                "confidence": 0.9,
+            },
+            {
+                "entity_id": "entity-databricks",
+                "name": "Databricks",
+                "entity_type": "Organization",
+                "content": "Databricks is a data company.",
+                "confidence": 0.88,
+            },
+        ]
+        return rows[: max(1, int(limit))]
+
 
 class FakeVectorStore:
     def get_stats(self):
@@ -75,8 +94,10 @@ def client(monkeypatch):
     pytest.importorskip("fastapi")
     monkeypatch.setenv("MOLLYGRAPH_TEST_MODE", "1")
 
+    import config
     import main
 
+    importlib.reload(config)
     importlib.reload(main)
 
     main.queue = FakeQueue()

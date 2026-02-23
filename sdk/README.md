@@ -26,7 +26,18 @@ client = MollyGraphClient(
 
 print(client.health())
 print(client.query("What do we know about Brian?"))
+print(client.get_embedding_config())
+print(client.get_embedding_status())
 client.close()
+```
+
+Switch embedding providers/models:
+
+```python
+client.add_embedding_model("huggingface", "BAAI/bge-small-en-v1.5")
+client.set_embedding_provider("huggingface", "BAAI/bge-small-en-v1.5")
+client.add_embedding_model("ollama", "nomic-embed-text", activate=True)
+client.reindex_embeddings(limit=5000, dry_run=False)
 ```
 
 ## MCP Adapter

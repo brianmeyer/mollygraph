@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -13,21 +17,55 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 import config
+from metrics.stats_logger import get_summary, log_request
 from audit.llm_audit import run_llm_audit
+from embedding_registry import (
+    add_embedding_model,
+    get_embedding_registry,
+    get_embedding_status,
+    initialize_embedding_registry,
+    set_active_embedding_provider,
+)
+from extractor_registry import (
+    add_extractor_model,
+    get_extractor_registry,
+    get_extractor_status,
+    initialize_extractor_registry,
+    set_active_extractor_backend,
+)
+from extractor_schema_registry import (
+    get_extractor_schema_presets,
+    get_extractor_schema_status,
+    initialize_extractor_schema_registry,
+    set_active_extractor_schema,
+    upload_custom_extractor_schema,
+)
 from evolution.gliner_training import get_gliner_stats, run_gliner_finetune_pipeline
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
 from maintenance.auditor import run_maintenance_cycle
 from memory.bitemporal_graph import BiTemporalGraph
-from memory.graph import get_graph_summary, get_relationship_type_distribution
+from memory import extractor as memory_extractor
 from memory.graph_suggestions import build_suggestion_digest
 from memory.models import ExtractionJob
 from memory.vector_store import VectorStore
+from runtime_graph import set_graph_instance
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","message":"%(message)s"}',
-)
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "module": record.module,
+        })
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonFormatter())
+logging.root.addHandler(_handler)
+logging.root.setLevel(logging.INFO)
+
 log = logging.getLogger("mollygraph")
 
 security = HTTPBearer(auto_error=False)
@@ -37,6 +75,30 @@ app = FastAPI(
     description="Local-first graph + vector memory service",
     version="1.0.0",
 )
+
+@app.middleware("http")
+async def timing_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Process-Time-Ms"] = f"{duration_ms:.2f}"
+    log.info("request", extra={
+        "path": request.url.path,
+        "method": request.method,
+        "status": response.status_code,
+        "duration_ms": round(duration_ms, 2),
+    })
+    try:
+        log_request(
+            path=request.url.path,
+            method=request.method,
+            status=response.status_code,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        pass
+    return response
+
 
 # Global instances initialized during lifespan startup.
 graph: BiTemporalGraph | None = None
@@ -117,6 +179,52 @@ class TrainRequest(BaseModel):
     force: bool = False
 
 
+class EmbeddingConfigRequest(BaseModel):
+    provider: str = Field(default="hash")
+    model: str | None = None
+
+
+class EmbeddingModelRequest(BaseModel):
+    provider: str
+    model: str
+    activate: bool = False
+
+
+class EmbeddingReindexRequest(BaseModel):
+    limit: int = Field(default=5000, ge=1, le=500000)
+    dry_run: bool = False
+
+
+class ExtractorConfigRequest(BaseModel):
+    backend: str = Field(default="gliner2")
+    model: str | None = None
+    relation_model: str | None = None
+
+
+class ExtractorModelRequest(BaseModel):
+    backend: str
+    model: str
+    role: str = Field(default="entity")
+    activate: bool = False
+
+
+class ExtractorPrefetchRequest(BaseModel):
+    backend: str | None = None
+    model: str | None = None
+    relation_model: str | None = None
+
+
+class ExtractorSchemaConfigRequest(BaseModel):
+    mode: str = Field(default="default")
+    preset: str | None = None
+
+
+class ExtractorSchemaUploadRequest(BaseModel):
+    entities: dict[str, Any] | list[str]
+    relations: dict[str, Any] | list[str]
+    activate: bool = True
+
+
 def verify_api_key(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> str:
     if credentials is None:
         raise HTTPException(
@@ -140,18 +248,131 @@ def require_runtime_ready() -> None:
         raise HTTPException(status_code=503, detail="Service not ready")
 
 
+def _refresh_embedding_runtime() -> None:
+    # Force re-load when HF model/provider changes.
+    ExtractionPipeline.invalidate_embedding_cache()
+
+
+def _refresh_extractor_runtime() -> None:
+    # Force extractor model reload when backend/model changes.
+    memory_extractor.invalidate_model_cache()
+
+
+def _validate_strict_ai_startup() -> None:
+    if not getattr(config, "STRICT_AI", False):
+        return
+
+    errors: list[str] = []
+    embedding_status = get_embedding_status()
+    extractor_status = get_extractor_status()
+
+    for item in embedding_status.get("blocking_errors", []):
+        text = str(item).strip()
+        if text:
+            errors.append(text)
+    for item in extractor_status.get("blocking_errors", []):
+        text = str(item).strip()
+        if text:
+            errors.append(text)
+
+    if errors:
+        raise RuntimeError("strict_ai startup validation failed: " + " | ".join(errors))
+
+
+def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
+    if graph is None or vector_store is None:
+        raise RuntimeError("Service not ready")
+
+    rows = graph.list_entities_for_embedding(limit=limit)
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "provider": config.EMBEDDING_BACKEND,
+            "model": (
+                config.EMBEDDING_MODEL
+                if config.EMBEDDING_BACKEND in {"huggingface", "sentence-transformers", "sentence_transformers", "st", "hf"}
+                else config.OLLAMA_EMBED_MODEL if config.EMBEDDING_BACKEND == "ollama" else ""
+            ),
+            "entities_found": len(rows),
+            "reindexed": 0,
+            "failed": 0,
+            "sample": rows[:5],
+        }
+
+    reindexed = 0
+    failed = 0
+    errors: list[dict[str, str]] = []
+    for row in rows:
+        entity_id = str(row.get("entity_id") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not entity_id or not name:
+            failed += 1
+            continue
+
+        entity_type = str(row.get("entity_type") or "Concept")
+        content = str(row.get("content") or "")
+        confidence = float(row.get("confidence") or 1.0)
+        source_text = f"{name} {entity_type} {content[:500]}"
+        embedding = ExtractionPipeline._text_embedding(source_text)
+        try:
+            vector_store.add_entity(
+                entity_id=entity_id,
+                name=name,
+                entity_type=entity_type,
+                dense_embedding=embedding,
+                content=content[:1000] if content else name,
+                confidence=confidence,
+            )
+            reindexed += 1
+        except Exception as exc:
+            failed += 1
+            if len(errors) < 10:
+                errors.append({"entity_id": entity_id, "name": name, "error": str(exc)})
+
+    return {
+        "status": "ok" if failed == 0 else "partial",
+        "provider": config.EMBEDDING_BACKEND,
+        "model": (
+            config.EMBEDDING_MODEL
+            if config.EMBEDDING_BACKEND in {"huggingface", "sentence-transformers", "sentence_transformers", "st", "hf"}
+            else config.OLLAMA_EMBED_MODEL if config.EMBEDDING_BACKEND == "ollama" else ""
+        ),
+        "entities_found": len(rows),
+        "reindexed": reindexed,
+        "failed": failed,
+        "errors": errors,
+    }
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global graph, vector_store, pipeline, queue, queue_worker, _worker_task
 
+    initialize_embedding_registry()
+    initialize_extractor_registry()
+    initialize_extractor_schema_registry()
+
+    # Verify gliner2 is importable at startup.
+    try:
+        import gliner2  # type: ignore
+        log.info("startup_check: gliner2 OK", extra={"path": gliner2.__file__})
+    except ImportError as e:
+        log.error("startup_check FAILED: %s. Python: %s", e, sys.executable)
+        raise RuntimeError(f"GLiNER2 not importable: {e}")
+    log.info("boot: python=%s venv=%s", sys.executable, os.environ.get("VIRTUAL_ENV", "none"))
+
     if config.TEST_MODE:
+        set_graph_instance(None)
         log.info("Starting in test mode (external services disabled)")
         yield
         return
 
+    _validate_strict_ai_startup()
+
     log.info("Starting MollyGraph service")
 
     graph = BiTemporalGraph(config.NEO4J_URI, config.NEO4J_USER, config.NEO4J_PASSWORD)
+    set_graph_instance(graph)
     try:
         vector_store = VectorStore(backend=config.VECTOR_BACKEND)
     except Exception:
@@ -184,8 +405,8 @@ async def lifespan(_app: FastAPI):
                 await _worker_task
             except asyncio.CancelledError:
                 pass
-        if graph is not None:
-            graph.close()
+        set_graph_instance(None)
+        graph = None
 
 
 app.router.lifespan_context = lifespan
@@ -219,22 +440,30 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    queue_pending = await asyncio.to_thread(queue.get_pending_count) if queue else 0
+    queue_processing = await asyncio.to_thread(queue.get_processing_count) if queue else 0
     return {
         "status": "healthy",
         "version": "1.0.0",
         "port": config.PORT,
         "test_mode": config.TEST_MODE,
-        "queue_pending": queue.get_pending_count() if queue else 0,
-        "queue_processing": queue.get_processing_count() if queue else 0,
+        "queue_pending": queue_pending,
+        "queue_processing": queue_processing,
         "vector_stats": vector_store.get_stats() if vector_store else {},
     }
+
+
+@app.get("/metrics/summary")
+async def metrics_summary(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return daily metrics summary: request counts, latencies, extraction quality."""
+    return get_summary()
 
 
 @app.get("/stats", response_model=StatsResponse)
 async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     queue_stats = {
-        "pending": queue.get_pending_count() if queue else 0,
-        "processing": queue.get_processing_count() if queue else 0,
+        "pending": await asyncio.to_thread(queue.get_pending_count) if queue else 0,
+        "processing": await asyncio.to_thread(queue.get_processing_count) if queue else 0,
     }
 
     vector_stats = vector_store.get_stats() if vector_store else {}
@@ -247,10 +476,10 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     }
     rel_distribution: dict[str, int] = {}
 
-    if not config.TEST_MODE:
+    if not config.TEST_MODE and graph is not None:
         try:
-            graph_summary = get_graph_summary()
-            rel_distribution = get_relationship_type_distribution()
+            graph_summary = graph.get_graph_summary()
+            rel_distribution = graph.get_relationship_type_distribution()
         except Exception:
             log.debug("Graph summary unavailable", exc_info=True)
 
@@ -286,12 +515,13 @@ async def ingest(
         priority=priority,
         reference_time=datetime.utcnow(),
     )
-    job_id = queue.submit(job)
+    job_id = await asyncio.to_thread(queue.submit, job)
+    queue_depth = await asyncio.to_thread(queue.get_pending_count)
 
     return {
         "job_id": job_id,
         "status": "queued",
-        "queue_depth": queue.get_pending_count(),
+        "queue_depth": queue_depth,
     }
 
 
@@ -396,6 +626,158 @@ async def train_gliner(req: TrainRequest, _api_key: str = Depends(verify_api_key
 @app.get("/training/status", operation_id="get_training_status_legacy")  # Legacy alias for train namespace drift.
 async def train_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return {"gliner": get_gliner_stats()}
+
+
+@app.get("/embeddings/config")
+async def embeddings_config(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    return get_embedding_registry()
+
+
+@app.get("/embeddings/status")
+async def embeddings_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    return get_embedding_status()
+
+
+@app.post("/embeddings/config")
+async def set_embeddings_config(
+    req: EmbeddingConfigRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        payload = set_active_embedding_provider(req.provider, req.model)
+        _refresh_embedding_runtime()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/embeddings/models")
+async def add_embeddings_model(
+    req: EmbeddingModelRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        payload = add_embedding_model(req.provider, req.model, activate=req.activate)
+        if req.activate:
+            _refresh_embedding_runtime()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/embeddings/reindex")
+async def reindex_embeddings(
+    req: EmbeddingReindexRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    require_runtime_ready()
+    try:
+        return await asyncio.to_thread(_reindex_embeddings_sync, req.limit, req.dry_run)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/extractors/config")
+async def extractors_config(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    return get_extractor_registry()
+
+
+@app.get("/extractors/status")
+async def extractors_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    return get_extractor_status()
+
+
+@app.get("/extractors/schema")
+async def extractors_schema(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    return get_extractor_schema_status(include_schema=True)
+
+
+@app.get("/extractors/schema/presets")
+async def extractors_schema_presets(
+    include_schema: bool = False,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    return get_extractor_schema_presets(include_schema=include_schema)
+
+
+@app.post("/extractors/schema")
+async def set_extractors_schema(
+    req: ExtractorSchemaConfigRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        payload = set_active_extractor_schema(req.mode, req.preset)
+        _refresh_extractor_runtime()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/extractors/schema/upload")
+async def upload_extractors_schema(
+    req: ExtractorSchemaUploadRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        payload = upload_custom_extractor_schema(
+            schema={"entities": req.entities, "relations": req.relations},
+            activate=req.activate,
+        )
+        if req.activate:
+            _refresh_extractor_runtime()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/extractors/config")
+async def set_extractors_config(
+    req: ExtractorConfigRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        payload = set_active_extractor_backend(req.backend, req.model, req.relation_model)
+        _refresh_extractor_runtime()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/extractors/models")
+async def add_extractors_model(
+    req: ExtractorModelRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        payload = add_extractor_model(
+            req.backend,
+            req.model,
+            activate=req.activate,
+            role=req.role,
+        )
+        if req.activate:
+            _refresh_extractor_runtime()
+        return payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/extractors/prefetch")
+async def prefetch_extractor_model(
+    req: ExtractorPrefetchRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            memory_extractor.prefetch_model,
+            req.backend,
+            req.model,
+            req.relation_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/maintenance/run")

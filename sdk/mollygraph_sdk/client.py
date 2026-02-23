@@ -50,3 +50,34 @@ class MollyGraphClient:
         resp = self._client.post("/train/gliner", json={"force": force})
         resp.raise_for_status()
         return resp.json()
+
+    def get_embedding_config(self) -> dict[str, Any]:
+        resp = self._client.get("/embeddings/config")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_embedding_status(self) -> dict[str, Any]:
+        resp = self._client.get("/embeddings/status")
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_embedding_provider(self, provider: str, model: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"provider": provider}
+        if model is not None:
+            payload["model"] = model
+        resp = self._client.post("/embeddings/config", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def add_embedding_model(self, provider: str, model: str, activate: bool = False) -> dict[str, Any]:
+        resp = self._client.post(
+            "/embeddings/models",
+            json={"provider": provider, "model": model, "activate": activate},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def reindex_embeddings(self, limit: int = 5000, dry_run: bool = False) -> dict[str, Any]:
+        resp = self._client.post("/embeddings/reindex", json={"limit": limit, "dry_run": dry_run})
+        resp.raise_for_status()
+        return resp.json()

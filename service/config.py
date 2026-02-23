@@ -67,12 +67,20 @@ PORT = int(os.environ.get("GRAPH_MEMORY_PORT", "7422"))
 API_KEY = os.environ.get("MOLLYGRAPH_API_KEY", "dev-key-change-in-production")
 TEST_MODE = os.environ.get("MOLLYGRAPH_TEST_MODE", "0").strip().lower() in {"1", "true", "yes"}
 VECTOR_BACKEND = os.environ.get("MOLLYGRAPH_VECTOR_BACKEND", "zvec")
+RUNTIME_PROFILE = os.environ.get("MOLLYGRAPH_RUNTIME_PROFILE", "hybrid").strip().lower()
+STRICT_AI = (
+    RUNTIME_PROFILE == "strict_ai"
+    or os.environ.get("MOLLYGRAPH_STRICT_AI", "0").strip().lower() in {"1", "true", "yes", "on"}
+)
 SPACY_ENRICHMENT = os.environ.get("MOLLYGRAPH_SPACY_ENRICHMENT", "0").strip().lower() in {"1", "true", "yes", "on"}
 SPACY_MODEL = os.environ.get("MOLLYGRAPH_SPACY_MODEL", "en_core_web_sm")
 SPACY_MIN_GLINER_ENTITIES = int(os.environ.get("MOLLYGRAPH_SPACY_MIN_GLINER_ENTITIES", "2"))
 EMBEDDING_BACKEND = os.environ.get("MOLLYGRAPH_EMBEDDING_BACKEND", "hash").strip().lower()
 EMBEDDING_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 OLLAMA_EMBED_MODEL = os.environ.get("MOLLYGRAPH_OLLAMA_EMBED_MODEL", "nomic-embed-text")
+EXTRACTOR_BACKEND = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "gliner2").strip().lower()
+EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
+EXTRACTOR_RELATION_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_MODEL", "Babelscape/rebel-large").strip()
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")

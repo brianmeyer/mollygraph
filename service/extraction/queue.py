@@ -250,7 +250,7 @@ class QueueWorker:
             active = len([t for t in self._tasks if not t.done()])
             
             if active < self.max_concurrent:
-                job = self.queue.claim_next()
+                job = await asyncio.to_thread(self.queue.claim_next)
                 
                 if job:
                     # Process in background
@@ -270,16 +270,17 @@ class QueueWorker:
             log.debug(f"Processing job {job.id}")
             result = await self.processor(job)
             
-            self.queue.complete(
-                job.id, 
-                success=(result.status == 'completed'),
-                error=result.error,
-                result=result.model_dump() if result.status == 'completed' else None
+            await asyncio.to_thread(
+                self.queue.complete,
+                job.id,
+                result.status == 'completed',
+                result.error,
+                result.model_dump() if result.status == 'completed' else None,
             )
             
         except Exception as e:
             log.error(f"Job {job.id} failed: {e}", exc_info=True)
-            self.queue.complete(job.id, success=False, error=str(e))
+            await asyncio.to_thread(self.queue.complete, job.id, False, str(e), None)
     
     def stop(self):
         """Signal the worker to stop."""

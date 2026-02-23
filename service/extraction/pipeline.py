@@ -14,6 +14,7 @@ import logging
 import math
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Any
@@ -24,6 +25,11 @@ from memory.bitemporal_graph import BiTemporalGraph
 from memory.vector_store import VectorStore
 from memory import extractor as gliner_extractor
 from memory.graph_suggestions import log_relationship_fallback
+
+try:
+    from metrics.stats_logger import log_extraction as _log_extraction
+except Exception:  # pragma: no cover
+    _log_extraction = None  # type: ignore
 
 try:
     import spacy  # type: ignore
@@ -55,6 +61,20 @@ _ALLOWED_REL_TYPES = {
     "DEPENDS_ON",
     "RELATED_TO",
     "MENTIONS",
+    # Education / school relationships
+    "ATTENDS",          # kids → school
+    "TEACHES_AT",       # teacher → school
+    "ALUMNI_OF",        # person → school (alma mater)
+    "STUDIED_AT",       # person → school (attended)
+    # Family relationships
+    "PARENT_OF",        # parent → child
+    "CHILD_OF",         # child → parent
+    # Workplace / professional
+    "REPORTS_TO",       # employee → manager
+    "CUSTOMER_OF",      # person → company
+    # Social / peer
+    "CLASSMATE_OF",     # person → person
+    "MENTORED_BY",      # person → mentor
 }
 
 _SPACY_LABEL_MAP = {
@@ -72,6 +92,7 @@ _SPACY_LABEL_MAP = {
 class ExtractionPipeline:
     """End-to-end extraction and graph/vector persistence."""
     _st_model: Any | None = None
+    _st_model_ref: str = ""
     _st_lock = threading.Lock()
     _embed_warning_emitted = False
 
@@ -80,8 +101,10 @@ class ExtractionPipeline:
         self.vector_store = vector_store
         self._spacy_nlp: Any | None = None
         self._spacy_attempted = False
+        self._spacy_strict_notice_emitted = False
 
     async def process_job(self, job: ExtractionJob) -> ExtractionJob:
+        _t_start = time.perf_counter()
         try:
             job.status = "processing"
             job.started_at = datetime.utcnow()
@@ -90,13 +113,17 @@ class ExtractionPipeline:
             raw_entities = extracted.get("entities", []) if isinstance(extracted, dict) else []
             raw_relations = extracted.get("relations", []) if isinstance(extracted, dict) else []
 
-            if service_config.SPACY_ENRICHMENT:
+            if service_config.SPACY_ENRICHMENT and not service_config.STRICT_AI:
                 raw_entities.extend(
                     self._spacy_enrich_entities(
                         content=job.content,
                         gliner_entity_count=len(raw_entities),
                     )
                 )
+            elif service_config.SPACY_ENRICHMENT and service_config.STRICT_AI:
+                if not self._spacy_strict_notice_emitted:
+                    log.info("strict_ai mode enabled; skipping spaCy enrichment fallback")
+                    self._spacy_strict_notice_emitted = True
 
             entities = self._build_entities(raw_entities)
             canonical_names: dict[str, str] = {}
@@ -121,7 +148,7 @@ class ExtractionPipeline:
                 except Exception:
                     log.debug("Vector index upsert failed for %s", entity.name, exc_info=True)
 
-            relationships = self._build_relationships(
+            relationships, fallback_count = self._build_relationships(
                 raw_relations=raw_relations,
                 canonical_names=canonical_names,
                 reference_time=job.reference_time,
@@ -147,6 +174,48 @@ class ExtractionPipeline:
             job.status = "completed"
             job.completed_at = datetime.utcnow()
             job.error = None
+
+            # ── Metrics logging ───────────────────────────────────────────────
+            processing_time_ms = (time.perf_counter() - _t_start) * 1000
+            scores = [
+                self._safe_float(e.get("score"), default=0.5)
+                for e in raw_entities
+                if isinstance(e, dict)
+            ]
+            conf_min = min(scores) if scores else 0.0
+            conf_max = max(scores) if scores else 0.0
+            conf_avg = sum(scores) / len(scores) if scores else 0.0
+
+            log.info(
+                "extraction_complete",
+                extra={
+                    "job_id": getattr(job, "id", "unknown"),
+                    "entities": len(stored_entities),
+                    "relationships": len(relationships),
+                    "fallbacks": fallback_count,
+                    "conf_min": round(conf_min, 4),
+                    "conf_max": round(conf_max, 4),
+                    "conf_avg": round(conf_avg, 4),
+                    "processing_ms": round(processing_time_ms, 2),
+                },
+            )
+
+            if _log_extraction is not None:
+                try:
+                    _log_extraction(
+                        job_id=getattr(job, "job_id", getattr(job, "id", "unknown")),
+                        entities_extracted=len(stored_entities),
+                        relationships_extracted=len(relationships),
+                        fallback_count=fallback_count,
+                        processing_time_ms=processing_time_ms,
+                        content_length=len(job.content),
+                        confidence_min=conf_min,
+                        confidence_max=conf_max,
+                        confidence_avg=conf_avg,
+                    )
+                except Exception:
+                    log.debug("metrics log_extraction failed", exc_info=True)
+
             return job
 
         except Exception as exc:
@@ -196,9 +265,11 @@ class ExtractionPipeline:
         canonical_names: dict[str, str],
         reference_time: datetime,
         context: str,
-    ) -> list[Relationship]:
+    ) -> tuple[list[Relationship], int]:
+        """Build relationships list. Returns (relationships, fallback_count)."""
         relationships: list[Relationship] = []
         seen: set[tuple[str, str, str]] = set()
+        fallback_count = 0
 
         for item in raw_relations:
             if not isinstance(item, dict):
@@ -225,6 +296,7 @@ class ExtractionPipeline:
                     context=context[:200],
                 )
                 rel_type = "RELATED_TO"
+                fallback_count += 1
 
             dedupe_key = (source.lower(), rel_type, target.lower())
             if dedupe_key in seen:
@@ -244,7 +316,7 @@ class ExtractionPipeline:
                 )
             )
 
-        return relationships
+        return relationships, fallback_count
 
     def _spacy_enrich_entities(self, content: str, gliner_entity_count: int) -> list[dict[str, Any]]:
         """Optional NER enrichment when GLiNER yields sparse extraction."""
@@ -335,23 +407,45 @@ class ExtractionPipeline:
             return default
 
     @staticmethod
+    def invalidate_embedding_cache() -> None:
+        with ExtractionPipeline._st_lock:
+            ExtractionPipeline._st_model = None
+            ExtractionPipeline._st_model_ref = ""
+        ExtractionPipeline._embed_warning_emitted = False
+
+    @staticmethod
     def _text_embedding(text: str, dim: int = 768) -> list[float]:
         """Compute embedding using local-first backend with deterministic fallback."""
         backend = service_config.EMBEDDING_BACKEND
 
-        if backend in {"sentence-transformers", "sentence_transformers", "st"}:
+        if service_config.STRICT_AI and backend == "hash":
+            raise RuntimeError(
+                "strict_ai mode does not allow hash embeddings. "
+                "Choose huggingface or ollama via /embeddings/config."
+            )
+
+        if backend in {"sentence-transformers", "sentence_transformers", "st", "huggingface", "hf"}:
             try:
                 with ExtractionPipeline._st_lock:
-                    if ExtractionPipeline._st_model is None:
+                    current_model_ref = str(service_config.EMBEDDING_MODEL or "").strip()
+                    if (
+                        ExtractionPipeline._st_model is None
+                        or ExtractionPipeline._st_model_ref != current_model_ref
+                    ):
                         from sentence_transformers import SentenceTransformer
 
-                        ExtractionPipeline._st_model = SentenceTransformer(service_config.EMBEDDING_MODEL)
+                        ExtractionPipeline._st_model = SentenceTransformer(current_model_ref)
+                        ExtractionPipeline._st_model_ref = current_model_ref
                 vector = ExtractionPipeline._st_model.encode(
                     text,
                     normalize_embeddings=True,
                 )
                 return ExtractionPipeline._resize_and_normalize_embedding(vector, dim)
-            except Exception:
+            except Exception as exc:
+                if service_config.STRICT_AI:
+                    raise RuntimeError(
+                        "Sentence-transformers embedding backend failed in strict_ai mode."
+                    ) from exc
                 if not ExtractionPipeline._embed_warning_emitted:
                     log.warning(
                         "sentence-transformers embedding unavailable; falling back to hash backend",
@@ -376,10 +470,19 @@ class ExtractionPipeline:
                     vector = data.get("embedding")
                     if isinstance(vector, list):
                         return ExtractionPipeline._resize_and_normalize_embedding(vector, dim)
-            except Exception:
+            except Exception as exc:
+                if service_config.STRICT_AI:
+                    raise RuntimeError(
+                        "Ollama embedding backend failed in strict_ai mode."
+                    ) from exc
                 if not ExtractionPipeline._embed_warning_emitted:
                     log.warning("Ollama embedding unavailable; falling back to hash backend", exc_info=True)
                     ExtractionPipeline._embed_warning_emitted = True
+
+        if service_config.STRICT_AI:
+            raise RuntimeError(
+                f"No embedding backend output available for backend '{backend}' in strict_ai mode."
+            )
 
         # Default: deterministic local hash embedding (no model server required).
         return ExtractionPipeline._hash_embedding(text, dim)

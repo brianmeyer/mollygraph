@@ -2,16 +2,15 @@
 Bi-temporal graph operations for MollyGraph V2.
 Handles valid_time vs observed_time tracking and relationship decay.
 """
-import asyncio
 import math
+import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple
 import logging
 
 from neo4j import GraphDatabase
 from memory.models import Entity, Relationship, Episode
-import config
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +37,19 @@ RELATION_TIERS = {
     "PART_OF": "structural",
 }
 
+VALID_REL_TYPES = {
+    "WORKS_ON", "WORKS_AT", "KNOWS", "USES", "LOCATED_IN",
+    "DISCUSSED_WITH", "INTERESTED_IN", "CREATED", "MANAGES",
+    "DEPENDS_ON", "RELATED_TO", "MENTIONS",
+    "CLASSMATE_OF", "STUDIED_AT", "ALUMNI_OF",
+    "MENTORS", "MENTORED_BY", "REPORTS_TO", "COLLABORATES_WITH",
+    "CONTACT_OF", "CUSTOMER_OF", "ATTENDS", "PARENT_OF",
+    "CHILD_OF", "RECEIVED_FROM",
+    # Added: OpenClaw improvements
+    "TEACHES_AT",
+}
+_REL_TYPE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
 
 def recency_score(days_since: float) -> float:
     """Exponential decay with configurable half-life."""
@@ -63,6 +75,30 @@ def calculate_strength(mention_count: int, days_since: float, tier: str = "socia
     decayed = base_strength * math.exp(-lambda_decay * days_since)
     
     return round(decayed, 4)
+
+
+def _to_iso_datetime(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    iso_format = getattr(value, "iso_format", None)
+    if callable(iso_format):
+        try:
+            return str(iso_format())
+        except Exception:
+            pass
+
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return str(isoformat())
+        except Exception:
+            pass
+
+    text = str(value).strip()
+    return text or None
 
 
 class BiTemporalGraph:
@@ -217,10 +253,26 @@ class BiTemporalGraph:
                     # Strengthen existing
                     session.run("""
                         MATCH ()-[r {id: $id}]->()
-                        SET r.strength = r.strength + log(1 + r.mention_count),
-                            r.mention_count = r.mention_count + 1,
-                            r.last_mentioned = datetime($now)
-                    """, id=existing["id"], now=datetime.utcnow().isoformat())
+                        SET r.strength = coalesce(r.strength, 0.0) + log(1 + coalesce(r.mention_count, 1)),
+                            r.mention_count = coalesce(r.mention_count, 0) + 1,
+                            r.last_mentioned = datetime($now),
+                            r.observed_at = datetime($now),
+                            r.first_mentioned = coalesce(r.first_mentioned, r.observed_at, r.valid_at, datetime($now)),
+                            r.context_snippets = CASE
+                                WHEN size(coalesce(r.context_snippets, [])) >= 3
+                                THEN coalesce(r.context_snippets, [])[1..] + $new_snippets
+                                ELSE coalesce(r.context_snippets, []) + $new_snippets
+                            END,
+                            r.episode_ids = CASE
+                                WHEN size($new_episode_ids) = 0 THEN coalesce(r.episode_ids, [])
+                                ELSE coalesce(r.episode_ids, []) + [id IN $new_episode_ids WHERE NOT id IN coalesce(r.episode_ids, [])]
+                            END
+                    """,
+                        id=existing["id"],
+                        now=datetime.utcnow().isoformat(),
+                        new_snippets=rel.context_snippets,
+                        new_episode_ids=rel.episode_ids,
+                    )
                     return existing["id"], "updated"
             else:
                 # Create new
@@ -277,6 +329,8 @@ class BiTemporalGraph:
                 valid_at: datetime($valid_at),
                 valid_until: $valid_until,
                 observed_at: datetime($observed_at),
+                first_mentioned: datetime($first_mentioned),
+                last_mentioned: datetime($last_mentioned),
                 confidence: $confidence,
                 strength: $strength,
                 mention_count: $mention_count,
@@ -292,6 +346,8 @@ class BiTemporalGraph:
             valid_at=rel.valid_at.isoformat() if rel.valid_at else datetime.utcnow().isoformat(),
             valid_until=rel.valid_until.isoformat() if rel.valid_until else None,
             observed_at=rel.observed_at.isoformat(),
+            first_mentioned=rel.observed_at.isoformat(),
+            last_mentioned=rel.observed_at.isoformat(),
             confidence=rel.confidence,
             strength=strength,
             mention_count=rel.mention_count,
@@ -373,3 +429,343 @@ class BiTemporalGraph:
                 "direct_connections": [dict(r) for r in direct],
                 "two_hop_connections": [dict(r) for r in two_hop] if hops >= 2 else [],
             }
+
+    # ---------------------------------------------------------------------
+    # Maintenance / Audit Operations
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_rel_type(rel_type: str) -> str:
+        return rel_type.strip().upper().replace(" ", "_")
+
+    @staticmethod
+    def _is_valid_rel_type(rel_type: str) -> bool:
+        return rel_type in VALID_REL_TYPES and bool(_REL_TYPE_RE.match(rel_type))
+
+    def run_strength_decay_sync(self) -> int:
+        """Decay entity and relationship strengths in one pass."""
+        with self.driver.session() as session:
+            entity_record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE e.last_mentioned IS NOT NULL
+                WITH e,
+                     toFloat(coalesce(e.mention_count, 1)) AS mentions,
+                     toFloat(duration.between(datetime(e.last_mentioned), datetime()).days) AS days_since
+                SET e.strength = mentions * exp(-0.03 * days_since)
+                RETURN count(e) AS updated
+                """
+            ).single()
+
+            rel_record = session.run(
+                """
+                MATCH ()-[r]->()
+                WITH r,
+                     coalesce(r.last_mentioned, r.observed_at, r.valid_at) AS last_seen,
+                     toFloat(coalesce(r.mention_count, 1)) AS mentions,
+                     CASE
+                         WHEN type(r) IN ['IS_A', 'PART_OF'] THEN 1000.0
+                         WHEN type(r) IN ['WORKS_AT', 'WORKS_ON', 'SKILLED_IN', 'LIVES_IN'] THEN 180.0
+                         WHEN type(r) IN ['MENTIONS', 'DISCUSSED_WITH', 'SAID', 'RELATED_TO'] THEN 7.0
+                         ELSE 30.0
+                     END AS half_life
+                WHERE last_seen IS NOT NULL
+                WITH r, mentions, half_life,
+                     toFloat(duration.between(datetime(last_seen), datetime()).days) AS days_since
+                SET r.strength = log(1.0 + mentions) * exp(-((log(2.0) / half_life) * days_since))
+                RETURN count(r) AS updated
+                """
+            ).single()
+
+        entity_updated = int(entity_record["updated"]) if entity_record else 0
+        rel_updated = int(rel_record["updated"]) if rel_record else 0
+        total = entity_updated + rel_updated
+        log.info(
+            "Strength decay updated %d entities and %d relationships",
+            entity_updated,
+            rel_updated,
+        )
+        return total
+
+    def delete_orphan_entities_sync(self) -> int:
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE NOT (e)--()
+                DELETE e
+                RETURN count(e) AS deleted
+                """
+            ).single()
+        deleted = int(record["deleted"]) if record else 0
+        log.info("Deleted %d orphan entities", deleted)
+        return deleted
+
+    def delete_self_referencing_rels(self) -> int:
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)-[r]->(e)
+                DELETE r
+                RETURN count(r) AS deleted
+                """
+            ).single()
+        deleted = int(record["deleted"]) if record else 0
+        log.info("Deleted %d self-referencing relationships", deleted)
+        return deleted
+
+    def get_relationships_for_audit(self, limit: int = 500) -> List[Dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (h:Entity)-[r]->(t:Entity)
+                RETURN h.name AS head,
+                       coalesce(h.entity_type, 'Concept') AS head_type,
+                       t.name AS tail,
+                       coalesce(t.entity_type, 'Concept') AS tail_type,
+                       type(r) AS rel_type,
+                       coalesce(r.strength, 0.0) AS strength,
+                       coalesce(r.mention_count, 1) AS mention_count,
+                       coalesce(r.context_snippets, []) AS context_snippets,
+                       coalesce(r.audit_status, 'unverified') AS audit_status,
+                       coalesce(r.first_mentioned, r.observed_at, r.valid_at) AS first_mentioned,
+                       coalesce(r.last_mentioned, r.observed_at, r.valid_at) AS last_mentioned
+                ORDER BY coalesce(r.strength, 0.0) ASC,
+                         coalesce(r.last_mentioned, r.observed_at, r.valid_at) ASC
+                LIMIT $limit
+                """,
+                limit=safe_limit,
+            )
+            return [dict(record) for record in result]
+
+    def get_relationship_type_distribution(self) -> Dict[str, int]:
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH ()-[r]->()
+                RETURN type(r) AS rel_type, count(r) AS cnt
+                ORDER BY cnt DESC
+                """
+            )
+            return {str(record["rel_type"]): int(record["cnt"]) for record in result}
+
+    def set_relationship_audit_status(self, head: str, tail: str, rel_type: str, status: str) -> None:
+        normalized_type = self._normalize_rel_type(rel_type)
+        if not self._is_valid_rel_type(normalized_type):
+            return
+
+        with self.driver.session() as session:
+            session.run(
+                f"""
+                MATCH (h:Entity {{name: $head}})-[r:{normalized_type}]->(t:Entity {{name: $tail}})
+                SET r.audit_status = $status
+                """,
+                head=head,
+                tail=tail,
+                status=status,
+            )
+
+    def reclassify_relationship(
+        self,
+        head: str,
+        tail: str,
+        old_type: str,
+        new_type: str,
+        strength: float,
+        mention_count: int,
+        context_snippets: List[str] | None = None,
+        first_mentioned: str | None = None,
+    ) -> None:
+        normalized_old = self._normalize_rel_type(old_type)
+        normalized_new = self._normalize_rel_type(new_type)
+        if not self._is_valid_rel_type(normalized_old) or not self._is_valid_rel_type(normalized_new):
+            return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        first_iso = _to_iso_datetime(first_mentioned) or now_iso
+        snippets = list(context_snippets or [])
+        mention_value = max(1, int(mention_count or 1))
+        strength_value = max(0.0, float(strength or 0.0))
+
+        with self.driver.session() as session:
+            with session.begin_transaction() as tx:
+                existing = tx.run(
+                    f"""
+                    MATCH (h:Entity {{name: $head}})-[r:{normalized_old}]->(t:Entity {{name: $tail}})
+                    RETURN r.valid_at AS valid_at,
+                           r.observed_at AS observed_at,
+                           r.episode_ids AS episode_ids,
+                           r.confidence AS confidence
+                    ORDER BY coalesce(r.last_mentioned, r.observed_at, r.valid_at) DESC
+                    LIMIT 1
+                    """,
+                    head=head,
+                    tail=tail,
+                ).single()
+
+                valid_iso = _to_iso_datetime(existing.get("valid_at")) if existing else None
+                observed_iso = _to_iso_datetime(existing.get("observed_at")) if existing else None
+                raw_episode_ids = existing.get("episode_ids") if existing else []
+                if isinstance(raw_episode_ids, list):
+                    episode_ids = [str(item) for item in raw_episode_ids if str(item).strip()]
+                else:
+                    episode_ids = []
+                confidence = float(existing.get("confidence") or 0.7) if existing else 0.7
+
+                tx.run(
+                    f"""
+                    MATCH (h:Entity {{name: $head}})-[r:{normalized_old}]->(t:Entity {{name: $tail}})
+                    DELETE r
+                    """,
+                    head=head,
+                    tail=tail,
+                )
+
+                tx.run(
+                    f"""
+                    MATCH (h:Entity {{name: $head}})
+                    MATCH (t:Entity {{name: $tail}})
+                    MERGE (h)-[r:{normalized_new}]->(t)
+                    ON CREATE SET
+                        r.id = $rel_id,
+                        r.valid_at = datetime($valid_at),
+                        r.valid_until = NULL,
+                        r.observed_at = datetime($observed_at),
+                        r.first_mentioned = datetime($first_mentioned),
+                        r.last_mentioned = datetime($now),
+                        r.confidence = $confidence,
+                        r.strength = $strength,
+                        r.mention_count = $mention_count,
+                        r.context_snippets = $snippets,
+                        r.episode_ids = $episode_ids,
+                        r.audit_status = 'auto_fixed'
+                    ON MATCH SET
+                        r.strength = CASE
+                            WHEN $strength > coalesce(r.strength, 0.0) THEN $strength
+                            ELSE coalesce(r.strength, $strength)
+                        END,
+                        r.mention_count = coalesce(r.mention_count, 0) + $mention_count,
+                        r.context_snippets = CASE
+                            WHEN size(coalesce(r.context_snippets, [])) >= 3
+                            THEN coalesce(r.context_snippets, [])[1..] + $snippets
+                            ELSE coalesce(r.context_snippets, []) + $snippets
+                        END,
+                        r.episode_ids = CASE
+                            WHEN size($episode_ids) = 0 THEN coalesce(r.episode_ids, [])
+                            ELSE coalesce(r.episode_ids, []) + [item IN $episode_ids WHERE NOT item IN coalesce(r.episode_ids, [])]
+                        END,
+                        r.last_mentioned = datetime($now),
+                        r.audit_status = 'auto_fixed',
+                        r.first_mentioned = coalesce(r.first_mentioned, datetime($first_mentioned)),
+                        r.valid_at = coalesce(r.valid_at, datetime($valid_at)),
+                        r.observed_at = coalesce(r.observed_at, datetime($observed_at))
+                    """,
+                    head=head,
+                    tail=tail,
+                    rel_id=str(uuid.uuid4()),
+                    valid_at=valid_iso or first_iso,
+                    observed_at=observed_iso or now_iso,
+                    first_mentioned=first_iso,
+                    now=now_iso,
+                    confidence=confidence,
+                    strength=strength_value,
+                    mention_count=mention_value,
+                    snippets=snippets,
+                    episode_ids=episode_ids,
+                )
+                tx.commit()
+
+    def delete_specific_relationship(self, head: str, tail: str, rel_type: str) -> bool:
+        normalized_type = self._normalize_rel_type(rel_type)
+        if not self._is_valid_rel_type(normalized_type):
+            return False
+
+        with self.driver.session() as session:
+            record = session.run(
+                f"""
+                MATCH (h:Entity {{name: $head}})-[r:{normalized_type}]->(t:Entity {{name: $tail}})
+                DELETE r
+                RETURN count(r) AS deleted
+                """,
+                head=head,
+                tail=tail,
+            ).single()
+        return bool(record and int(record["deleted"]) > 0)
+
+    def get_graph_summary(self) -> Dict[str, Any]:
+        with self.driver.session() as session:
+            entity_record = session.run("MATCH (e:Entity) RETURN count(e) AS c").single()
+            rel_record = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()
+            episode_record = session.run("MATCH (ep:Episode) RETURN count(ep) AS c").single()
+
+            top_connected = session.run(
+                """
+                MATCH (e:Entity)
+                OPTIONAL MATCH (e)-[r]-()
+                WITH e, count(r) AS connections
+                ORDER BY connections DESC
+                LIMIT 10
+                RETURN e.name AS name,
+                       coalesce(e.entity_type, 'Concept') AS type,
+                       coalesce(e.mention_count, 0) AS mentions,
+                       connections
+                """
+            )
+
+            recent = session.run(
+                """
+                MATCH (e:Entity)
+                WITH e, coalesce(e.first_mentioned, e.last_mentioned, e.created_at) AS added
+                WHERE added IS NOT NULL
+                RETURN e.name AS name,
+                       coalesce(e.entity_type, 'Concept') AS type,
+                       added
+                ORDER BY added DESC
+                LIMIT 5
+                """
+            )
+            top_rows = [dict(record) for record in top_connected]
+            recent_rows = [dict(record) for record in recent]
+
+        return {
+            "entity_count": int(entity_record["c"]) if entity_record else 0,
+            "relationship_count": int(rel_record["c"]) if rel_record else 0,
+            "episode_count": int(episode_record["c"]) if episode_record else 0,
+            "top_connected": top_rows,
+            "recent": recent_rows,
+        }
+
+    def list_entities_for_embedding(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Return entity rows suitable for vector reindexing."""
+        safe_limit = max(1, int(limit))
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity)
+                RETURN coalesce(e.id, toLower(e.name)) AS entity_id,
+                       e.name AS name,
+                       coalesce(e.entity_type, 'Concept') AS entity_type,
+                       coalesce(e.summary, e.description, '') AS content,
+                       coalesce(e.confidence, 1.0) AS confidence
+                ORDER BY coalesce(e.mention_count, 0) DESC, e.name ASC
+                LIMIT $limit
+                """,
+                limit=safe_limit,
+            )
+
+            rows: List[Dict[str, Any]] = []
+            for record in result:
+                name = str(record.get("name") or "").strip()
+                if not name:
+                    continue
+                rows.append(
+                    {
+                        "entity_id": str(record.get("entity_id") or name.lower()),
+                        "name": name,
+                        "entity_type": str(record.get("entity_type") or "Concept"),
+                        "content": str(record.get("content") or ""),
+                        "confidence": float(record.get("confidence") or 1.0),
+                    }
+                )
+            return rows

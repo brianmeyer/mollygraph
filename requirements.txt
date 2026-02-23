@@ -8,6 +8,8 @@ python-dotenv==1.*
 pyyaml==6.*
 gliner2
 zvec
+sqlite-vec
+numpy
 spacy<3.9
 torch
 transformers

@@ -71,6 +71,7 @@ docker compose -f docker-compose.neo4j.yml up -d
 Defaults:
 - API: `http://127.0.0.1:7422`
 - Runtime state: `~/.graph-memory`
+- Embedding registry file: `~/.graph-memory/embedding_config.json`
 - API key: `dev-key-change-in-production`
 
 ## Use As MCP
@@ -135,6 +136,37 @@ AUDIT_MODEL_LOCAL=llama3.1:8b
 OLLAMA_CHAT_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
+Configure embedding providers/models at runtime:
+
+```bash
+# Register additional models
+curl -X POST http://127.0.0.1:7422/embeddings/models \
+  -H "Authorization: Bearer dev-key-change-in-production" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"huggingface","model":"BAAI/bge-small-en-v1.5"}'
+
+curl -X POST http://127.0.0.1:7422/embeddings/models \
+  -H "Authorization: Bearer dev-key-change-in-production" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"ollama","model":"nomic-embed-text","activate":true}'
+
+# Switch active provider/model
+curl -X POST http://127.0.0.1:7422/embeddings/config \
+  -H "Authorization: Bearer dev-key-change-in-production" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"huggingface","model":"BAAI/bge-small-en-v1.5"}'
+
+# Check provider/model readiness (HF deps, Ollama reachability/models)
+curl -H "Authorization: Bearer dev-key-change-in-production" \
+  http://127.0.0.1:7422/embeddings/status
+
+# Reindex existing entities after switching model/provider
+curl -X POST http://127.0.0.1:7422/embeddings/reindex \
+  -H "Authorization: Bearer dev-key-change-in-production" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":5000,"dry_run":false}'
+```
+
 ## Optional Cloud Add-ons
 
 Cloud providers are optional, not required for core operation.
@@ -156,6 +188,11 @@ Canonical:
 - `GET /suggestions/digest`
 - `POST /train/gliner`
 - `GET /train/status`
+- `GET /embeddings/config`
+- `GET /embeddings/status`
+- `POST /embeddings/config`
+- `POST /embeddings/models`
+- `POST /embeddings/reindex`
 - `POST /maintenance/run`
 
 Legacy aliases retained:

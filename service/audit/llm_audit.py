@@ -13,21 +13,36 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import config
-from memory.graph import (
-    VALID_REL_TYPES,
-    delete_orphan_entities_sync,
-    delete_self_referencing_rels,
-    delete_specific_relationship,
-    get_relationships_for_audit,
-    reclassify_relationship,
-    run_strength_decay_sync,
-    set_relationship_audit_status,
-)
+from evolution.audit_feedback import record_audit_feedback_batch
+from memory.bitemporal_graph import VALID_REL_TYPES
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
+from runtime_graph import require_graph_instance
 
 log = logging.getLogger(__name__)
 
 _BATCH_SIZE = 500
+
+
+# ---------------------------------------------------------------------------
+# Training signal helpers
+# ---------------------------------------------------------------------------
+
+def _audit_signals_path() -> "Path":
+    """Return path to the audit training signals JSONL file."""
+    from pathlib import Path
+    signals_dir = Path.home() / ".graph-memory" / "training"
+    signals_dir.mkdir(parents=True, exist_ok=True)
+    return signals_dir / "audit_signals.jsonl"
+
+
+def _write_audit_signal(signal: dict[str, Any]) -> None:
+    """Append one training signal record to audit_signals.jsonl."""
+    try:
+        path = _audit_signals_path()
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(signal, ensure_ascii=True) + "\n")
+    except Exception:
+        log.debug("Failed writing audit signal", exc_info=True)
 
 
 SYSTEM_PROMPT = (
@@ -432,10 +447,13 @@ async def apply_verdicts(
     verdicts: list[dict[str, Any]],
     dry_run: bool,
 ) -> dict[str, int]:
+    graph = require_graph_instance()
     auto_fixed = 0
     quarantined = 0
     deleted = 0
     verified = 0
+
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for verdict in verdicts:
         idx = int(verdict["index"]) - 1
@@ -446,17 +464,50 @@ async def apply_verdicts(
         decision = verdict["verdict"]
         suggested_type = verdict.get("suggested_type", "")
 
+        # Grab first context snippet for training signals.
+        snippets = rel.get("context_snippets") or []
+        context = snippets[0] if snippets else ""
+
         if decision == "verify":
             verified += 1
             if not dry_run:
-                set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "verified")
+                graph.set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "verified")
+            _write_audit_signal({
+                "timestamp": now_iso,
+                "signal": "positive",
+                "head": rel["head"],
+                "tail": rel["tail"],
+                "relation": rel["rel_type"],
+                "context": context,
+                "source": "verify",
+            })
             continue
 
         if decision == "reclassify":
             if suggested_type in VALID_REL_TYPES:
                 auto_fixed += 1
+                # Old label is a hard negative; new label is a positive.
+                _write_audit_signal({
+                    "timestamp": now_iso,
+                    "signal": "negative",
+                    "head": rel["head"],
+                    "tail": rel["tail"],
+                    "relation": rel["rel_type"],
+                    "context": context,
+                    "source": "reclassify",
+                    "corrected_to": suggested_type,
+                })
+                _write_audit_signal({
+                    "timestamp": now_iso,
+                    "signal": "positive",
+                    "head": rel["head"],
+                    "tail": rel["tail"],
+                    "relation": suggested_type,
+                    "context": context,
+                    "source": "reclassify",
+                })
                 if not dry_run:
-                    reclassify_relationship(
+                    graph.reclassify_relationship(
                         rel["head"],
                         rel["tail"],
                         rel["rel_type"],
@@ -468,20 +519,47 @@ async def apply_verdicts(
                     )
             else:
                 quarantined += 1
+                _write_audit_signal({
+                    "timestamp": now_iso,
+                    "signal": "negative",
+                    "head": rel["head"],
+                    "tail": rel["tail"],
+                    "relation": rel["rel_type"],
+                    "context": context,
+                    "source": "quarantine",
+                })
                 if not dry_run:
-                    set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "quarantined")
+                    graph.set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "quarantined")
             continue
 
         if decision == "quarantine":
             quarantined += 1
+            _write_audit_signal({
+                "timestamp": now_iso,
+                "signal": "negative",
+                "head": rel["head"],
+                "tail": rel["tail"],
+                "relation": rel["rel_type"],
+                "context": context,
+                "source": "quarantine",
+            })
             if not dry_run:
-                set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "quarantined")
+                graph.set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "quarantined")
             continue
 
         if decision == "delete":
             deleted += 1
+            _write_audit_signal({
+                "timestamp": now_iso,
+                "signal": "negative",
+                "head": rel["head"],
+                "tail": rel["tail"],
+                "relation": rel["rel_type"],
+                "context": context,
+                "source": "delete",
+            })
             if not dry_run:
-                delete_specific_relationship(rel["head"], rel["tail"], rel["rel_type"])
+                graph.delete_specific_relationship(rel["head"], rel["tail"], rel["rel_type"])
 
     return {
         "auto_fixed": auto_fixed,
@@ -513,6 +591,9 @@ def _write_maintenance_report(schedule: str, result: dict[str, Any]) -> str:
         f"- Auto-fixed: {result.get('auto_fixed', 0)}",
         f"- Quarantined: {result.get('quarantined', 0)}",
         f"- Deleted: {result.get('deleted', 0)}",
+        f"- Feedback rows written: {result.get('feedback_written', 0)}",
+        f"- Feedback positives: {result.get('feedback_positive_labels', 0)}",
+        f"- Feedback negatives: {result.get('feedback_negative_labels', 0)}",
         f"- Self-refs deleted: {result.get('self_refs_deleted', 0)}",
         f"- Orphans deleted: {result.get('orphans_deleted', 0)}",
         f"- Strength decay updated: {result.get('strength_decay_updated', 0)}",
@@ -539,12 +620,13 @@ async def run_llm_audit(
 ) -> dict[str, Any]:
     """Run cleanup + optional LLM audit + suggestion tracking."""
     started = time.monotonic()
+    graph = require_graph_instance()
 
-    self_refs_deleted = delete_self_referencing_rels()
-    orphans_deleted = delete_orphan_entities_sync()
-    strength_decay_updated = run_strength_decay_sync()
+    self_refs_deleted = graph.delete_self_referencing_rels()
+    orphans_deleted = graph.delete_orphan_entities_sync()
+    strength_decay_updated = graph.run_strength_decay_sync()
 
-    rels = get_relationships_for_audit(limit=max(1, int(limit)))
+    rels = graph.get_relationships_for_audit(limit=max(1, int(limit)))
 
     auto_fixed = 0
     quarantined = 0
@@ -557,6 +639,10 @@ async def run_llm_audit(
     chosen_provider = ""
     fallback_note = ""
     llm_enabled = bool(config.AUDIT_LLM_ENABLED or model_override)
+    feedback_written = 0
+    feedback_positive_labels = 0
+    feedback_negative_labels = 0
+    feedback_file = ""
 
     if rels:
         for batch in _chunked(rels, _BATCH_SIZE):
@@ -581,6 +667,19 @@ async def run_llm_audit(
                 quarantined += outcome["quarantined"]
                 deleted += outcome["deleted"]
                 verified += outcome["verified"]
+
+                feedback = record_audit_feedback_batch(
+                    batch,
+                    verdicts,
+                    schedule=schedule,
+                    provider=chosen_provider,
+                    model=chosen_model,
+                    dry_run=dry_run,
+                )
+                feedback_written += int(feedback.get("written", 0) or 0)
+                feedback_positive_labels += int(feedback.get("positive_labels", 0) or 0)
+                feedback_negative_labels += int(feedback.get("negative_labels", 0) or 0)
+                feedback_file = str(feedback.get("file") or feedback_file)
             except Exception:
                 log.error("Audit batch failed", exc_info=True)
                 parse_failures += 1
@@ -623,6 +722,10 @@ async def run_llm_audit(
         "fallback": fallback_note,
         "suggestion_digest": suggestion_digest,
         "auto_adoption_result": auto_adoption_result,
+        "feedback_written": feedback_written,
+        "feedback_positive_labels": feedback_positive_labels,
+        "feedback_negative_labels": feedback_negative_labels,
+        "feedback_file": feedback_file,
         "duration_seconds": duration_seconds,
     }
 
