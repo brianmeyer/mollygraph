@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -498,17 +498,31 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     )
 
 
+class _IngestBody(BaseModel):
+    content: str
+    source: str = "manual"
+    priority: int = 1
+
+
 @app.post("/ingest", operation_id="post_ingest")
 @app.post(
     "/extract",
     operation_id="post_extract_legacy",
 )  # Legacy alias kept for older integrations.
 async def ingest(
-    content: str,
+    content: str | None = None,
     source: str = "manual",
     priority: int = 1,
     _api_key: str = Depends(verify_api_key),
+    body: _IngestBody | None = Body(None),
 ) -> dict[str, Any]:
+    # Accept content from either query param or JSON body
+    if body is not None and content is None:
+        content = body.content
+        source = body.source
+        priority = body.priority
+    if not content:
+        raise HTTPException(status_code=422, detail="content is required (query param or JSON body)")
     require_runtime_ready()
 
     job = ExtractionJob(
