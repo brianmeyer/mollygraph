@@ -190,7 +190,7 @@ Full REST API for custom integrations:
 - [x] Relationship suggestion system
 - [x] Hot-reload model deployment
 - [x] Strength decay — stale knowledge fades, active knowledge stays prominent
-- [ ] Bi-temporal graph (valid_time vs observed_time — module built, not yet wired into ingestion)
+- [x] Bi-temporal graph (valid_from, valid_to, observed_at, last_seen on all entities & relationships)
 - [ ] Multi-agent memory isolation
 - [ ] Web UI for graph exploration
 - [ ] Plugin system for custom extractors
