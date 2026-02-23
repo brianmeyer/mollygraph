@@ -200,6 +200,7 @@ class BiTemporalGraph:
                         description: $description,
                         first_mentioned: datetime($first_mentioned),
                         last_mentioned: datetime($last_mentioned),
+                        created_at: datetime(),
                         confidence: $confidence,
                         mention_count: $mention_count,
                         strength: $strength,

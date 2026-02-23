@@ -39,6 +39,29 @@ _ALLOWED_ENTITY_TYPES = {
 }
 
 
+def _get_allowed_rel_types() -> frozenset[str]:
+    """Derive allowed relation type labels from the active extractor schema.
+
+    Returns labels as normalized lowercase strings (matching the training record format).
+    Falls back to empty frozenset (= allow all) if schema cannot be loaded.
+    """
+    try:
+        from extractor_schema_registry import get_effective_extractor_schema
+
+        schema = get_effective_extractor_schema()
+        rels = schema.get("relations") or {}
+        return frozenset(
+            str(k).strip().lower().replace("_", " ") for k in rels if k
+        )
+    except Exception:
+        pass
+    return frozenset()
+
+
+# Lazily computed allowed relation types (populated on first use)
+_ALLOWED_REL_TYPES: frozenset[str] = frozenset()
+
+
 class GLiNERTrainingService:
     _GLINER_MAX_RUNS = 3
     _GLINER_MAX_BACKUPS = 2
@@ -157,6 +180,17 @@ class GLiNERTrainingService:
                 "message": msg,
             }
 
+        # ── Pre-split data stats logging ──────────────────────────────────────
+        _pre_pos = sum(len(r.get("relations") or []) for r in rows)
+        _pre_neg = sum(len(r.get("negative_relations") or []) for r in rows)
+        log.info("=" * 60)
+        log.info("GLiNER fine-tune pipeline starting")
+        log.info("  Total examples:    %d (required: %d)", total_rows, required)
+        log.info("  Positive rels:     %d", _pre_pos)
+        log.info("  Negative rels:     %d", _pre_neg)
+        log.info("  Eval ratio:        %.2f  seed=%d", GLINER_BENCHMARK_EVAL_RATIO, GLINER_BENCHMARK_SEED)
+        log.info("=" * 60)
+
         train_rows, eval_rows = self.split_holdout_rows(
             rows,
             eval_ratio=GLINER_BENCHMARK_EVAL_RATIO,
@@ -172,6 +206,22 @@ class GLiNERTrainingService:
                 "train_count": len(train_rows),
                 "eval_count": len(eval_rows),
             }
+
+        # ── Post-split logging ────────────────────────────────────────────────
+        _train_ent_dist: dict[str, int] = {}
+        _train_rel_dist: dict[str, int] = {}
+        for _r in train_rows:
+            for _e in (_r.get("entities") or []):
+                _lbl = str(_e.get("label") or "Concept") if isinstance(_e, dict) else "Concept"
+                _train_ent_dist[_lbl] = _train_ent_dist.get(_lbl, 0) + 1
+            for _rel in (_r.get("relations") or []):
+                _lbl = str(_rel.get("label") or "").strip() if isinstance(_rel, dict) else ""
+                if _lbl:
+                    _train_rel_dist[_lbl] = _train_rel_dist.get(_lbl, 0) + 1
+
+        log.info("After split: train=%d  eval=%d", len(train_rows), len(eval_rows))
+        log.info("  Train entity types:   %s", dict(sorted(_train_ent_dist.items())))
+        log.info("  Train relation types: %s", dict(sorted(_train_rel_dist.items())))
 
         strategy = await asyncio.to_thread(self.select_gliner_training_strategy, total_rows)
         mode = str(strategy.get("mode") or "lora").strip().lower()
@@ -191,7 +241,9 @@ class GLiNERTrainingService:
                 "message": self.state["gliner_last_result"],
             }
 
-        self.state["gliner_last_finetune_at"] = datetime.now(timezone.utc).isoformat()
+        # NOTE: gliner_last_finetune_at is intentionally NOT set here.
+        # It is only stamped after training succeeds so that a failed attempt
+        # does NOT consume the cooldown window — allowing an immediate retry.
         self.state["gliner_training_examples"] = total_rows
         self.state["gliner_last_cycle_status"] = "finetune_started"
         self.state["gliner_last_training_strategy"] = mode
@@ -199,17 +251,23 @@ class GLiNERTrainingService:
 
         fine_tune = await asyncio.to_thread(self.fine_tune_gliner_candidate, train_rows, mode)
         if not fine_tune.get("ok", False):
+            error_msg = fine_tune.get("error", "unknown error")
             self.state["gliner_last_cycle_status"] = "finetune_failed"
-            self.state["gliner_last_result"] = f"GLiNER {mode} fine-tune failed before benchmarking."
+            self.state["gliner_last_result"] = f"GLiNER {mode} fine-tune failed: {error_msg}"
             self.save_state()
             return {
                 "status": "finetune_failed",
+                "error": error_msg,
                 "count": total_rows,
                 "train_count": len(train_rows),
                 "eval_count": len(eval_rows),
                 "training_strategy": strategy,
                 "fine_tune": fine_tune,
             }
+
+        # Training succeeded — stamp the cooldown timer now so retries respect the window.
+        self.state["gliner_last_finetune_at"] = datetime.now(timezone.utc).isoformat()
+        self.save_state()
 
         candidate_model_ref = str(fine_tune.get("candidate_model") or "").strip()
         benchmark = await asyncio.to_thread(
@@ -220,9 +278,41 @@ class GLiNERTrainingService:
         )
 
         benchmark_ok = bool(benchmark.get("ok", False))
+        # Use combined improvement (0.5 * entity + 0.5 * relation) for deploy decision
+        combined_improvement = float(benchmark.get("combined_improvement", 0.0) or 0.0)
+        entity_improvement = float(benchmark.get("entity_improvement", 0.0) or 0.0)
+        relation_improvement = float(benchmark.get("relation_improvement", 0.0) or 0.0)
+        # Legacy: improvement = entity improvement for backward compat logs
         improvement = float(benchmark.get("improvement", 0.0) or 0.0)
         threshold = float(config.GLINER_FINETUNE_BENCHMARK_THRESHOLD)
-        should_deploy = benchmark_ok and improvement >= threshold
+        should_deploy = benchmark_ok and combined_improvement >= threshold
+
+        log.info(
+            "Deploy decision: combined=%.4f (entity=%.4f, relation=%.4f) vs threshold=%.4f → %s",
+            combined_improvement, entity_improvement, relation_improvement,
+            threshold, "DEPLOY" if should_deploy else "REJECT",
+        )
+
+        # ── Confidence calibration pass ───────────────────────────────────────
+        calibration: dict[str, Any] = {}
+        try:
+            log.info("Running confidence calibration on %d eval rows...", len(eval_rows))
+            calibration = await asyncio.to_thread(
+                self.calibrate_confidence,
+                candidate_model_ref,
+                eval_rows,
+            )
+            ece = float(calibration.get("ece", 0.0) or 0.0)
+            log.info(
+                "Calibration complete: ECE=%.4f  total_predictions=%d",
+                ece,
+                calibration.get("total_predictions", 0),
+            )
+            if calibration.get("warning"):
+                log.warning("Calibration warning: %s", calibration["warning"])
+        except Exception:
+            log.warning("Calibration pass failed", exc_info=True)
+            calibration = {"ece": 0.0, "total_predictions": 0, "bins": [], "warning": None}
 
         payload = {
             "count": total_rows,
@@ -231,33 +321,74 @@ class GLiNERTrainingService:
             "training_strategy": strategy,
             "fine_tune": fine_tune,
             "benchmark": benchmark,
+            "calibration": calibration,
             "threshold": threshold,
             "should_deploy": should_deploy,
         }
 
         status = "below_threshold"
+        decision_reason = f"Combined improvement {combined_improvement:.4f} < threshold {threshold:.4f}"
+
         if should_deploy:
-            deploy = await asyncio.to_thread(
-                self.deploy_gliner_candidate_model,
-                Path(candidate_model_ref),
-                benchmark,
-                fine_tune,
-            )
-            payload["deploy"] = deploy
-            if deploy.get("ok"):
-                status = "deployed"
-                self.state["gliner_last_result"] = (
-                    f"GLiNER {mode} +{improvement:.4f} F1 on {len(eval_rows)} eval rows; deployed."
+            decision_reason = f"Combined improvement {combined_improvement:.4f} >= threshold {threshold:.4f}"
+            # ── Shadow evaluation before deploy ────────────────────────────
+            shadow: dict[str, Any] = {}
+            if config.GLINER_SHADOW_ENABLED:
+                base_model_ref = self.active_gliner_model_ref()
+                shadow = await asyncio.to_thread(
+                    self.run_shadow_evaluation,
+                    base_model_ref,
+                    candidate_model_ref,
+                    config.GLINER_SHADOW_EPISODES,
                 )
-                self.state["gliner_last_cycle_status"] = "deployed"
+                payload["shadow"] = shadow
+                log.info("Shadow evaluation result: %s", shadow)
+
+            shadow_passed = (
+                not config.GLINER_SHADOW_ENABLED
+                or shadow.get("skipped", False)
+                or shadow.get("passed", True)
+            )
+
+            if not shadow_passed:
+                await asyncio.to_thread(
+                    self.discard_gliner_candidate_model,
+                    Path(candidate_model_ref) if candidate_model_ref else None,
+                )
+                status = "shadow_failed"
+                reason = shadow.get("failure_reason", "candidate_fallback_rate_regression")
+                decision_reason = f"Benchmark passed but shadow FAILED: {reason}"
+                self.state["gliner_last_result"] = (
+                    f"GLiNER {mode} benchmark passed (+{combined_improvement:.4f}) but shadow FAILED: {reason}"
+                )
+                self.state["gliner_last_cycle_status"] = "shadow_failed"
                 self.save_state()
             else:
-                status = "deploy_failed"
-                self.state["gliner_last_result"] = (
-                    f"GLiNER {mode} benchmark passed (+{improvement:.4f}) but deploy failed."
+                deploy = await asyncio.to_thread(
+                    self.deploy_gliner_candidate_model,
+                    Path(candidate_model_ref),
+                    benchmark,
+                    fine_tune,
                 )
-                self.state["gliner_last_cycle_status"] = "deploy_failed"
-                self.save_state()
+                payload["deploy"] = deploy
+                if deploy.get("ok"):
+                    status = "deployed"
+                    decision_reason = (
+                        f"Combined improvement {combined_improvement:.4f} >= threshold {threshold:.4f}; deployed"
+                    )
+                    self.state["gliner_last_result"] = (
+                        f"GLiNER {mode} +{combined_improvement:.4f} combined F1 on {len(eval_rows)} eval rows; deployed."
+                    )
+                    self.state["gliner_last_cycle_status"] = "deployed"
+                    self.save_state()
+                else:
+                    status = "deploy_failed"
+                    decision_reason = f"Combined improvement {combined_improvement:.4f} >= threshold but deploy failed"
+                    self.state["gliner_last_result"] = (
+                        f"GLiNER {mode} benchmark passed (+{combined_improvement:.4f}) but deploy failed."
+                    )
+                    self.state["gliner_last_cycle_status"] = "deploy_failed"
+                    self.save_state()
         else:
             await asyncio.to_thread(
                 self.discard_gliner_candidate_model,
@@ -265,9 +396,11 @@ class GLiNERTrainingService:
             )
             self.state["gliner_last_cycle_status"] = "below_threshold"
             self.state["gliner_last_result"] = (
-                f"GLiNER {mode} candidate rejected (+{improvement:.4f} < {threshold:.4f})."
+                f"GLiNER {mode} candidate rejected (+{combined_improvement:.4f} combined < {threshold:.4f})."
             )
             self.save_state()
+
+        log.info("Deploy decision finalized: status=%s reason=%s", status, decision_reason)
 
         await asyncio.to_thread(
             self.record_gliner_benchmark,
@@ -277,7 +410,144 @@ class GLiNERTrainingService:
             total_rows,
         )
 
-        return {
+        # ── LoRA run audit trail ──────────────────────────────────────────────
+        run_audit_path: str | None = None
+        try:
+            positive_counts = sum(len(r.get("relations", [])) for r in rows)
+            negative_counts = sum(len(r.get("negative_relations", [])) for r in rows)
+            type_dist: dict[str, int] = {}
+            for r in rows:
+                for ent in r.get("entities", []):
+                    if isinstance(ent, dict):
+                        label = str(ent.get("label") or "Concept")
+                    else:
+                        label = "Concept"
+                    type_dist[label] = type_dist.get(label, 0) + 1
+
+            rollback_baseline: dict = {}
+            try:
+                from metrics.model_health import model_health_monitor
+                if model_health_monitor.baseline_fallback_rate is not None:
+                    rollback_baseline = {
+                        "fallback_rate": model_health_monitor.baseline_fallback_rate,
+                        "model_ref": model_health_monitor.model_ref,
+                        "set_at": model_health_monitor.deployed_at.isoformat() if model_health_monitor.deployed_at else None,
+                    }
+            except Exception:
+                pass
+
+            unique_entity_types = sorted({
+                str(ent.get("label") or "Concept")
+                for r in rows
+                for ent in (r.get("entities") or [])
+                if isinstance(ent, dict)
+            })
+            unique_relation_types = sorted({
+                str(rel.get("label") or "").strip()
+                for r in rows
+                for rel in (r.get("relations") or [])
+                if isinstance(rel, dict) and rel.get("label")
+            })
+            avg_entities = (
+                sum(len(r.get("entities") or []) for r in rows) / len(rows) if rows else 0.0
+            )
+            avg_relations = (
+                sum(len(r.get("relations") or []) for r in rows) / len(rows) if rows else 0.0
+            )
+
+            _ft_meta = fine_tune.get("metadata") or {}
+            if isinstance(_ft_meta, dict):
+                _ft_epochs = _ft_meta.get("num_epochs")
+                _ft_lr = _ft_meta.get("learning_rate")
+                _ft_batch = _ft_meta.get("batch_size")
+            else:
+                _ft_epochs = None
+                _ft_lr = None
+                _ft_batch = None
+
+            _ft_result = fine_tune.get("result") or {}
+            loss_curve: list[float] = []
+            final_loss: float | None = None
+            if isinstance(_ft_result, dict):
+                loss_curve = [
+                    float(x) for x in (_ft_result.get("loss_curve") or [])
+                    if x is not None
+                ]
+                final_loss = float(_ft_result.get("final_loss")) if _ft_result.get("final_loss") is not None else None
+            if not final_loss and loss_curve:
+                final_loss = loss_curve[-1]
+
+            _cal_ece = float(calibration.get("ece", 0.0) or 0.0)
+            _cal_bins = calibration.get("bins") or []
+
+            audit_payload: dict[str, Any] = {
+                "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "mode": mode,
+                "data": {
+                    "total_examples": total_rows,
+                    "train_count": len(train_rows),
+                    "eval_count": len(eval_rows),
+                    "positive_relations": positive_counts,
+                    "negative_relations": negative_counts,
+                    "unique_entity_types": unique_entity_types,
+                    "unique_relation_types": unique_relation_types,
+                    "avg_entities_per_example": round(avg_entities, 2),
+                    "avg_relations_per_example": round(avg_relations, 2),
+                    "entity_type_distribution": type_dist,
+                },
+                "training": {
+                    "epochs": _ft_epochs,
+                    "learning_rate": _ft_lr,
+                    "batch_size": _ft_batch,
+                    "final_loss": final_loss,
+                    "loss_curve": loss_curve,
+                    "base_model": self.active_gliner_model_ref(),
+                    "seed": GLINER_BENCHMARK_SEED,
+                },
+                "benchmark": {
+                    "entity_f1": {
+                        "base": float(benchmark.get("base_entity_f1", benchmark.get("base_score", 0.0)) or 0.0),
+                        "candidate": float(benchmark.get("candidate_entity_f1", benchmark.get("candidate_score", 0.0)) or 0.0),
+                        "improvement": float(benchmark.get("entity_improvement", benchmark.get("improvement", 0.0)) or 0.0),
+                    },
+                    "relation_f1": {
+                        "base": float(benchmark.get("base_relation_f1", 0.0) or 0.0),
+                        "candidate": float(benchmark.get("candidate_relation_f1", 0.0) or 0.0),
+                        "improvement": float(benchmark.get("relation_improvement", 0.0) or 0.0),
+                    },
+                    "per_type_f1": benchmark.get("per_type_relation_f1") or {},
+                    "combined_improvement": float(benchmark.get("combined_improvement", 0.0) or 0.0),
+                },
+                "calibration": {
+                    "ece": _cal_ece,
+                    "bins": _cal_bins,
+                    "total_predictions": int(calibration.get("total_predictions", 0) or 0),
+                    "warning": calibration.get("warning"),
+                },
+                "decision": status,
+                "decision_reason": decision_reason,
+                "status": status,
+                "deploy_decision": {
+                    "should_deploy": status == "deployed",
+                    "combined_improvement": float(benchmark.get("combined_improvement", 0.0) or 0.0),
+                    "entity_improvement": float(benchmark.get("entity_improvement", 0.0) or 0.0),
+                    "relation_improvement": float(benchmark.get("relation_improvement", 0.0) or 0.0),
+                    "threshold": float(config.GLINER_FINETUNE_BENCHMARK_THRESHOLD),
+                    "reason": decision_reason,
+                },
+                "rollback_baseline": rollback_baseline,
+                "strategy": strategy,
+                "shadow": payload.get("shadow"),
+                "fine_tune": fine_tune,
+            }
+
+            run_audit_path = await asyncio.to_thread(self.write_run_audit, audit_payload)
+        except Exception:
+            log.warning("Failed to write run audit trail", exc_info=True)
+
+        result: dict[str, Any] = {
             "status": status,
             "count": total_rows,
             "train_count": len(train_rows),
@@ -285,8 +555,12 @@ class GLiNERTrainingService:
             "training_strategy": strategy,
             "benchmark": benchmark,
             "fine_tune": fine_tune,
+            **({"shadow": payload.get("shadow")} if "shadow" in payload else {}),
             **({"deploy": payload.get("deploy")} if "deploy" in payload else {}),
         }
+        if run_audit_path:
+            result["run_audit_path"] = run_audit_path
+        return result
 
     def accumulate_gliner_training_data(self, limit: int = GLINER_TRAINING_SCAN_LIMIT) -> dict[str, Any]:
         from runtime_graph import require_graph_instance
@@ -884,7 +1158,15 @@ class GLiNERTrainingService:
                 entities_map[label].append(name)
                 entity_names.add(name)
 
+        # ── Derive allowed relation types from schema (cached lazily) ────────
+        global _ALLOWED_REL_TYPES
+        if not _ALLOWED_REL_TYPES:
+            _ALLOWED_REL_TYPES = _get_allowed_rel_types()
+        # Empty frozenset means "allow all"
+        _check_rel = bool(_ALLOWED_REL_TYPES)
+
         relations_out: list[dict[str, Any]] = []
+        seen_rel_keys: set[tuple[str, str, str]] = set()
         for rel in row.get("relations") or []:
             if not isinstance(rel, dict):
                 continue
@@ -900,11 +1182,21 @@ class GLiNERTrainingService:
                 continue
             if self.normalize_entity_text(tail) not in text_norm:
                 continue
+            # Filter by allowed relation types
+            if _check_rel and label not in _ALLOWED_REL_TYPES:
+                continue
 
+            key = (head, label, tail)
+            if key in seen_rel_keys:
+                continue
+            seen_rel_keys.add(key)
             relations_out.append({label: {"head": head, "tail": tail}})
 
         # ── Hard negatives from quarantine/delete/reclassify audit verdicts ─
+        # reclassify → the original label is hard-negative + corrected label becomes positive
+        # quarantine / delete → the label is an omission signal (hard negative only)
         negative_relations_out: list[dict[str, Any]] = []
+        seen_neg_keys: set[tuple[str, str, str]] = set()
         for rel in row.get("negative_relations") or row.get("hard_negative_relations") or []:
             if not isinstance(rel, dict):
                 continue
@@ -915,10 +1207,24 @@ class GLiNERTrainingService:
             if not head or not tail or not label:
                 continue
             # Negatives don't need to appear in text - they are hard negatives from audit
-            entry: dict[str, Any] = {label: {"head": head, "tail": tail}}
-            if rel.get("corrected_to"):
-                entry[label]["corrected_to"] = str(rel["corrected_to"]).lower().replace("_", " ")
-            negative_relations_out.append(entry)
+
+            neg_key = (head, label, tail)
+            if neg_key not in seen_neg_keys:
+                seen_neg_keys.add(neg_key)
+                entry: dict[str, Any] = {label: {"head": head, "tail": tail}}
+                corrected_to = str(rel.get("corrected_to") or "").strip().lower().replace("_", " ")
+                if corrected_to:
+                    entry[label]["corrected_to"] = corrected_to
+                negative_relations_out.append(entry)
+
+            # reclassify signal: also add corrected label as a positive relation
+            corrected_to = str(rel.get("corrected_to") or "").strip().lower().replace("_", " ")
+            if corrected_to and corrected_to != label:
+                if not _check_rel or corrected_to in _ALLOWED_REL_TYPES:
+                    pos_key = (head, corrected_to, tail)
+                    if pos_key not in seen_rel_keys:
+                        seen_rel_keys.add(pos_key)
+                        relations_out.append({corrected_to: {"head": head, "tail": tail}})
 
         output: dict[str, Any] = {}
         if entities_map:
@@ -1018,10 +1324,19 @@ class GLiNERTrainingService:
                 "status": status,
                 "total_examples": int(total_examples),
                 "benchmark_ok": bool(benchmark.get("ok", False)),
+                # Legacy key
                 "improvement": float(benchmark.get("improvement", 0.0) or 0.0),
                 "base_score": float(benchmark.get("base_score", 0.0) or 0.0),
                 "candidate_score": float(benchmark.get("candidate_score", 0.0) or 0.0),
                 "eval_count": int(benchmark.get("split", {}).get("eval_count", 0) or 0),
+                # Extended scoring keys
+                "entity_improvement": float(benchmark.get("entity_improvement", 0.0) or 0.0),
+                "relation_improvement": float(benchmark.get("relation_improvement", 0.0) or 0.0),
+                "combined_improvement": float(benchmark.get("combined_improvement", 0.0) or 0.0),
+                "base_entity_f1": float(benchmark.get("base_entity_f1", benchmark.get("base_score", 0.0)) or 0.0),
+                "candidate_entity_f1": float(benchmark.get("candidate_entity_f1", benchmark.get("candidate_score", 0.0)) or 0.0),
+                "base_relation_f1": float(benchmark.get("base_relation_f1", 0.0) or 0.0),
+                "candidate_relation_f1": float(benchmark.get("candidate_relation_f1", 0.0) or 0.0),
             }
         )
 
@@ -1032,6 +1347,28 @@ class GLiNERTrainingService:
         train_records = [record for record in (self.to_gliner_training_record(r) for r in train_rows) if record]
         if not train_records:
             return {"ok": False, "error": "no_valid_train_records"}
+
+        # Log pre-training data stats
+        _ent_types: dict[str, int] = {}
+        _rel_types: dict[str, int] = {}
+        _neg_types: dict[str, int] = {}
+        for _rec in train_records:
+            _out = _rec.get("output") or {}
+            for _lbl, _ents in (_out.get("entities") or {}).items():
+                _ent_types[_lbl] = _ent_types.get(_lbl, 0) + len(_ents)
+            for _rel in (_out.get("relations") or []):
+                for _lbl in _rel:
+                    _rel_types[_lbl] = _rel_types.get(_lbl, 0) + 1
+            for _neg in (_out.get("negative_relations") or []):
+                for _lbl in _neg:
+                    _neg_types[_lbl] = _neg_types.get(_lbl, 0) + 1
+        log.info(
+            "fine_tune_gliner_candidate: %d records  entity_types=%s  rel_types=%s  neg_types=%s",
+            len(train_records),
+            dict(sorted(_ent_types.items())),
+            dict(sorted(_rel_types.items())),
+            dict(sorted(_neg_types.items())),
+        )
 
         try:
             from gliner2.training.trainer import train_gliner2
@@ -1061,22 +1398,39 @@ class GLiNERTrainingService:
         use_lora = normalized_mode == "lora"
         num_epochs = 1 if use_lora else 2
 
+        _train_kwargs = dict(
+            model_path=self.active_gliner_model_ref(),
+            train_data=train_records,
+            output_dir=str(output_dir),
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            eval_strategy="no",
+            fp16=False,
+            bf16=False,
+            num_workers=0,
+            logging_steps=max(1, min(25, len(train_records))),
+            use_lora=use_lora,
+            save_adapter_only=False,
+            seed=GLINER_BENCHMARK_SEED,
+        )
         try:
-            result = train_gliner2(
-                model_path=self.active_gliner_model_ref(),
-                train_data=train_records,
-                output_dir=str(output_dir),
-                num_epochs=num_epochs,
-                batch_size=batch_size,
-                eval_strategy="no",
-                fp16=False,
-                bf16=False,
-                num_workers=0,
-                logging_steps=max(1, min(25, len(train_records))),
-                use_lora=use_lora,
-                save_adapter_only=False,
-                seed=GLINER_BENCHMARK_SEED,
+            result = train_gliner2(**_train_kwargs)
+        except TypeError as type_exc:
+            # Older train_gliner2 versions may not accept all kwargs; retry
+            # with minimal required args only.
+            log.warning(
+                "train_gliner2 TypeError (likely unsupported kwargs), retrying with minimal signature: %s",
+                type_exc,
             )
+            _minimal_kwargs = {
+                k: v for k, v in _train_kwargs.items()
+                if k in {"model_path", "train_data", "output_dir", "num_epochs", "batch_size", "use_lora", "seed"}
+            }
+            try:
+                result = train_gliner2(**_minimal_kwargs)
+            except Exception as exc2:
+                log.error("GLiNER fine-tune failed (minimal signature)", exc_info=True)
+                return {"ok": False, "error": str(exc2)}
         except Exception as exc:
             log.error("GLiNER fine-tune failed", exc_info=True)
             return {"ok": False, "error": str(exc)}
@@ -1167,9 +1521,29 @@ class GLiNERTrainingService:
             backup_dir = backup_root / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             shutil.copytree(active_dir, backup_dir, dirs_exist_ok=False)
 
-        if active_dir.exists():
-            shutil.rmtree(active_dir, ignore_errors=True)
-        shutil.copytree(candidate_path, active_dir, dirs_exist_ok=False)
+        # ── Atomic rename-swap deploy (avoids race between rmtree and read) ──
+        # Copy candidate → temp, rename active → .old, rename temp → active.
+        temp_dir = active_dir.parent / f".deploy-{int(time.time())}"
+        try:
+            shutil.copytree(candidate_path, temp_dir)
+            old_dir = active_dir.parent / f".old-{int(time.time())}"
+            if active_dir.exists():
+                try:
+                    active_dir.rename(old_dir)  # atomic on same filesystem
+                except FileNotFoundError:
+                    pass  # active dir already gone
+            temp_dir.rename(active_dir)          # atomic on same filesystem
+            # Best-effort cleanup of displaced old dir
+            try:
+                shutil.rmtree(old_dir, ignore_errors=True)
+            except Exception:
+                pass
+        except Exception as deploy_exc:
+            log.error("Atomic deploy failed, falling back to direct copy: %s", deploy_exc)
+            # Non-atomic fallback
+            if active_dir.exists():
+                shutil.rmtree(active_dir, ignore_errors=True)
+            shutil.copytree(candidate_path, active_dir, dirs_exist_ok=False)
 
         deployed_at = datetime.now(timezone.utc).isoformat()
         self.state["gliner_active_model_ref"] = str(active_dir)
@@ -1193,6 +1567,26 @@ class GLiNERTrainingService:
         config_path = self.gliner_training_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config_payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+        # ── Notify model health monitor of the new baseline ───────────────────
+        try:
+            from metrics.model_health import model_health_monitor
+
+            base_eval = benchmark.get("base") or {}
+            base_metrics = base_eval.get("metrics") or {}
+            # Compute pre-deploy fallback rate from base benchmark: (FP+FN) / total
+            tp = int(base_eval.get("counts", {}).get("tp", 0) or 0)
+            fp = int(base_eval.get("counts", {}).get("fp", 0) or 0)
+            fn = int(base_eval.get("counts", {}).get("fn", 0) or 0)
+            total_ops = tp + fp + fn
+            baseline_fallback_rate = (fp + fn) / max(total_ops, 1)
+            model_health_monitor.set_baseline(baseline_fallback_rate, str(active_dir))
+            log.info(
+                "Model health monitor notified: baseline_fallback_rate=%.4f model=%s",
+                baseline_fallback_rate, str(active_dir),
+            )
+        except Exception:
+            log.warning("Failed to notify model health monitor after deploy", exc_info=True)
 
         pruned = self.prune_gliner_dirs()
 
@@ -1301,18 +1695,123 @@ class GLiNERTrainingService:
         schema = model.create_schema().entities(entity_schema)
         return model, schema
 
+    def load_gliner_full_model(self, model_ref: str) -> tuple[Any, Any]:
+        """Load GLiNER2 model with both entity and relation schemas."""
+        from gliner2 import GLiNER2
+        from extractor_schema_registry import get_effective_extractor_schema
+
+        model = GLiNER2.from_pretrained(model_ref)
+        schema_cfg = get_effective_extractor_schema()
+        entity_schema = schema_cfg.get("entities", {})
+        relation_schema = schema_cfg.get("relations", {})
+        try:
+            schema = model.create_schema().entities(entity_schema).relations(relation_schema)
+        except Exception:
+            log.debug("Relation schema not supported by model; using entity-only schema")
+            schema = model.create_schema().entities(entity_schema)
+        return model, schema
+
+    @staticmethod
+    def _normalize_relation_label(label: Any) -> str:
+        """Normalize a relation label to a canonical lowercase string."""
+        return str(label or "").strip().lower().replace("_", " ")
+
+    @staticmethod
+    def _extract_gold_relations(row: dict[str, Any]) -> set[tuple[str, str, str]]:
+        """Extract (head, label, tail) tuples from a benchmark row."""
+        gold: set[tuple[str, str, str]] = set()
+        for rel in row.get("relations") or []:
+            if not isinstance(rel, dict):
+                continue
+            head = str(rel.get("head") or "").strip().lower()
+            tail = str(rel.get("tail") or "").strip().lower()
+            label = GLiNERTrainingService._normalize_relation_label(rel.get("label"))
+            if head and tail and label:
+                gold.add((head, label, tail))
+        return gold
+
+    @staticmethod
+    def _extract_predicted_relations(result: Any) -> set[tuple[str, str, str]]:
+        """Extract (head, label, tail) tuples from a GLiNER2 extraction result."""
+        if not isinstance(result, dict):
+            return set()
+        predicted: set[tuple[str, str, str]] = set()
+        rel_dict = result.get("relation_extraction") or result.get("relations") or {}
+
+        if isinstance(rel_dict, dict):
+            for rtype, items in rel_dict.items():
+                if not isinstance(items, list):
+                    continue
+                label = GLiNERTrainingService._normalize_relation_label(rtype)
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    head_raw = item.get("head") or {}
+                    tail_raw = item.get("tail") or {}
+                    head = str(head_raw.get("text") if isinstance(head_raw, dict) else head_raw).strip().lower()
+                    tail = str(tail_raw.get("text") if isinstance(tail_raw, dict) else tail_raw).strip().lower()
+                    if head and tail and label:
+                        predicted.add((head, label, tail))
+        elif isinstance(rel_dict, list):
+            for item in rel_dict:
+                if not isinstance(item, dict):
+                    continue
+                label = GLiNERTrainingService._normalize_relation_label(item.get("label"))
+                head = str(item.get("head") or "").strip().lower()
+                tail = str(item.get("tail") or "").strip().lower()
+                if head and tail and label:
+                    predicted.add((head, label, tail))
+
+        return predicted
+
+    @staticmethod
+    def _extract_predicted_entities_with_confidence(
+        result: Any,
+    ) -> list[tuple[str, str, float]]:
+        """Extract (text, label, confidence) tuples from a GLiNER2 result."""
+        if not isinstance(result, dict):
+            return []
+        entity_dict = result.get("entities") or result
+        if not isinstance(entity_dict, dict):
+            return []
+        out: list[tuple[str, str, float]] = []
+        for etype, items in entity_dict.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict):
+                    text = str(item.get("text") or "").strip()
+                    conf = float(item.get("confidence", 0.5) or 0.5)
+                    if text:
+                        out.append((text, str(etype), conf))
+        return out
+
     def evaluate_model_on_rows(
         self,
         model_ref: str,
         rows: list[dict[str, Any]],
         threshold: float = GLINER_BENCHMARK_THRESHOLD,
     ) -> dict[str, Any]:
+        """Evaluate a GLiNER2 model on eval rows, scoring both entities and relations.
+
+        Returns a dict containing:
+        - ``entity_metrics``  — precision/recall/F1 for entities
+        - ``relation_metrics`` — precision/recall/F1 for relations (all types)
+        - ``per_type_relation_f1`` — per-relation-type F1 dict
+        - ``metrics`` — alias for entity_metrics (backward-compat)
+        - ``ok`` / ``error`` / ``counts`` / ``rows_evaluated`` / ``latency_ms_avg``
+        """
         if not rows:
+            _empty = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
             return {
                 "ok": False,
                 "error": "empty_eval_set",
-                "metrics": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
+                "metrics": _empty,
+                "entity_metrics": _empty,
+                "relation_metrics": _empty,
+                "per_type_relation_f1": {},
                 "counts": {"tp": 0, "fp": 0, "fn": 0},
+                "relation_counts": {"tp": 0, "fp": 0, "fn": 0},
                 "rows_total": 0,
                 "rows_evaluated": 0,
                 "rows_failed": 0,
@@ -1320,22 +1819,28 @@ class GLiNERTrainingService:
             }
 
         try:
-            model, schema = self.load_gliner_entity_model(model_ref)
+            model, schema = self.load_gliner_full_model(model_ref)
         except Exception as exc:
+            _empty = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
             return {
                 "ok": False,
                 "error": f"model_load_failed: {exc}",
-                "metrics": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
+                "metrics": _empty,
+                "entity_metrics": _empty,
+                "relation_metrics": _empty,
+                "per_type_relation_f1": {},
                 "counts": {"tp": 0, "fp": 0, "fn": 0},
+                "relation_counts": {"tp": 0, "fp": 0, "fn": 0},
                 "rows_total": len(rows),
                 "rows_evaluated": 0,
                 "rows_failed": len(rows),
                 "latency_ms_avg": 0.0,
             }
 
-        tp = 0
-        fp = 0
-        fn = 0
+        e_tp = e_fp = e_fn = 0
+        r_tp: dict[str, int] = {}
+        r_fp: dict[str, int] = {}
+        r_fn: dict[str, int] = {}
         rows_evaluated = 0
         rows_failed = 0
         latency_sum_ms = 0.0
@@ -1349,7 +1854,9 @@ class GLiNERTrainingService:
                     failure_samples.append({"row_index": idx, "error": "missing_text"})
                 continue
 
-            expected = self.extract_expected_entity_set(row)
+            expected_ents = self.extract_expected_entity_set(row)
+            expected_rels = self._extract_gold_relations(row)
+
             try:
                 t0 = time.monotonic()
                 result = model.extract(text, schema, threshold=threshold, include_confidence=True)
@@ -1360,18 +1867,35 @@ class GLiNERTrainingService:
                     failure_samples.append({"row_index": idx, "error": str(exc)[:300]})
                 continue
 
-            predicted = self.extract_predicted_entity_set(result)
-            tp += len(predicted & expected)
-            fp += len(predicted - expected)
-            fn += len(expected - predicted)
+            # Entity scoring
+            predicted_ents = self.extract_predicted_entity_set(result)
+            e_tp += len(predicted_ents & expected_ents)
+            e_fp += len(predicted_ents - expected_ents)
+            e_fn += len(expected_ents - predicted_ents)
+
+            # Relation scoring (per-type)
+            predicted_rels = self._extract_predicted_relations(result)
+            all_rel_labels = {rtype for _, rtype, _ in expected_rels | predicted_rels}
+            for rtype in all_rel_labels:
+                exp_set = {(h, t) for h, rt, t in expected_rels if rt == rtype}
+                pred_set = {(h, t) for h, rt, t in predicted_rels if rt == rtype}
+                r_tp[rtype] = r_tp.get(rtype, 0) + len(pred_set & exp_set)
+                r_fp[rtype] = r_fp.get(rtype, 0) + len(pred_set - exp_set)
+                r_fn[rtype] = r_fn.get(rtype, 0) + len(exp_set - pred_set)
+
             rows_evaluated += 1
 
+        _empty = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
         if rows_evaluated == 0:
             return {
                 "ok": False,
                 "error": "all_inference_failed",
-                "metrics": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
-                "counts": {"tp": tp, "fp": fp, "fn": fn},
+                "metrics": _empty,
+                "entity_metrics": _empty,
+                "relation_metrics": _empty,
+                "per_type_relation_f1": {},
+                "counts": {"tp": e_tp, "fp": e_fp, "fn": e_fn},
+                "relation_counts": {"tp": sum(r_tp.values()), "fp": sum(r_fp.values()), "fn": sum(r_fn.values())},
                 "rows_total": len(rows),
                 "rows_evaluated": 0,
                 "rows_failed": rows_failed,
@@ -1379,18 +1903,292 @@ class GLiNERTrainingService:
                 "failure_samples": failure_samples,
             }
 
-        metrics = self.compute_prf_metrics(tp=tp, fp=fp, fn=fn)
+        entity_metrics = self.compute_prf_metrics(tp=e_tp, fp=e_fp, fn=e_fn)
+
+        # Aggregate relation metrics (micro-average)
+        total_r_tp = sum(r_tp.values())
+        total_r_fp = sum(r_fp.values())
+        total_r_fn = sum(r_fn.values())
+        relation_metrics = self.compute_prf_metrics(tp=total_r_tp, fp=total_r_fp, fn=total_r_fn)
+
+        # Per-type relation F1
+        per_type_relation_f1: dict[str, float] = {}
+        for rtype in sorted(set(list(r_tp.keys()) + list(r_fp.keys()) + list(r_fn.keys()))):
+            pt_f1 = self.compute_prf_metrics(
+                tp=r_tp.get(rtype, 0),
+                fp=r_fp.get(rtype, 0),
+                fn=r_fn.get(rtype, 0),
+            )
+            per_type_relation_f1[rtype] = round(pt_f1["f1"], 4)
+
+        is_partial = rows_failed > 0
         return {
-            "ok": rows_failed == 0,
-            "error": "" if rows_failed == 0 else "partial_inference_failures",
-            "metrics": metrics,
-            "counts": {"tp": tp, "fp": fp, "fn": fn},
+            "ok": not is_partial,
+            "error": "" if not is_partial else "partial_inference_failures",
+            # Entity
+            "entity_metrics": entity_metrics,
+            "metrics": entity_metrics,  # backward-compat alias
+            "counts": {"tp": e_tp, "fp": e_fp, "fn": e_fn},
+            # Relation
+            "relation_metrics": relation_metrics,
+            "relation_counts": {"tp": total_r_tp, "fp": total_r_fp, "fn": total_r_fn},
+            "per_type_relation_f1": per_type_relation_f1,
+            # Common
             "rows_total": len(rows),
             "rows_evaluated": rows_evaluated,
             "rows_failed": rows_failed,
             "latency_ms_avg": round(latency_sum_ms / rows_evaluated, 2),
             "failure_samples": failure_samples,
         }
+
+    # ── Confidence calibration ────────────────────────────────────────────────
+
+    def calibrate_confidence(
+        self,
+        model_ref: str,
+        rows: list[dict[str, Any]],
+        n_bins: int = 10,
+        threshold: float = GLINER_BENCHMARK_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Compute Expected Calibration Error (ECE) for a candidate model.
+
+        Buckets predictions by confidence score and compares average confidence
+        to empirical accuracy within each bucket.  Returns ECE and per-bin stats.
+        """
+        if not rows:
+            return {"ece": 0.0, "total_predictions": 0, "bins": [], "warning": "empty_eval_set"}
+
+        try:
+            model, schema = self.load_gliner_full_model(model_ref)
+        except Exception as exc:
+            return {"ece": 0.0, "total_predictions": 0, "bins": [], "warning": f"model_load_failed: {exc}"}
+
+        bin_confidence: list[list[float]] = [[] for _ in range(n_bins)]
+        bin_accuracy: list[list[float]] = [[] for _ in range(n_bins)]
+        total_predictions = 0
+
+        for row in rows:
+            text = str(row.get("text") or "").strip()
+            if not text:
+                continue
+            expected_ents = self.extract_expected_entity_set(row)
+            try:
+                result = model.extract(text, schema, threshold=threshold, include_confidence=True)
+            except Exception:
+                continue
+
+            for text_pred, _label, conf in self._extract_predicted_entities_with_confidence(result):
+                bin_idx = min(int(conf * n_bins), n_bins - 1)
+                is_correct = 1.0 if self.normalize_entity_text(text_pred) in expected_ents else 0.0
+                bin_confidence[bin_idx].append(conf)
+                bin_accuracy[bin_idx].append(is_correct)
+                total_predictions += 1
+
+        if total_predictions == 0:
+            return {"ece": 0.0, "total_predictions": 0, "bins": [], "warning": "no_predictions"}
+
+        bins_out: list[dict[str, Any]] = []
+        ece = 0.0
+        for i in range(n_bins):
+            if not bin_confidence[i]:
+                continue
+            avg_conf = sum(bin_confidence[i]) / len(bin_confidence[i])
+            avg_acc = sum(bin_accuracy[i]) / len(bin_accuracy[i])
+            frac = len(bin_confidence[i]) / total_predictions
+            ece += frac * abs(avg_conf - avg_acc)
+            bins_out.append({
+                "bin": i,
+                "avg_confidence": round(avg_conf, 4),
+                "avg_accuracy": round(avg_acc, 4),
+                "count": len(bin_confidence[i]),
+                "fraction": round(frac, 4),
+                "calibration_gap": round(abs(avg_conf - avg_acc), 4),
+            })
+
+        warning: str | None = None
+        if ece > 0.25:
+            warning = f"High ECE={ece:.4f}: model may be overconfident or underconfident"
+        elif ece > 0.15:
+            warning = f"Moderate ECE={ece:.4f}: consider temperature scaling"
+
+        return {
+            "ece": round(ece, 4),
+            "total_predictions": total_predictions,
+            "bins": bins_out,
+            "warning": warning,
+        }
+
+    # ── Run audit trail ───────────────────────────────────────────────────────
+
+    def write_run_audit(self, audit_payload: dict[str, Any]) -> str:
+        """Write a JSON audit trail for this training run.
+
+        Saved to ~/.graph-memory/training/runs/YYYY-MM-DD-HHMMSS.json.
+        Returns the path as a string.
+        """
+        runs_dir = config.GRAPH_MEMORY_DIR / "training" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+
+        run_id = str(audit_payload.get("run_id") or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+        out_path = runs_dir / f"{run_id}.json"
+        out_path.write_text(
+            json.dumps(audit_payload, indent=2, default=str, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        log.info("Run audit written to %s", out_path)
+        return str(out_path)
+
+    def list_training_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """List recent training run audits."""
+        runs_dir = config.GRAPH_MEMORY_DIR / "training" / "runs"
+        if not runs_dir.exists():
+            return []
+
+        paths = sorted(runs_dir.glob("*.json"), reverse=True)[:limit]
+        results: list[dict[str, Any]] = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                results.append({
+                    "run_id": payload.get("run_id", path.stem),
+                    "mode": payload.get("mode"),
+                    "status": payload.get("status"),
+                    "started_at": payload.get("started_at"),
+                    "combined_improvement": payload.get("deploy_decision", {}).get("combined_improvement"),
+                    "entity_improvement": payload.get("deploy_decision", {}).get("entity_improvement"),
+                    "relation_improvement": payload.get("deploy_decision", {}).get("relation_improvement"),
+                    "path": str(path),
+                })
+            except Exception:
+                results.append({"path": str(path), "error": "parse_failed"})
+        return results
+
+    # ── Shadow evaluation ─────────────────────────────────────────────────────
+
+    def run_shadow_evaluation(
+        self,
+        base_model_ref: str,
+        candidate_model_ref: str,
+        n_episodes: int = 20,
+    ) -> dict[str, Any]:
+        """Run both models on recent live episodes; compare fallback rates.
+
+        The candidate passes if its fallback rate is not significantly worse
+        than the base model (within a 20% tolerance).
+        """
+        if not candidate_model_ref:
+            return {"skipped": True, "reason": "no_candidate_model_ref"}
+
+        episodes = self._query_recent_episode_texts(limit=n_episodes)
+        if not episodes:
+            return {"skipped": True, "reason": "no_episodes_available"}
+
+        base_results: list[dict[str, Any]] = []
+        cand_results: list[dict[str, Any]] = []
+
+        try:
+            base_model, base_schema = self.load_gliner_full_model(base_model_ref)
+        except Exception as exc:
+            return {"skipped": True, "reason": f"base_model_load_failed: {exc}"}
+
+        try:
+            cand_model, cand_schema = self.load_gliner_full_model(candidate_model_ref)
+        except Exception as exc:
+            return {"skipped": True, "reason": f"candidate_model_load_failed: {exc}"}
+
+        for ep in episodes:
+            text = str(ep.get("text") or "").strip()
+            if not text:
+                continue
+            base_res = self._shadow_extract(base_model, base_schema, text)
+            cand_res = self._shadow_extract(cand_model, cand_schema, text)
+            base_results.append(base_res)
+            cand_results.append(cand_res)
+
+        if not base_results:
+            return {"skipped": True, "reason": "all_extractions_failed"}
+
+        def _fallback_rate(results: list[dict[str, Any]]) -> float:
+            total = sum(r.get("n_entities", 0) + r.get("n_relations", 0) for r in results)
+            fallbacks = sum(r.get("fallback", 0) for r in results)
+            return fallbacks / max(total, 1)
+
+        base_rate = _fallback_rate(base_results)
+        cand_rate = _fallback_rate(cand_results)
+
+        # Candidate fails if fallback rate is >20% worse than base
+        TOLERANCE = 1.20
+        passed = cand_rate <= base_rate * TOLERANCE
+
+        failure_reason: str | None = None
+        if not passed:
+            failure_reason = (
+                f"candidate_fallback_rate={cand_rate:.4f} > "
+                f"base_fallback_rate={base_rate:.4f} * {TOLERANCE:.2f}"
+            )
+
+        return {
+            "skipped": False,
+            "passed": passed,
+            "failure_reason": failure_reason,
+            "episodes_evaluated": len(base_results),
+            "base_fallback_rate": round(base_rate, 4),
+            "candidate_fallback_rate": round(cand_rate, 4),
+            "base_avg_entities": round(
+                sum(r.get("n_entities", 0) for r in base_results) / max(len(base_results), 1), 2
+            ),
+            "candidate_avg_entities": round(
+                sum(r.get("n_entities", 0) for r in cand_results) / max(len(cand_results), 1), 2
+            ),
+            "base_avg_relations": round(
+                sum(r.get("n_relations", 0) for r in base_results) / max(len(base_results), 1), 2
+            ),
+            "candidate_avg_relations": round(
+                sum(r.get("n_relations", 0) for r in cand_results) / max(len(cand_results), 1), 2
+            ),
+        }
+
+    def _query_recent_episode_texts(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Query Neo4j for recent episode texts for shadow evaluation."""
+        try:
+            from runtime_graph import require_graph_instance
+
+            driver = require_graph_instance().driver
+            with driver.session() as session:
+                records = session.run(
+                    """
+                    MATCH (ep:Episode)
+                    WHERE ep.content_preview IS NOT NULL
+                      AND trim(ep.content_preview) <> ''
+                    RETURN ep.content_preview AS text,
+                           ep.id AS episode_id
+                    ORDER BY coalesce(ep.created_at, ep.ingested_at, ep.occurred_at) DESC
+                    LIMIT $limit
+                    """,
+                    limit=int(limit),
+                )
+                return [{"text": r["text"], "episode_id": r["episode_id"]} for r in records]
+        except Exception:
+            log.warning("Failed to query episode texts for shadow eval", exc_info=True)
+            return []
+
+    @staticmethod
+    def _shadow_extract(model: Any, schema: Any, text: str) -> dict[str, Any]:
+        """Run a single extraction and return stats for shadow evaluation."""
+        try:
+            result = model.extract(text, schema, threshold=0.35, include_confidence=True)
+            entity_dict = result.get("entities") or {}
+            n_entities = sum(len(v) for v in entity_dict.values() if isinstance(v, list)) if isinstance(entity_dict, dict) else 0
+            rel_dict = result.get("relation_extraction") or result.get("relations") or {}
+            n_relations = sum(len(v) for v in rel_dict.values() if isinstance(v, list)) if isinstance(rel_dict, dict) else 0
+            return {
+                "n_entities": n_entities,
+                "n_relations": n_relations,
+                "fallback": 0,
+                "ok": True,
+            }
+        except Exception:
+            return {"n_entities": 0, "n_relations": 0, "fallback": 1, "ok": False}
 
     def benchmark_finetune_candidate(
         self,
@@ -1444,10 +2242,37 @@ class GLiNERTrainingService:
         base_eval = self.evaluate_model_on_rows(base_model_ref, eval_rows)
         candidate_eval = self.evaluate_model_on_rows(candidate_model_ref, eval_rows)
 
-        base_score = float(base_eval.get("metrics", {}).get("f1", 0.0) or 0.0)
-        candidate_score = float(candidate_eval.get("metrics", {}).get("f1", 0.0) or 0.0)
+        # ── Entity F1 ──────────────────────────────────────────────────────
+        base_entity_f1 = float(base_eval.get("entity_metrics", base_eval.get("metrics", {})).get("f1", 0.0) or 0.0)
+        cand_entity_f1 = float(candidate_eval.get("entity_metrics", candidate_eval.get("metrics", {})).get("f1", 0.0) or 0.0)
+
+        # ── Relation F1 ───────────────────────────────────────────────────
+        base_relation_f1 = float((base_eval.get("relation_metrics") or {}).get("f1", 0.0) or 0.0)
+        cand_relation_f1 = float((candidate_eval.get("relation_metrics") or {}).get("f1", 0.0) or 0.0)
+
+        # ── Combined F1 (0.5 entity + 0.5 relation) ───────────────────────
+        base_combined = 0.5 * base_entity_f1 + 0.5 * base_relation_f1
+        cand_combined = 0.5 * cand_entity_f1 + 0.5 * cand_relation_f1
+
         benchmark_ok = bool(base_eval.get("ok")) and bool(candidate_eval.get("ok"))
-        improvement = (candidate_score - base_score) if benchmark_ok else 0.0
+        entity_improvement = (cand_entity_f1 - base_entity_f1) if benchmark_ok else 0.0
+        relation_improvement = (cand_relation_f1 - base_relation_f1) if benchmark_ok else 0.0
+        combined_improvement = (cand_combined - base_combined) if benchmark_ok else 0.0
+        # Legacy key for backward compatibility
+        improvement = entity_improvement
+
+        # Per-type relation F1
+        base_per_type = base_eval.get("per_type_relation_f1") or {}
+        cand_per_type = candidate_eval.get("per_type_relation_f1") or {}
+        all_types = sorted(set(list(base_per_type.keys()) + list(cand_per_type.keys())))
+        per_type_improvement = {
+            rtype: round(
+                float(cand_per_type.get(rtype, 0.0) or 0.0)
+                - float(base_per_type.get(rtype, 0.0) or 0.0),
+                4,
+            )
+            for rtype in all_types
+        }
 
         failure_details = []
         if not base_eval.get("ok"):
@@ -1468,9 +2293,23 @@ class GLiNERTrainingService:
             "candidate_model": candidate_model_ref or None,
             "base": base_eval,
             "candidate": candidate_eval,
-            "base_score": round(base_score, 4),
-            "candidate_score": round(candidate_score, 4),
+            # Legacy keys
+            "base_score": round(base_entity_f1, 4),
+            "candidate_score": round(cand_entity_f1, 4),
             "improvement": round(improvement, 4),
+            # Extended keys
+            "base_entity_f1": round(base_entity_f1, 4),
+            "candidate_entity_f1": round(cand_entity_f1, 4),
+            "entity_improvement": round(entity_improvement, 4),
+            "base_relation_f1": round(base_relation_f1, 4),
+            "candidate_relation_f1": round(cand_relation_f1, 4),
+            "relation_improvement": round(relation_improvement, 4),
+            "combined_improvement": round(combined_improvement, 4),
+            "per_type_relation_f1": {
+                "base": base_per_type,
+                "candidate": cand_per_type,
+                "improvement": per_type_improvement,
+            },
             "failure": None if benchmark_ok else {"reason": "model_evaluation_failed", "details": failure_details},
         }
 

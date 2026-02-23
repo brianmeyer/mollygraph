@@ -21,6 +21,7 @@ _relation_model: Any | None = None
 _model_lock = threading.Lock()
 _model_backend: str = ""
 _model_ref: str = ""
+_model_mtime: float | None = None   # mtime of active model dir for hot-reload detection
 _relation_model_backend: str = ""
 _relation_model_ref: str = ""
 
@@ -64,12 +65,13 @@ def _active_relation_model_ref() -> str:
 
 def invalidate_model_cache() -> None:
     """Clear cached extractor model so runtime config changes take effect."""
-    global _model, _relation_model, _model_backend, _model_ref, _relation_model_backend, _relation_model_ref
+    global _model, _relation_model, _model_backend, _model_ref, _model_mtime, _relation_model_backend, _relation_model_ref
     with _model_lock:
         _model = None
         _relation_model = None
         _model_backend = ""
         _model_ref = ""
+        _model_mtime = None
         _relation_model_backend = ""
         _relation_model_ref = ""
 
@@ -83,9 +85,31 @@ def _resolve_gliner_model_ref(selected_model: str) -> str:
     return str(config.GLINER_BASE_MODEL)
 
 
+def _load_base_gliner_model() -> Any:
+    """Load the base GLiNER2 model from HuggingFace (or local cache)."""
+    from gliner2 import GLiNER2
+
+    log.info("Loading GLiNER2 base model (%s)...", config.GLINER_BASE_MODEL)
+    m = GLiNER2.from_pretrained(str(config.GLINER_BASE_MODEL))
+    log.info("GLiNER2 base model loaded.")
+    return m
+
+
+def _load_gliner_model_from_dir(model_dir: str) -> Any:
+    """Load a GLiNER2 model from a local directory path."""
+    from gliner2 import GLiNER2
+
+    return GLiNER2.from_pretrained(model_dir)
+
+
 def _get_model() -> Any:
-    """Load the active extractor model according to runtime config."""
-    global _model, _model_backend, _model_ref
+    """Load the active extractor model according to runtime config.
+
+    For gliner2 backend, also performs mtime-based hot-reload: if the
+    active model directory content changes (e.g. after a LoRA deploy) the
+    model is reloaded automatically on the next extraction call.
+    """
+    global _model, _model_backend, _model_ref, _model_mtime
 
     backend = _active_backend()
     requested_model = _active_model_ref()
@@ -97,6 +121,83 @@ def _get_model() -> Any:
             "Set one via POST /extractors/config or POST /extractors/models."
         )
 
+    # ── GLiNER2 mtime hot-reload check ────────────────────────────────────
+    # When the resolved path is a local directory (deployed model), check its
+    # mtime.  A rename-swap deploy changes the mtime while the path string
+    # stays the same, so we need this extra check to trigger a reload.
+    if backend == "gliner2":
+        import os as _os
+        current_mtime: float | None = None
+        if resolved_ref and _os.path.isdir(resolved_ref):
+            try:
+                current_mtime = _os.path.getmtime(resolved_ref)
+            except OSError:
+                current_mtime = None
+
+        # Fast path: same backend, same ref, same mtime → return cached model
+        if (
+            _model is not None
+            and _model_backend == backend
+            and _model_ref == resolved_ref
+            and current_mtime is not None
+            and _model_mtime == current_mtime
+        ):
+            return _model
+
+        # Also fast-path non-directory refs (HuggingFace model IDs) when unchanged
+        if (
+            _model is not None
+            and _model_backend == backend
+            and _model_ref == resolved_ref
+            and current_mtime is None
+            and _model_mtime is None
+        ):
+            return _model
+
+        with _model_lock:
+            # Re-read inside lock
+            if resolved_ref and _os.path.isdir(resolved_ref):
+                try:
+                    current_mtime = _os.path.getmtime(resolved_ref)
+                except OSError:
+                    current_mtime = None
+
+            if (
+                _model is not None
+                and _model_backend == backend
+                and _model_ref == resolved_ref
+                and _model_mtime == current_mtime
+            ):
+                return _model
+
+            if current_mtime is not None:
+                log.info(
+                    "GLiNER2 hot-reload triggered: path=%s mtime=%.3f",
+                    resolved_ref, current_mtime,
+                )
+                try:
+                    model = _load_gliner_model_from_dir(resolved_ref)
+                except Exception as exc:
+                    log.error(
+                        "Failed to hot-reload GLiNER2 model from %s: %s", resolved_ref, exc
+                    )
+                    if _model is not None:
+                        return _model  # keep old model as safe fallback
+                    model = _load_base_gliner_model()
+                    resolved_ref = str(config.GLINER_BASE_MODEL)
+                    current_mtime = None
+            else:
+                log.info("Loading GLiNER2 model (%s)...", resolved_ref)
+                model = _load_gliner_model_from_dir(resolved_ref) if _os.path.isdir(resolved_ref) else _load_base_gliner_model()
+                log.info("GLiNER2 model loaded.")
+
+            _model = model
+            _model_backend = backend
+            _model_ref = resolved_ref
+            _model_mtime = current_mtime
+            return _model
+
+    # ── Non-gliner2 backends (no mtime tracking) ──────────────────────────
     if _model is not None and _model_backend == backend and _model_ref == resolved_ref:
         return _model
 
@@ -104,27 +205,21 @@ def _get_model() -> Any:
         if _model is not None and _model_backend == backend and _model_ref == resolved_ref:
             return _model
 
-        if backend == "gliner2":
-            from gliner2 import GLiNER2
+        from transformers import pipeline
 
-            log.info("Loading GLiNER2 model (%s)...", resolved_ref)
-            model = GLiNER2.from_pretrained(resolved_ref)
-            log.info("GLiNER2 model loaded.")
-        else:
-            from transformers import pipeline
-
-            log.info("Loading HF token-classification model (%s)...", resolved_ref)
-            model = pipeline(
-                "token-classification",
-                model=resolved_ref,
-                tokenizer=resolved_ref,
-                aggregation_strategy="simple",
-            )
-            log.info("HF token-classification model loaded.")
+        log.info("Loading HF token-classification model (%s)...", resolved_ref)
+        model = pipeline(
+            "token-classification",
+            model=resolved_ref,
+            tokenizer=resolved_ref,
+            aggregation_strategy="simple",
+        )
+        log.info("HF token-classification model loaded.")
 
         _model = model
         _model_backend = backend
         _model_ref = resolved_ref
+        _model_mtime = None
         return _model
 
 

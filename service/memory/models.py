@@ -76,11 +76,7 @@ class Relationship(BaseModel):
     # Identifiers
     source_entity: str  # Source entity name/ID
     target_entity: str  # Target entity name/ID
-    relation_type: Literal[
-        "WORKS_ON", "WORKS_AT", "KNOWS", "USES", "LOCATED_IN",
-        "DISCUSSED_WITH", "INTERESTED_IN", "CREATED", "MANAGES",
-        "DEPENDS_ON", "RELATED_TO", "MENTIONS"
-    ]
+    relation_type: str
     
     # Bi-temporal tracking
     valid_at: Optional[datetime] = None  # When fact is true (valid time)

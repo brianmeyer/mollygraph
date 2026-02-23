@@ -40,7 +40,8 @@ from extractor_schema_registry import (
     set_active_extractor_schema,
     upload_custom_extractor_schema,
 )
-from evolution.gliner_training import get_gliner_stats, run_gliner_finetune_pipeline
+from evolution.gliner_training import get_gliner_stats, run_gliner_finetune_pipeline, GLiNERTrainingService
+from metrics.model_health import model_health_monitor
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
 from maintenance.auditor import run_maintenance_cycle
@@ -543,8 +544,19 @@ async def get_entity(name: str, _api_key: str = Depends(verify_api_key)) -> Enti
 
 
 def _extract_query_entities(query: str) -> list[str]:
+    """Extract candidate entity names from a natural-language query.
+
+    Primary heuristic: title-cased or ALL-CAPS words >= 3 chars.
+    Fuzzy fallback: if nothing qualifies, return every word >= 4 chars
+    (allows queries like "tell me about rust" to match "Rust").
+    """
     words = [w.strip(" ,.!?:;()[]{}") for w in query.split()]
     entities = [w for w in words if len(w) > 2 and (w.istitle() or w.isupper())]
+
+    # Fuzzy fallback: lowercased words of reasonable length
+    if not entities:
+        entities = [w for w in words if len(w) >= 4 and w.isalpha()]
+
     # preserve order while deduping
     seen: set[str] = set()
     ordered: list[str] = []
@@ -568,6 +580,32 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
         facts = graph.get_current_facts(entity_name)
         if facts:
             results.append({"entity": entity_name, "facts": facts[:10]})
+
+    # Fuzzy Neo4j CONTAINS fallback: if exact-name lookup missed, try substring match
+    if not results:
+        try:
+            with graph.driver.session() as _session:
+                for entity_name in entities[:5]:
+                    _contains_q = entity_name.lower()
+                    _rows = _session.run(
+                        "MATCH (e:Entity) WHERE toLower(e.name) CONTAINS $q "
+                        "RETURN e.name AS name LIMIT 5",
+                        q=_contains_q,
+                    )
+                    for _row in _rows:
+                        _name = str(_row.get("name") or "").strip()
+                        if _name:
+                            _facts = graph.get_current_facts(_name)
+                            if _facts:
+                                results.append({
+                                    "entity": _name,
+                                    "facts": _facts[:10],
+                                    "match": "fuzzy_contains",
+                                })
+                    if results:
+                        break
+        except Exception:
+            log.debug("Fuzzy CONTAINS fallback failed", exc_info=True)
 
     # Fallback: query vector index using deterministic embedding.
     if not results and vector_store is not None:
@@ -787,6 +825,84 @@ async def trigger_maintenance(
 ) -> dict[str, Any]:
     background_tasks.add_task(run_maintenance_cycle)
     return {"status": "maintenance_triggered", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.get("/metrics/model-health")
+async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return the current model health monitor status (rollback guard)."""
+    try:
+        return model_health_monitor.status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"model_health_error: {exc}") from exc
+
+
+@app.get("/training/runs")
+async def training_runs(
+    limit: int = 20,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """List recent training run audit trails."""
+    try:
+        svc = GLiNERTrainingService()
+        runs = await asyncio.to_thread(svc.list_training_runs, limit)
+        return {
+            "runs": runs,
+            "count": len(runs),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"training_runs_error: {exc}") from exc
+
+
+@app.post("/maintenance/nightly")
+async def trigger_nightly_maintenance(
+    background_tasks: BackgroundTasks,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Run the full nightly maintenance pipeline in the background.
+
+    Sequence:
+    1. LLM audit (Kimi/Gemini) on recent relationships
+    2. Model health check → if quality degraded, trigger auto-rollback
+    3. If training data threshold met and cooldown elapsed, auto-trigger LoRA fine-tune
+    """
+    async def _nightly_bg() -> None:
+        log.info("Nightly maintenance pipeline started")
+        try:
+            # Step 1: LLM audit
+            from audit.llm_audit import run_llm_audit
+
+            audit_result = await run_llm_audit(limit=200, dry_run=False, schedule="nightly")
+            log.info("Nightly audit complete: %s", audit_result.get("status"))
+        except Exception:
+            log.warning("Nightly audit step failed", exc_info=True)
+
+        try:
+            # Step 2: Model health check
+            health = model_health_monitor.status()
+            rollback_triggered = health.get("rollback_triggered", False)
+            if rollback_triggered:
+                log.warning("Model health monitor triggered rollback: %s", health.get("reason"))
+            else:
+                log.info("Model health OK: fallback_rate=%.4f", health.get("fallback_rate", 0.0))
+        except Exception:
+            log.warning("Model health check step failed", exc_info=True)
+
+        try:
+            # Step 3: Auto-trigger LoRA if conditions met
+            pipeline_result = await run_gliner_finetune_pipeline(force=False)
+            log.info("Nightly LoRA pipeline: status=%s", pipeline_result.get("status"))
+        except Exception:
+            log.warning("Nightly LoRA pipeline step failed", exc_info=True)
+
+        log.info("Nightly maintenance pipeline complete")
+
+    background_tasks.add_task(_nightly_bg)
+    return {
+        "status": "nightly_maintenance_triggered",
+        "timestamp": datetime.utcnow().isoformat(),
+        "sequence": ["llm_audit", "model_health_check", "lora_pipeline"],
+    }
 
 
 if __name__ == "__main__":

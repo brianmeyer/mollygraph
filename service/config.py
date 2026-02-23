@@ -94,6 +94,8 @@ GLINER_TRAINING_SCAN_LIMIT         = int(os.environ.get("GLINER_TRAINING_SCAN_LI
 GLINER_BENCHMARK_SEED              = 1337
 GLINER_BENCHMARK_EVAL_RATIO        = 0.2
 GLINER_BENCHMARK_THRESHOLD         = 0.4
+GLINER_SHADOW_EPISODES             = int(os.environ.get("GLINER_SHADOW_EPISODES", "20"))
+GLINER_SHADOW_ENABLED              = os.environ.get("GLINER_SHADOW_ENABLED", "true").lower() == "true"
 
 # ── Ensure runtime dirs exist ────────────────────────────────────────────────
 for _d in (
