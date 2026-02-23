@@ -162,7 +162,19 @@ class GLiNERTrainingService:
             "force": bool(force),
         }
 
+    _finetune_running = False  # class-level concurrency guard
+
     async def run_gliner_finetune_pipeline(self) -> dict[str, Any]:
+        if GLiNERTrainingMixin._finetune_running:
+            log.warning("GLiNER fine-tune already running, skipping concurrent trigger")
+            return {"status": "already_running", "message": "Fine-tune pipeline already in progress"}
+        GLiNERTrainingMixin._finetune_running = True
+        try:
+            return await self._run_finetune_pipeline_inner()
+        finally:
+            GLiNERTrainingMixin._finetune_running = False
+
+    async def _run_finetune_pipeline_inner(self) -> dict[str, Any]:
         rows = await asyncio.to_thread(self.load_accumulated_gliner_examples)
         total_rows = len(rows)
         required = int(config.GLINER_FINETUNE_MIN_EXAMPLES)
@@ -265,8 +277,13 @@ class GLiNERTrainingService:
                 "fine_tune": fine_tune,
             }
 
-        # Training succeeded — stamp the cooldown timer now so retries respect the window.
+        # Training succeeded — stamp the cooldown timer and update status.
         self.state["gliner_last_finetune_at"] = datetime.now(timezone.utc).isoformat()
+        self.state["gliner_last_cycle_status"] = "finetune_completed"
+        self.state["gliner_last_result"] = (
+            f"GLiNER {mode} training completed. {len(train_rows)} train / {len(eval_rows)} eval. "
+            f"Running benchmark..."
+        )
         self.save_state()
 
         candidate_model_ref = str(fine_tune.get("candidate_model") or "").strip()
