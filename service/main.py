@@ -828,6 +828,30 @@ async def trigger_maintenance(
     return {"status": "maintenance_triggered", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.post("/maintenance/backfill-temporal", operation_id="post_maintenance_backfill_temporal")
+async def backfill_temporal_properties(
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    require_runtime_ready()
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    backfill_fn = getattr(graph, "backfill_temporal_properties_sync", None)
+    if not callable(backfill_fn):
+        raise HTTPException(status_code=501, detail="Temporal backfill is not supported by the active graph backend")
+
+    try:
+        summary = await asyncio.to_thread(backfill_fn)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"temporal_backfill_error: {exc}") from exc
+
+    return {
+        "status": "temporal_backfill_completed",
+        "summary": _json_safe(summary),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
 @app.get("/metrics/model-health")
 async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     """Return the current model health monitor status (rollback guard)."""

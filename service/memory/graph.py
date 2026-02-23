@@ -40,7 +40,27 @@ VALID_REL_TYPES = {
     "MENTORS", "MENTORED_BY", "REPORTS_TO", "COLLABORATES_WITH",
     "CONTACT_OF",
     "CUSTOMER_OF", "ATTENDS", "PARENT_OF", "CHILD_OF", "RECEIVED_FROM",
+    "TEACHES_AT",
 }
+
+
+def _relationship_half_life_case(rel_var: str = "r") -> str:
+    """Build CASE expression using shared bitemporal tier mapping when available."""
+    try:
+        from memory.bitemporal_graph import build_relationship_half_life_case
+
+        return build_relationship_half_life_case(rel_var)
+    except Exception:
+        # Safe fallback if bitemporal module dependencies are unavailable.
+        return (
+            "CASE\n"
+            f"    WHEN type({rel_var}) IN ['IS_A', 'PART_OF', 'PARENT_OF', 'CHILD_OF', 'STUDIED_AT', 'ALUMNI_OF'] THEN 1000.0\n"
+            f"    WHEN type({rel_var}) IN ['WORKS_AT', 'WORKS_ON', 'USES', 'LOCATED_IN', 'CREATED', 'MANAGES', "
+            "'DEPENDS_ON', 'REPORTS_TO', 'COLLABORATES_WITH', 'CUSTOMER_OF', 'ATTENDS', 'TEACHES_AT'] THEN 180.0\n"
+            f"    WHEN type({rel_var}) IN ['MENTIONS', 'DISCUSSED_WITH', 'RELATED_TO', 'SAID'] THEN 7.0\n"
+            "    ELSE 30.0\n"
+            "END"
+        )
 
 
 def _get_graph_write_lock() -> asyncio.Lock:
@@ -252,8 +272,11 @@ def _upsert_entity_sync(
         if existing:
             session.run(
                 """MATCH (e:Entity) WHERE e.name = $existing_name
-                   SET e.mention_count = e.mention_count + 1,
+                   SET e.mention_count = coalesce(e.mention_count, 0) + 1,
                        e.last_mentioned = $now,
+                       e.last_seen = $now,
+                       e.valid_from = coalesce(e.valid_from, e.first_mentioned, $now),
+                       e.valid_to = null,
                        e.confidence = CASE
                            WHEN $confidence > e.confidence THEN $confidence
                            ELSE e.confidence END,
@@ -276,6 +299,9 @@ def _upsert_entity_sync(
                        mention_count: 1,
                        first_mentioned: $now,
                        last_mentioned: $now,
+                       valid_from: $now,
+                       valid_to: null,
+                       last_seen: $now,
                        strength: 1.0,
                        confidence: $confidence,
                        aliases: [],
@@ -351,19 +377,29 @@ def _upsert_relationship_sync(
                 ON CREATE SET
                     r.strength = $confidence,
                     r.mention_count = 1,
+                    r.valid_from = $now,
+                    r.valid_to = null,
+                    r.valid_at = $now,
+                    r.valid_until = null,
+                    r.observed_at = $now,
                     r.first_mentioned = $now,
                     r.last_mentioned = $now,
                     r.context_snippets = [$snippet]
                 ON MATCH SET
-                    r.mention_count = r.mention_count + 1,
+                    r.mention_count = coalesce(r.mention_count, 0) + 1,
                     r.last_mentioned = $now,
+                    r.observed_at = $now,
+                    r.valid_from = coalesce(r.valid_from, r.valid_at, r.first_mentioned, $now),
+                    r.valid_to = null,
+                    r.valid_at = coalesce(r.valid_at, r.valid_from, $now),
+                    r.valid_until = null,
                     r.strength = CASE
                         WHEN $confidence > r.strength THEN $confidence
                         ELSE r.strength END,
                     r.context_snippets = CASE
-                        WHEN size(r.context_snippets) >= 3
-                        THEN r.context_snippets[1..] + [$snippet]
-                        ELSE r.context_snippets + [$snippet]
+                        WHEN size(coalesce(r.context_snippets, [])) >= 3
+                        THEN coalesce(r.context_snippets, [])[1..] + [$snippet]
+                        ELSE coalesce(r.context_snippets, []) + [$snippet]
                     END,
                     r.audit_status = CASE WHEN r.audit_status IN ['quarantined', 'verified'] THEN r.audit_status ELSE null END
                 RETURN r.mention_count AS mention_count""",
@@ -437,9 +473,12 @@ def _create_episode_sync(
             session.run(
                 """MATCH (ep:Episode {id: $eid})
                    MATCH (e:Entity {name: $name})
-                   MERGE (ep)-[:MENTIONS]->(e)""",
+                   MERGE (ep)-[:MENTIONS]->(e)
+                   SET e.last_seen = $now,
+                       e.last_mentioned = $now""",
                 eid=episode_id,
                 name=name,
+                now=now,
             )
     return episode_id
 
@@ -632,21 +671,42 @@ def delete_entity(name: str) -> bool:
 
 def _run_strength_decay_sync() -> int:
     driver = get_driver()
+    half_life_case = _relationship_half_life_case("r")
     with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
-        result = session.run(
+        entity_result = session.run(
             """
             MATCH (e:Entity)
-            WHERE e.last_mentioned IS NOT NULL
+            WHERE coalesce(e.last_seen, e.last_mentioned) IS NOT NULL
             WITH e,
-                 e.mention_count AS mentions,
-                 duration.between(datetime(e.last_mentioned), datetime()).days AS days_since
+                 toFloat(coalesce(e.mention_count, 1)) AS mentions,
+                 toFloat(duration.between(datetime(coalesce(e.last_seen, e.last_mentioned)), datetime()).days) AS days_since
             SET e.strength = mentions * exp(-0.03 * days_since)
             RETURN count(e) AS updated
             """
         )
-        updated = result.single()["updated"]
-        log.info("Strength decay: updated %d entities", updated)
-        return updated
+        rel_result = session.run(
+            f"""
+            MATCH ()-[r]->()
+            WITH r,
+                 coalesce(r.last_mentioned, r.observed_at, r.valid_from, r.valid_at) AS last_seen,
+                 toFloat(coalesce(r.mention_count, 1)) AS mentions,
+                 {half_life_case} AS half_life
+            WHERE last_seen IS NOT NULL
+            WITH r, mentions, half_life,
+                 toFloat(duration.between(datetime(last_seen), datetime()).days) AS days_since
+            SET r.strength = log(1.0 + mentions) * exp(-((log(2.0) / half_life) * days_since))
+            RETURN count(r) AS updated
+            """
+        )
+        entity_updated = int(entity_result.single()["updated"])
+        rel_updated = int(rel_result.single()["updated"])
+        total = entity_updated + rel_updated
+        log.info(
+            "Strength decay: updated %d entities and %d relationships",
+            entity_updated,
+            rel_updated,
+        )
+        return total
 
 
 def run_strength_decay_sync() -> int:
@@ -656,6 +716,84 @@ def run_strength_decay_sync() -> int:
 async def run_strength_decay() -> int:
     async with _get_graph_write_lock():
         return await asyncio.to_thread(_run_strength_decay_sync)
+
+
+def _backfill_temporal_properties_sync() -> dict[str, int]:
+    driver = get_driver()
+    now = datetime.now(timezone.utc).isoformat()
+    with _GRAPH_SYNC_WRITE_LOCK, driver.session() as session:
+        entity_record = session.run(
+            """
+            MATCH (e:Entity)
+            OPTIONAL MATCH (ep_link:Episode)-[:MENTIONS]->(e)
+            WITH e, min(coalesce(ep_link.created_at, ep_link.occurred_at, ep_link.ingested_at)) AS linked_episode_at
+            OPTIONAL MATCH (ep_list:Episode)
+            WHERE e.name IN coalesce(ep_list.entities_extracted, [])
+            WITH e,
+                 linked_episode_at,
+                 min(coalesce(ep_list.created_at, ep_list.occurred_at, ep_list.ingested_at)) AS listed_episode_at,
+                 e.valid_from IS NULL AS needs_valid_from,
+                 e.last_seen IS NULL AS needs_last_seen,
+                 e.mention_count IS NULL AS needs_mentions
+            WITH e, needs_valid_from, needs_last_seen, needs_mentions,
+                 coalesce(e.first_mentioned, e.last_mentioned, linked_episode_at, listed_episode_at, $now) AS inferred_valid_from
+            SET e.valid_from = coalesce(e.valid_from, inferred_valid_from),
+                e.last_seen = coalesce(e.last_seen, e.last_mentioned, inferred_valid_from, $now),
+                e.mention_count = coalesce(e.mention_count, 1)
+            RETURN count(e) AS scanned,
+                   sum(CASE WHEN needs_valid_from THEN 1 ELSE 0 END) AS valid_from_backfilled,
+                   sum(CASE WHEN needs_last_seen THEN 1 ELSE 0 END) AS last_seen_backfilled,
+                   sum(CASE WHEN needs_mentions THEN 1 ELSE 0 END) AS mention_count_backfilled
+            """,
+            now=now,
+        ).single()
+
+        rel_record = session.run(
+            """
+            MATCH ()-[r]->()
+            OPTIONAL MATCH (ep:Episode)
+            WHERE any(ep_id IN coalesce(r.episode_ids, []) WHERE ep.id = ep_id)
+            WITH r,
+                 min(coalesce(ep.created_at, ep.occurred_at, ep.ingested_at)) AS episode_at,
+                 r.valid_from IS NULL AS needs_valid_from,
+                 r.observed_at IS NULL AS needs_observed_at,
+                 r.valid_to IS NULL AS needs_valid_to
+            WITH r, needs_valid_from, needs_observed_at, needs_valid_to,
+                 coalesce(r.valid_at, r.first_mentioned, r.last_mentioned, r.observed_at, episode_at, $now) AS inferred_valid_from
+            SET r.valid_from = coalesce(r.valid_from, inferred_valid_from),
+                r.valid_at = coalesce(r.valid_at, r.valid_from, inferred_valid_from),
+                r.observed_at = coalesce(r.observed_at, r.last_mentioned, r.valid_from, $now),
+                r.valid_to = coalesce(r.valid_to, r.valid_until),
+                r.valid_until = coalesce(r.valid_until, r.valid_to)
+            RETURN count(r) AS scanned,
+                   sum(CASE WHEN needs_valid_from THEN 1 ELSE 0 END) AS valid_from_backfilled,
+                   sum(CASE WHEN needs_observed_at THEN 1 ELSE 0 END) AS observed_at_backfilled,
+                   sum(CASE WHEN needs_valid_to THEN 1 ELSE 0 END) AS valid_to_backfilled
+            """,
+            now=now,
+        ).single()
+
+    return {
+        "entities_scanned": int(entity_record["scanned"]) if entity_record else 0,
+        "entities_valid_from_backfilled": int(entity_record["valid_from_backfilled"]) if entity_record else 0,
+        "entities_last_seen_backfilled": int(entity_record["last_seen_backfilled"]) if entity_record else 0,
+        "entities_mention_count_backfilled": int(entity_record["mention_count_backfilled"]) if entity_record else 0,
+        "relationships_scanned": int(rel_record["scanned"]) if rel_record else 0,
+        "relationships_valid_from_backfilled": int(rel_record["valid_from_backfilled"]) if rel_record else 0,
+        "relationships_observed_at_backfilled": int(rel_record["observed_at_backfilled"]) if rel_record else 0,
+        "relationships_valid_to_backfilled": int(rel_record["valid_to_backfilled"]) if rel_record else 0,
+    }
+
+
+def backfill_temporal_properties_sync() -> dict[str, int]:
+    summary = _backfill_temporal_properties_sync()
+    log.info("Legacy graph temporal backfill summary: %s", summary)
+    return summary
+
+
+async def backfill_temporal_properties() -> dict[str, int]:
+    async with _get_graph_write_lock():
+        return await asyncio.to_thread(_backfill_temporal_properties_sync)
 
 
 def _delete_orphan_entities_sync() -> int:
@@ -801,17 +939,27 @@ def reclassify_relationship(
                         r.strength = $strength,
                         r.mention_count = $mention_count,
                         r.context_snippets = $snippets,
+                        r.valid_from = $first_mentioned,
+                        r.valid_to = null,
+                        r.valid_at = $first_mentioned,
+                        r.valid_until = null,
+                        r.observed_at = $now,
                         r.first_mentioned = $first_mentioned,
                         r.last_mentioned = $now,
                         r.audit_status = 'auto_fixed'
                     ON MATCH SET
                         r.strength = CASE WHEN $strength > r.strength THEN $strength ELSE r.strength END,
-                        r.mention_count = r.mention_count + $mention_count,
+                        r.mention_count = coalesce(r.mention_count, 0) + $mention_count,
                         r.context_snippets = CASE
-                            WHEN size(r.context_snippets) >= 3
-                            THEN r.context_snippets[1..] + $snippets
-                            ELSE r.context_snippets + $snippets
+                            WHEN size(coalesce(r.context_snippets, [])) >= 3
+                            THEN coalesce(r.context_snippets, [])[1..] + $snippets
+                            ELSE coalesce(r.context_snippets, []) + $snippets
                         END,
+                        r.valid_from = coalesce(r.valid_from, r.valid_at, $first_mentioned),
+                        r.valid_to = null,
+                        r.valid_at = coalesce(r.valid_at, r.valid_from, $first_mentioned),
+                        r.valid_until = null,
+                        r.observed_at = coalesce(r.observed_at, $now),
                         r.last_mentioned = $now,
                         r.audit_status = 'auto_fixed'""",
                 head=head, tail=tail, strength=strength,
