@@ -479,6 +479,98 @@ async def metrics_retrieval(_api_key: str = Depends(verify_api_key)) -> dict[str
     }
 
 
+@app.get("/metrics/schema-drift")
+async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Track schema drift: entity types and relationship types over time.
+    Alerts if relationship types grew >5% in 24h."""
+    drift_file = config.GRAPH_MEMORY_DIR / "schema_drift.json"
+    now = datetime.now(tz=timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+
+    # Current counts
+    current_rel_types: dict[str, int] = {}
+    current_entity_types: dict[str, int] = {}
+    if graph is not None:
+        try:
+            current_rel_types = graph.get_relationship_type_distribution()
+            with graph.driver.session() as s:
+                rows = s.run(
+                    "MATCH (e:Entity) RETURN e.entity_type AS t, count(*) AS c"
+                ).data()
+                current_entity_types = {r["t"] or "Unknown": r["c"] for r in rows}
+        except Exception:
+            pass
+
+    num_rel_types = len(current_rel_types)
+    num_entity_types = len(current_entity_types)
+
+    # Load history
+    history: list[dict] = []
+    if drift_file.exists():
+        try:
+            history = json.loads(drift_file.read_text())
+        except Exception:
+            history = []
+
+    # Find yesterday's snapshot
+    yesterday_snap = None
+    for snap in reversed(history):
+        if snap.get("date") != today:
+            yesterday_snap = snap
+            break
+
+    drift_pct_rel = 0.0
+    drift_pct_ent = 0.0
+    alarm = False
+    new_rel_types: list[str] = []
+    new_entity_types: list[str] = []
+
+    if yesterday_snap:
+        prev_rel = yesterday_snap.get("num_rel_types", num_rel_types)
+        prev_ent = yesterday_snap.get("num_entity_types", num_entity_types)
+        if prev_rel > 0:
+            drift_pct_rel = ((num_rel_types - prev_rel) / prev_rel) * 100
+        if prev_ent > 0:
+            drift_pct_ent = ((num_entity_types - prev_ent) / prev_ent) * 100
+        alarm = drift_pct_rel > 5.0 or drift_pct_ent > 10.0
+        prev_rel_set = set(yesterday_snap.get("rel_types", []))
+        prev_ent_set = set(yesterday_snap.get("entity_types", []))
+        new_rel_types = sorted(set(current_rel_types.keys()) - prev_rel_set)
+        new_entity_types = sorted(set(current_entity_types.keys()) - prev_ent_set)
+
+    # Save today's snapshot (upsert)
+    today_snap = {
+        "date": today,
+        "num_rel_types": num_rel_types,
+        "num_entity_types": num_entity_types,
+        "rel_types": sorted(current_rel_types.keys()),
+        "entity_types": sorted(current_entity_types.keys()),
+    }
+    history = [s for s in history if s.get("date") != today]
+    history.append(today_snap)
+    # Keep last 30 days
+    history = history[-30:]
+    try:
+        drift_file.write_text(json.dumps(history, indent=2))
+    except Exception:
+        pass
+
+    return {
+        "date": today,
+        "relationship_types": num_rel_types,
+        "entity_types": num_entity_types,
+        "drift_pct_rel_types": round(drift_pct_rel, 1),
+        "drift_pct_entity_types": round(drift_pct_ent, 1),
+        "alarm": alarm,
+        "alarm_threshold": "rel_types +5% or entity_types +10%",
+        "new_rel_types_today": new_rel_types,
+        "new_entity_types_today": new_entity_types,
+        "rel_type_distribution": {str(k): int(v) for k, v in current_rel_types.items()},
+        "history_days": len(history),
+        "timestamp": now.isoformat(),
+    }
+
+
 @app.get("/stats", response_model=StatsResponse)
 async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     queue_stats = {
