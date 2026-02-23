@@ -305,7 +305,7 @@ class EntityMixin:
             result = session.run(
                 """
                 MATCH (e:Entity)
-                RETURN coalesce(e.id, toLower(e.name)) AS entity_id,
+                RETURN coalesce(e.id, replace(toLower(e.name), ' ', '_')) AS entity_id,
                        e.name AS name,
                        coalesce(e.entity_type, 'Concept') AS entity_type,
                        coalesce(e.summary, e.description, '') AS content,
@@ -323,7 +323,7 @@ class EntityMixin:
                     continue
                 rows.append(
                     {
-                        "entity_id": str(record.get("entity_id") or name.lower()),
+                        "entity_id": str(record.get("entity_id") or name.lower()).replace(" ", "_"),
                         "name": name,
                         "entity_type": str(record.get("entity_type") or "Concept"),
                         "content": str(record.get("content") or ""),
