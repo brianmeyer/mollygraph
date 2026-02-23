@@ -389,13 +389,13 @@ def _build_today_counts(today: str) -> dict[str, dict[str, Any]]:
 def _adopt_rel_type(rel_type: str) -> bool:
     try:
         from memory import extractor
-        from memory import graph
+        from memory.graph import VALID_REL_TYPES
 
         normalized = rel_type.strip().upper().replace(" ", "_")
-        if not normalized or normalized in graph.VALID_REL_TYPES:
+        if not normalized or normalized in VALID_REL_TYPES:
             return False
 
-        graph.VALID_REL_TYPES.add(normalized)
+        VALID_REL_TYPES.add(normalized)
 
         relation_name = normalized.lower().replace("_", " ")
         if relation_name not in extractor.RELATION_SCHEMA:

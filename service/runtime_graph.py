@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 
 import config
-from memory.bitemporal_graph import BiTemporalGraph
+from memory.graph import BiTemporalGraph
 
 _GRAPH_INSTANCE: BiTemporalGraph | None = None
 _GRAPH_LOCK = threading.Lock()

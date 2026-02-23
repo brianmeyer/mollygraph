@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 import config
 from evolution.audit_feedback import record_audit_feedback_batch
-from memory.bitemporal_graph import VALID_REL_TYPES
+from memory.graph import VALID_REL_TYPES
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
 

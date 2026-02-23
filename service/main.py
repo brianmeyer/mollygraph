@@ -45,7 +45,7 @@ from metrics.model_health import model_health_monitor
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
 from maintenance.auditor import run_maintenance_cycle
-from memory.bitemporal_graph import BiTemporalGraph
+from memory.graph import BiTemporalGraph
 from memory import extractor as memory_extractor
 from memory.graph_suggestions import build_suggestion_digest
 from memory.models import ExtractionJob

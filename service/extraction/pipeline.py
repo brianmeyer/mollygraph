@@ -21,7 +21,7 @@ from typing import Any
 
 import config as service_config
 from memory.models import Entity, Episode, ExtractionJob, Relationship
-from memory.bitemporal_graph import BiTemporalGraph
+from memory.graph import BiTemporalGraph
 from memory.vector_store import VectorStore
 from memory import extractor as gliner_extractor
 from memory.graph_suggestions import log_relationship_fallback
