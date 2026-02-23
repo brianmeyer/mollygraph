@@ -17,7 +17,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 import config
-from metrics.stats_logger import get_summary, log_request
+from metrics.stats_logger import (
+    get_recent_retrieval_queries,
+    get_retrieval_summary,
+    get_summary,
+    log_request,
+    log_retrieval,
+)
 from audit.llm_audit import run_llm_audit
 from embedding_registry import (
     add_embedding_model,
@@ -461,6 +467,18 @@ async def metrics_summary(_api_key: str = Depends(verify_api_key)) -> dict[str, 
     return get_summary()
 
 
+@app.get("/metrics/retrieval")
+async def metrics_retrieval(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return detailed retrieval metrics and recent query timing traces."""
+    return {
+        "date": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        "retrieval": get_retrieval_summary(),
+        "recent_queries": get_recent_retrieval_queries(limit=10),
+        "vector_store": vector_store.get_stats() if vector_store else {},
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
 @app.get("/stats", response_model=StatsResponse)
 async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     queue_stats = {
@@ -588,16 +606,32 @@ def _extract_query_entities(query: str) -> list[str]:
 async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryResponse:
     require_runtime_ready()
 
-    entities = _extract_query_entities(q)
-    results: list[dict[str, Any]] = []
+    query_start = time.perf_counter()
+    entity_extraction_ms = 0.0
+    graph_exact_lookup_ms = 0.0
+    graph_fuzzy_lookup_ms = 0.0
+    embedding_ms = 0.0
+    vector_search_ms = 0.0
 
+    _entity_extract_start = time.perf_counter()
+    entities = _extract_query_entities(q)
+    entity_extraction_ms = (time.perf_counter() - _entity_extract_start) * 1000
+
+    results: list[dict[str, Any]] = []
+    retrieval_source = "none"
+
+    _exact_start = time.perf_counter()
     for entity_name in entities[:5]:
         facts = graph.get_current_facts(entity_name)
         if facts:
             results.append({"entity": entity_name, "facts": facts[:10]})
+    graph_exact_lookup_ms = (time.perf_counter() - _exact_start) * 1000
+    if results:
+        retrieval_source = "graph_exact"
 
     # Fuzzy Neo4j CONTAINS fallback: if exact-name lookup missed, try substring match
     if not results:
+        _fuzzy_start = time.perf_counter()
         try:
             with graph.driver.session() as _session:
                 for entity_name in entities[:5]:
@@ -621,17 +655,48 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
                         break
         except Exception:
             log.debug("Fuzzy CONTAINS fallback failed", exc_info=True)
+        graph_fuzzy_lookup_ms = (time.perf_counter() - _fuzzy_start) * 1000
+        if results:
+            retrieval_source = "graph_fuzzy"
 
     # Fallback: query vector index using deterministic embedding.
     if not results and vector_store is not None:
-        embedding = ExtractionPipeline._text_embedding(q)
-        for item in vector_store.similarity_search(embedding, top_k=5):
+        _embedding_start = time.perf_counter()
+        try:
+            embedding = ExtractionPipeline._text_embedding(q)
+        finally:
+            embedding_ms = (time.perf_counter() - _embedding_start) * 1000
+
+        _vector_start = time.perf_counter()
+        vector_hits = vector_store.similarity_search(embedding, top_k=5)
+        vector_search_ms = (time.perf_counter() - _vector_start) * 1000
+
+        for item in vector_hits:
             name = str(item.get("name") or "").strip()
             if not name:
                 continue
             facts = graph.get_current_facts(name)
             if facts:
                 results.append({"entity": name, "facts": facts[:5], "score": item.get("score", 0.0)})
+        if results:
+            retrieval_source = "vector"
+
+    total_latency_ms = (time.perf_counter() - query_start) * 1000
+    try:
+        log_retrieval(
+            query=q,
+            retrieval_source=retrieval_source,
+            result_count=len(results),
+            latency_ms=total_latency_ms,
+            vector_search_ms=vector_search_ms,
+            embedding_ms=embedding_ms,
+            entity_extraction_ms=entity_extraction_ms,
+            graph_exact_lookup_ms=graph_exact_lookup_ms,
+            graph_fuzzy_lookup_ms=graph_fuzzy_lookup_ms,
+            entities_queried=entities,
+        )
+    except Exception:
+        log.debug("metrics log_retrieval failed", exc_info=True)
 
     return QueryResponse(
         query=q,

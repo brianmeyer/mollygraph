@@ -134,6 +134,8 @@ class ExtractionPipeline:
 
     async def process_job(self, job: ExtractionJob) -> ExtractionJob:
         _t_start = time.perf_counter()
+        embedding_time_ms = 0.0
+        vector_store_time_ms = 0.0
         try:
             job.status = "processing"
             job.started_at = datetime.utcnow()
@@ -160,16 +162,24 @@ class ExtractionPipeline:
                 stored_entities.append(entity)
 
                 # Keep vector index in sync with graph entities.
-                embedding = self._text_embedding(f"{entity.name} {entity.entity_type} {job.content[:200]}")
+                _embed_start = time.perf_counter()
                 try:
-                    self.vector_store.add_entity(
-                        entity_id=entity_id,
-                        name=entity.name,
-                        entity_type=entity.entity_type,
-                        dense_embedding=embedding,
-                        content=job.content[:500],
-                        confidence=entity.confidence,
-                    )
+                    embedding = self._text_embedding(f"{entity.name} {entity.entity_type} {job.content[:200]}")
+                finally:
+                    embedding_time_ms += (time.perf_counter() - _embed_start) * 1000
+                try:
+                    _store_start = time.perf_counter()
+                    try:
+                        self.vector_store.add_entity(
+                            entity_id=entity_id,
+                            name=entity.name,
+                            entity_type=entity.entity_type,
+                            dense_embedding=embedding,
+                            content=job.content[:500],
+                            confidence=entity.confidence,
+                        )
+                    finally:
+                        vector_store_time_ms += (time.perf_counter() - _store_start) * 1000
                 except Exception:
                     log.debug("Vector index upsert failed for %s", entity.name, exc_info=True)
 
@@ -193,15 +203,23 @@ class ExtractionPipeline:
             # Embed episode into vector store for semantic search
             try:
                 import re as _re
-                ep_embedding = self._text_embedding(job.content[:512])
+                _episode_embed_start = time.perf_counter()
+                try:
+                    ep_embedding = self._text_embedding(job.content[:512])
+                finally:
+                    embedding_time_ms += (time.perf_counter() - _episode_embed_start) * 1000
                 ep_slug = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"ep_{episode.id}")
-                self.vector_store.add_entity(
-                    entity_id=ep_slug,
-                    name=f"Episode {episode.id[:8]}",
-                    entity_type="Episode",
-                    dense_embedding=ep_embedding,
-                    content=episode.content_preview,
-                )
+                _episode_store_start = time.perf_counter()
+                try:
+                    self.vector_store.add_entity(
+                        entity_id=ep_slug,
+                        name=f"Episode {episode.id[:8]}",
+                        entity_type="Episode",
+                        dense_embedding=ep_embedding,
+                        content=episode.content_preview,
+                    )
+                finally:
+                    vector_store_time_ms += (time.perf_counter() - _episode_store_start) * 1000
             except Exception:
                 log.debug("Vector index upsert failed for episode %s", episode.id, exc_info=True)
 
@@ -252,6 +270,8 @@ class ExtractionPipeline:
                         confidence_min=conf_min,
                         confidence_max=conf_max,
                         confidence_avg=conf_avg,
+                        embedding_time_ms=embedding_time_ms,
+                        vector_store_time_ms=vector_store_time_ms,
                     )
                 except Exception:
                     log.debug("metrics log_extraction failed", exc_info=True)

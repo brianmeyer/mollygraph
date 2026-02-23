@@ -4,6 +4,8 @@ Supports: sqlite-vec, Zvec
 """
 import os
 import math
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import List, Dict, Optional
 from pathlib import Path
@@ -350,7 +352,12 @@ class VectorStore:
             self.backend = SqliteVecBackend(**kwargs)
         else:
             raise ValueError(f"Unknown backend: {backend}")
-        
+
+        self._search_lock = threading.Lock()
+        self._similarity_search_durations_ms: list[float] = []
+        self._similarity_search_count = 0
+        self._similarity_search_error_count = 0
+
         log.info(f"VectorStore using {self.backend.__class__.__name__}")
     
     def add_entity(self, entity_id: str, name: str, entity_type: str,
@@ -360,7 +367,35 @@ class VectorStore:
     
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
-        return self.backend.similarity_search(query_embedding, top_k, entity_type)
+        start = time.perf_counter()
+        result_count = 0
+        failed = False
+        try:
+            results = self.backend.similarity_search(query_embedding, top_k, entity_type)
+            result_count = len(results)
+            return results
+        except Exception:
+            failed = True
+            raise
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            with self._search_lock:
+                self._similarity_search_count += 1
+                if failed:
+                    self._similarity_search_error_count += 1
+                self._similarity_search_durations_ms.append(duration_ms)
+                if len(self._similarity_search_durations_ms) > 10_000:
+                    del self._similarity_search_durations_ms[:5_000]
+
+            log.info(
+                "vector_similarity_search backend=%s top_k=%s entity_type=%s duration_ms=%.2f results=%s failed=%s",
+                self.backend.__class__.__name__,
+                top_k,
+                entity_type or "",
+                duration_ms,
+                result_count,
+                failed,
+            )
     
     def keyword_search(self, query: str, top_k: int = 10) -> List[Dict]:
         return self.backend.keyword_search(query, top_k)
@@ -370,4 +405,27 @@ class VectorStore:
         return self.backend.hybrid_search(query_embedding, query_text, top_k, dense_weight)
     
     def get_stats(self) -> Dict:
-        return self.backend.get_stats()
+        backend_stats = self.backend.get_stats()
+        with self._search_lock:
+            timings = list(self._similarity_search_durations_ms)
+            search_count = self._similarity_search_count
+            error_count = self._similarity_search_error_count
+
+        avg_latency = sum(timings) / len(timings) if timings else 0.0
+        return {
+            **backend_stats,
+            "similarity_search_count": search_count,
+            "similarity_search_error_count": error_count,
+            "similarity_search_avg_ms": round(avg_latency, 2),
+            "similarity_search_p95_ms": round(self._percentile(timings, 95), 2),
+            "similarity_search_last_ms": round(timings[-1], 2) if timings else 0.0,
+        }
+
+    @staticmethod
+    def _percentile(values: List[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        sorted_vals = sorted(values)
+        idx = int(len(sorted_vals) * pct / 100)
+        idx = min(idx, len(sorted_vals) - 1)
+        return sorted_vals[idx]
