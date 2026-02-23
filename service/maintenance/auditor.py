@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from audit.llm_audit import run_llm_audit
-from evolution.gliner_training import run_gliner_finetune_pipeline
+from evolution.gliner_training import (
+    cleanup_stale_gliner_training_examples,
+    run_gliner_finetune_pipeline,
+)
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
 
@@ -58,6 +61,22 @@ async def run_maintenance_cycle() -> dict[str, Any]:
         log.warning("Suggestion digest build failed", exc_info=True)
         suggestion_digest = ""
 
+    # Stale example cleanup runs BEFORE accumulation so that quarantined
+    # relations from the LLM audit above are removed before new examples
+    # are built on top of them.
+    stale_cleanup_result: dict
+    try:
+        stale_cleanup_result = await cleanup_stale_gliner_training_examples()
+        log.info(
+            "Stale training example cleanup: files_modified=%d examples_removed=%d relations_stripped=%d",
+            stale_cleanup_result.get("files_modified", 0),
+            stale_cleanup_result.get("examples_removed", 0),
+            stale_cleanup_result.get("relations_stripped", 0),
+        )
+    except Exception as exc:
+        log.warning("Stale training example cleanup failed", exc_info=True)
+        stale_cleanup_result = {"status": "error", "error": str(exc)}
+
     try:
         gliner_result = await run_gliner_finetune_pipeline(force=False)
     except Exception as exc:
@@ -74,5 +93,6 @@ async def run_maintenance_cycle() -> dict[str, Any]:
             "digest": suggestion_digest,
             "auto_adoption": adoption_summary,
         },
+        "stale_training_cleanup": stale_cleanup_result,
         "gliner": gliner_result,
     }

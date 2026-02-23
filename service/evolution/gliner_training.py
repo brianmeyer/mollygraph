@@ -600,12 +600,19 @@ class GLiNERTrainingService:
         opus_analysis_text = self.latest_maintenance_analysis_text()
         cursor = str(self.state.get("gliner_training_cursor", "")).strip()
 
+        # Only accumulate episodes older than 24 hours, giving the nightly audit
+        # time to review and quarantine bad data before it enters training.
+        cutoff_time = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        log.info(
+            "GLiNER accumulation: 24-hour audit delay active, cutoff=%s", cutoff_time
+        )
+
         where_cursor = (
             "AND datetime(coalesce(ep.created_at, toString(ep.ingested_at), toString(ep.occurred_at))) > datetime($cursor)"
             if cursor
             else ""
         )
-        params: dict[str, Any] = {"limit": int(limit)}
+        params: dict[str, Any] = {"limit": int(limit), "cutoff_time": cutoff_time}
         if cursor:
             params["cursor"] = cursor
 
@@ -620,6 +627,7 @@ class GLiNERTrainingService:
                       AND trim(ep.content_preview) <> ''
                       AND ep.entities_extracted IS NOT NULL
                       AND size(ep.entities_extracted) > 0
+                      AND datetime(coalesce(ep.created_at, toString(ep.ingested_at), toString(ep.occurred_at))) < datetime($cutoff_time)
                       {where_cursor}
                     RETURN ep.id AS episode_id,
                            coalesce(ep.created_at, toString(ep.ingested_at), toString(ep.occurred_at)) AS created_at,
@@ -713,6 +721,218 @@ class GLiNERTrainingService:
                 log.debug("Failed scanning training file %s", path, exc_info=True)
         return seen
 
+    def cleanup_stale_training_examples(self) -> dict[str, Any]:
+        """Remove or strip training examples that contain quarantined relations.
+
+        For each .jsonl file in the training directory:
+        - Loads every example and checks its ``extracted_relations`` against
+          Neo4j for any that now have ``audit_status IN ['quarantined', 'deleted']``.
+        - Relations that have been quarantined are stripped from the example.
+        - Examples that have *no* positive relations remaining (after stripping)
+          are dropped entirely.
+        - The file is atomically rewritten only when changes were made.
+
+        Returns a summary dict with counts of files touched, examples removed,
+        and relations stripped.
+        """
+        training_dir = self.gliner_training_dir()
+        if not training_dir.exists():
+            log.info("cleanup_stale_training_examples: training dir does not exist, nothing to do")
+            return {
+                "files_scanned": 0,
+                "files_modified": 0,
+                "examples_removed": 0,
+                "relations_stripped": 0,
+            }
+
+        try:
+            from runtime_graph import require_graph_instance
+            driver = require_graph_instance().driver
+        except Exception as exc:
+            log.warning(
+                "cleanup_stale_training_examples: cannot connect to graph, skipping: %s", exc
+            )
+            return {
+                "files_scanned": 0,
+                "files_modified": 0,
+                "examples_removed": 0,
+                "relations_stripped": 0,
+                "skipped": True,
+                "reason": str(exc),
+            }
+
+        files_scanned = 0
+        files_modified = 0
+        total_examples_removed = 0
+        total_relations_stripped = 0
+
+        jsonl_files = sorted(training_dir.glob("*.jsonl"))
+        log.info(
+            "cleanup_stale_training_examples: scanning %d .jsonl files in %s",
+            len(jsonl_files),
+            training_dir,
+        )
+
+        for path in jsonl_files:
+            files_scanned += 1
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    raw_lines = f.readlines()
+            except Exception:
+                log.warning("cleanup_stale_training_examples: failed to read %s", path, exc_info=True)
+                continue
+
+            examples: list[dict[str, Any]] = []
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    examples.append(payload)
+
+            if not examples:
+                continue
+
+            # Collect all (head, tail, label) relation keys present in this file
+            # so we can check Neo4j in a single batched query.
+            relation_keys: list[tuple[str, str, str]] = []
+            for ex in examples:
+                for rel in (ex.get("extracted_relations") or []):
+                    if not isinstance(rel, dict):
+                        continue
+                    head = str(rel.get("head") or "").strip()
+                    tail = str(rel.get("tail") or "").strip()
+                    label = str(rel.get("label") or "").strip()
+                    if head and tail and label:
+                        relation_keys.append((head, label, tail))
+
+            if not relation_keys:
+                continue
+
+            # Query Neo4j for any of these relations that are now quarantined/deleted.
+            quarantined_keys: set[tuple[str, str, str]] = set()
+            try:
+                with driver.session() as session:
+                    # Build params as head_names + tail_names to limit the MATCH scope,
+                    # then filter by relation type and audit_status in Python.
+                    heads = list({h for h, _, _ in relation_keys})
+                    tails = list({t for _, _, t in relation_keys})
+                    records = session.run(
+                        """
+                        MATCH (h:Entity)-[r]->(t:Entity)
+                        WHERE h.name IN $heads
+                          AND t.name IN $tails
+                          AND r.audit_status IN ['quarantined', 'deleted']
+                        RETURN h.name AS head, t.name AS tail, type(r) AS label
+                        """,
+                        heads=heads,
+                        tails=tails,
+                    )
+                    for record in records:
+                        h = str(record.get("head") or "").strip()
+                        t = str(record.get("tail") or "").strip()
+                        lb = str(record.get("label") or "").strip()
+                        if h and t and lb:
+                            quarantined_keys.add((h, lb, t))
+            except Exception:
+                log.warning(
+                    "cleanup_stale_training_examples: Neo4j query failed for %s, skipping file",
+                    path,
+                    exc_info=True,
+                )
+                continue
+
+            if not quarantined_keys:
+                continue
+
+            # Now filter each example.
+            file_examples_removed = 0
+            file_relations_stripped = 0
+            cleaned_examples: list[dict[str, Any]] = []
+
+            for ex in examples:
+                original_rels = ex.get("extracted_relations") or []
+                kept_rels: list[dict[str, Any]] = []
+                stripped = 0
+
+                for rel in original_rels:
+                    if not isinstance(rel, dict):
+                        kept_rels.append(rel)
+                        continue
+                    head = str(rel.get("head") or "").strip()
+                    tail = str(rel.get("tail") or "").strip()
+                    label = str(rel.get("label") or "").strip()
+                    if (head, label, tail) in quarantined_keys:
+                        stripped += 1
+                        log.debug(
+                            "cleanup_stale_training_examples: stripping quarantined relation "
+                            "(%s)-[%s]->(%s) from episode %s",
+                            head, label, tail, ex.get("episode_id"),
+                        )
+                    else:
+                        kept_rels.append(rel)
+
+                if stripped > 0:
+                    file_relations_stripped += stripped
+                    if kept_rels:
+                        # Keep the example but with stale relations removed.
+                        ex = {**ex, "extracted_relations": kept_rels}
+                        cleaned_examples.append(ex)
+                    else:
+                        # No positive relations remain; drop the whole example.
+                        file_examples_removed += 1
+                        log.info(
+                            "cleanup_stale_training_examples: dropping example episode_id=%s "
+                            "(all %d relations quarantined)",
+                            ex.get("episode_id"), stripped,
+                        )
+                else:
+                    cleaned_examples.append(ex)
+
+            if file_examples_removed == 0 and file_relations_stripped == 0:
+                continue
+
+            # Atomically rewrite the file.
+            total_examples_removed += file_examples_removed
+            total_relations_stripped += file_relations_stripped
+            files_modified += 1
+
+            tmp_path = path.with_suffix(".tmp")
+            try:
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    for ex in cleaned_examples:
+                        f.write(json.dumps(ex, ensure_ascii=True) + "\n")
+                tmp_path.replace(path)
+                log.info(
+                    "cleanup_stale_training_examples: rewrote %s "
+                    "(removed %d examples, stripped %d relations)",
+                    path.name, file_examples_removed, file_relations_stripped,
+                )
+            except Exception:
+                log.warning(
+                    "cleanup_stale_training_examples: failed to rewrite %s", path, exc_info=True
+                )
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        log.info(
+            "cleanup_stale_training_examples: done — files_scanned=%d files_modified=%d "
+            "examples_removed=%d relations_stripped=%d",
+            files_scanned, files_modified, total_examples_removed, total_relations_stripped,
+        )
+        return {
+            "files_scanned": files_scanned,
+            "files_modified": files_modified,
+            "examples_removed": total_examples_removed,
+            "relations_stripped": total_relations_stripped,
+        }
+
     def latest_maintenance_analysis_text(self) -> str:
         maintenance_dir = config.MAINTENANCE_DIR
         if not maintenance_dir.exists():
@@ -778,7 +998,10 @@ class GLiNERTrainingService:
 
         for entity in entity_rows:
             name = str(entity.get("name") or "").strip()
-            label = str(entity.get("entity_type") or "Concept").strip() or "Concept"
+            # Always normalize the entity type against the allowed set before
+            # adding it to any training example.  This prevents wrong labels
+            # (e.g. "Databricks" classified as "Person") from poisoning training.
+            label = self._normalize_entity_type(entity.get("entity_type"))
             mention_count = int(entity.get("mention_count") or 0)
             has_relationship = bool(entity.get("has_relationship"))
             normalized_name = self.normalize_entity_text(name)
@@ -2468,6 +2691,12 @@ def get_gliner_stats() -> dict[str, Any]:
     return service.status()
 
 
+async def cleanup_stale_gliner_training_examples() -> dict[str, Any]:
+    """Run stale training example cleanup as a coroutine (thread-dispatched)."""
+    service = _get_service()
+    return await asyncio.to_thread(service.cleanup_stale_training_examples)
+
+
 __all__ = [
     "GLINER_BASE_MODEL",
     "GLINER_BENCHMARK_EVAL_RATIO",
@@ -2476,6 +2705,7 @@ __all__ = [
     "GLINER_FINETUNE_COOLDOWN_DAYS",
     "GLINER_TRAINING_SCAN_LIMIT",
     "GLiNERTrainingService",
+    "cleanup_stale_gliner_training_examples",
     "get_gliner_stats",
     "run_gliner_accumulation",
     "run_gliner_finetune_pipeline",

@@ -46,7 +46,12 @@ from extractor_schema_registry import (
     set_active_extractor_schema,
     upload_custom_extractor_schema,
 )
-from evolution.gliner_training import get_gliner_stats, run_gliner_finetune_pipeline, GLiNERTrainingService
+from evolution.gliner_training import (
+    cleanup_stale_gliner_training_examples,
+    get_gliner_stats,
+    run_gliner_finetune_pipeline,
+    GLiNERTrainingService,
+)
 from metrics.model_health import model_health_monitor
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
@@ -1023,6 +1028,32 @@ async def backfill_temporal_properties(
     }
 
 
+@app.post("/maintenance/cleanup-training-data")
+async def cleanup_training_data(
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Remove stale GLiNER training examples that contain quarantined relations.
+
+    Reads all .jsonl files in the training directory and checks each positive
+    relation against Neo4j.  Relations that have since been quarantined or
+    deleted are stripped; examples that have no positive relations remaining
+    are dropped entirely.  Files are atomically rewritten.
+
+    This is also run automatically at the start of the nightly maintenance
+    pipeline (before new examples are accumulated).
+    """
+    try:
+        result = await cleanup_stale_gliner_training_examples()
+        return {
+            "status": "ok",
+            "result": result,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as exc:
+        log.error("cleanup_training_data endpoint failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"cleanup_error: {exc}") from exc
+
+
 @app.get("/metrics/model-health")
 async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     """Return the current model health monitor status (rollback guard)."""
@@ -1085,7 +1116,19 @@ async def trigger_nightly_maintenance(
             log.warning("Model health check step failed", exc_info=True)
 
         try:
-            # Step 3: Auto-trigger LoRA if conditions met
+            # Step 3: Cleanup stale training examples BEFORE new accumulation
+            cleanup_result = await cleanup_stale_gliner_training_examples()
+            log.info(
+                "Nightly stale training cleanup: files_modified=%d examples_removed=%d relations_stripped=%d",
+                cleanup_result.get("files_modified", 0),
+                cleanup_result.get("examples_removed", 0),
+                cleanup_result.get("relations_stripped", 0),
+            )
+        except Exception:
+            log.warning("Nightly stale training cleanup step failed", exc_info=True)
+
+        try:
+            # Step 4: Auto-trigger LoRA if conditions met (accumulates new data first)
             pipeline_result = await run_gliner_finetune_pipeline(force=False)
             log.info("Nightly LoRA pipeline: status=%s", pipeline_result.get("status"))
         except Exception:
@@ -1097,7 +1140,7 @@ async def trigger_nightly_maintenance(
     return {
         "status": "nightly_maintenance_triggered",
         "timestamp": datetime.utcnow().isoformat(),
-        "sequence": ["llm_audit", "model_health_check", "lora_pipeline"],
+        "sequence": ["llm_audit", "model_health_check", "stale_training_cleanup", "lora_pipeline"],
     }
 
 
