@@ -189,8 +189,8 @@ Full REST API for custom integrations:
 - [x] Local embedding support (sentence-transformers, Ollama)
 - [x] Relationship suggestion system
 - [x] Hot-reload model deployment
-- [x] Bi-temporal graph (valid_time vs observed_time tracking)
 - [x] Strength decay — stale knowledge fades, active knowledge stays prominent
+- [ ] Bi-temporal graph (valid_time vs observed_time — module built, not yet wired into ingestion)
 - [ ] Multi-agent memory isolation
 - [ ] Web UI for graph exploration
 - [ ] Plugin system for custom extractors
