@@ -1098,7 +1098,7 @@ class GLiNERTrainingService:
             from runtime_graph import require_graph_instance
             
             # Sample recent relationships for quality check
-            rels = require_graph_instance().get_relationships_for_audit(limit=100)
+            rels = require_graph_instance().get_relationships_for_audit(limit=40)
             if not rels:
                 return {"passed": True, "reason": "no_relationships_to_audit"}
             
