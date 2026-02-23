@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request, status
@@ -870,7 +870,7 @@ async def backfill_temporal_properties(
 async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     """Return the current model health monitor status (rollback guard)."""
     try:
-        return model_health_monitor.status()
+        return model_health_monitor.check_health()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"model_health_error: {exc}") from exc
 
@@ -918,7 +918,7 @@ async def trigger_nightly_maintenance(
 
         try:
             # Step 2: Model health check
-            health = model_health_monitor.status()
+            health = model_health_monitor.check_health()
             rollback_triggered = health.get("rollback_triggered", False)
             if rollback_triggered:
                 log.warning("Model health monitor triggered rollback: %s", health.get("reason"))
@@ -941,6 +941,116 @@ async def trigger_nightly_maintenance(
         "status": "nightly_maintenance_triggered",
         "timestamp": datetime.utcnow().isoformat(),
         "sequence": ["llm_audit", "model_health_check", "lora_pipeline"],
+    }
+
+
+def _cooldown_remaining_hours(state: dict) -> int:
+    """Compute hours remaining in the strategy-aware training cooldown."""
+    last_iso = str(state.get("gliner_last_finetune_at", "")).strip()
+    if not last_iso:
+        return 0
+    try:
+        last_dt = datetime.fromisoformat(last_iso)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return 0
+    strategy = state.get("gliner_last_strategy", "lora")
+    cooldown_days = config.GLINER_LORA_COOLDOWN_DAYS if strategy == "lora" else config.GLINER_FINETUNE_COOLDOWN_DAYS
+    remaining = timedelta(days=cooldown_days) - (datetime.now(timezone.utc) - last_dt)
+    return max(0, int(remaining.total_seconds() // 3600))
+
+
+@app.get("/metrics/evolution")
+async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Comprehensive self-evolution metrics — the full story of how the graph improves itself."""
+    require_runtime_ready()
+
+    svc = GLiNERTrainingService()
+    state = svc.state
+
+    # Training history
+    runs = await asyncio.to_thread(svc.list_training_runs, 50)
+    successful_runs = [r for r in runs if r.get("combined_improvement") is not None]
+
+    # Graph health
+    entity_count = await asyncio.to_thread(graph.entity_count)
+    relationship_count = await asyncio.to_thread(graph.relationship_count)
+    episode_count = await asyncio.to_thread(graph.episode_count)
+
+    # Audit feedback stats
+    try:
+        from evolution.audit_feedback import load_audit_feedback_entries
+        feedback = await asyncio.to_thread(load_audit_feedback_entries, 10000)
+        approved = sum(1 for f in feedback if f.get("action") == "approve")
+        rejected = sum(1 for f in feedback if f.get("action") == "reject")
+        reclassified = sum(1 for f in feedback if f.get("action") == "reclassify")
+    except Exception:
+        approved = rejected = reclassified = 0
+
+    # Model health
+    try:
+        model_health = model_health_monitor.check_health()
+    except Exception:
+        model_health = {"status": "unavailable"}
+
+    # Relationship type distribution for quality signal
+    try:
+        dist = await asyncio.to_thread(graph.get_relationship_type_distribution)
+        related_to_count = dist.get("RELATED_TO", 0)
+        total_rels = sum(dist.values())
+        fallback_rate = related_to_count / total_rels if total_rels > 0 else 0.0
+    except Exception:
+        related_to_count = 0
+        total_rels = relationship_count
+        fallback_rate = 0.0
+
+    return {
+        "graph": {
+            "entities": entity_count,
+            "relationships": relationship_count,
+            "episodes": episode_count,
+            "relationship_types": len(dist) if 'dist' in dir() else 0,
+            "related_to_fallback_rate": round(fallback_rate, 4),
+        },
+        "training": {
+            "total_examples": state.get("gliner_training_examples", 0),
+            "total_runs": len(runs),
+            "successful_runs": len(successful_runs),
+            "last_strategy": state.get("gliner_last_strategy", "unknown"),
+            "last_status": state.get("gliner_last_cycle_status", "unknown"),
+            "last_result": state.get("gliner_last_result", ""),
+            "active_model": state.get("gliner_active_model_ref", "base"),
+            "base_model": config.GLINER_BASE_MODEL,
+            "cooldown": {
+                "lora_days": config.GLINER_LORA_COOLDOWN_DAYS,
+                "full_finetune_days": config.GLINER_FINETUNE_COOLDOWN_DAYS,
+                "remaining_hours": _cooldown_remaining_hours(state),
+            },
+            "improvements": [
+                {
+                    "run_id": r.get("run_id"),
+                    "strategy": r.get("mode"),
+                    "entity_f1_delta": r.get("entity_improvement"),
+                    "relation_f1_delta": r.get("relation_improvement"),
+                    "combined_delta": r.get("combined_improvement"),
+                }
+                for r in successful_runs[:10]
+            ],
+        },
+        "audit": {
+            "feedback_total": approved + rejected + reclassified,
+            "approved": approved,
+            "rejected": rejected,
+            "reclassified": reclassified,
+            "approval_rate": round(approved / (approved + rejected + reclassified), 4) if (approved + rejected + reclassified) > 0 else 0.0,
+        },
+        "model_health": model_health,
+        "embedding": {
+            "provider": getattr(config, "EMBEDDING_PROVIDER", "unknown"),
+            "vectors": vector_store.count() if hasattr(vector_store, "count") else "unknown",
+        },
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 

@@ -26,6 +26,7 @@ GLINER_BENCHMARK_SEED = config.GLINER_BENCHMARK_SEED
 GLINER_BENCHMARK_EVAL_RATIO = config.GLINER_BENCHMARK_EVAL_RATIO
 GLINER_BENCHMARK_THRESHOLD = config.GLINER_BENCHMARK_THRESHOLD
 GLINER_FINETUNE_COOLDOWN_DAYS = config.GLINER_FINETUNE_COOLDOWN_DAYS
+GLINER_LORA_COOLDOWN_DAYS = config.GLINER_LORA_COOLDOWN_DAYS
 GLINER_TRAINING_SCAN_LIMIT = config.GLINER_TRAINING_SCAN_LIMIT
 
 _ALLOWED_ENTITY_TYPES = {
@@ -133,13 +134,17 @@ class GLiNERTrainingService:
         last_run_iso = str(self.state.get("gliner_last_finetune_at", "")).strip()
         last_run = _parse_datetime(last_run_iso)
 
-        if not force and last_run and (now_utc - last_run) < timedelta(days=GLINER_FINETUNE_COOLDOWN_DAYS):
+        # Strategy-aware cooldown: LoRA = 2 days, full fine-tune = 7 days
+        last_strategy = self.state.get("gliner_last_strategy", "lora")
+        cooldown_days = GLINER_LORA_COOLDOWN_DAYS if last_strategy == "lora" else GLINER_FINETUNE_COOLDOWN_DAYS
+
+        if not force and last_run and (now_utc - last_run) < timedelta(days=cooldown_days):
             elapsed = now_utc - last_run
-            remaining = timedelta(days=GLINER_FINETUNE_COOLDOWN_DAYS) - elapsed
+            remaining = timedelta(days=cooldown_days) - elapsed
             hours_remaining = max(0, int(remaining.total_seconds() // 3600))
             cooldown_line = (
-                f"GLiNER fine-tune skipped: last run {last_run.date().isoformat()} "
-                f"({hours_remaining}h cooldown remaining)."
+                f"GLiNER fine-tune skipped: last {last_strategy} run {last_run.date().isoformat()} "
+                f"({hours_remaining}h cooldown, {cooldown_days}d for {last_strategy})."
             )
             self.state["gliner_last_result"] = cooldown_line
             self.state["gliner_last_cycle_status"] = "cooldown_active"
