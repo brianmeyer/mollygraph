@@ -135,7 +135,13 @@ class GLiNERTrainingService:
         last_run = _parse_datetime(last_run_iso)
 
         # Strategy-aware cooldown: LoRA = 2 days, full fine-tune = 7 days
-        last_strategy = self.state.get("gliner_last_strategy", "lora")
+        last_strategy = str(
+            self.state.get("gliner_last_training_strategy")
+            or self.state.get("gliner_last_strategy")
+            or "lora"
+        ).strip().lower()
+        if last_strategy not in {"lora", "full"}:
+            last_strategy = "lora"
         cooldown_days = GLINER_LORA_COOLDOWN_DAYS if last_strategy == "lora" else GLINER_FINETUNE_COOLDOWN_DAYS
 
         if not force and last_run and (now_utc - last_run) < timedelta(days=cooldown_days):
@@ -2071,14 +2077,64 @@ class GLiNERTrainingService:
         for path in paths:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("run payload is not an object")
+
+                deploy_decision = payload.get("deploy_decision")
+                deploy_decision = deploy_decision if isinstance(deploy_decision, dict) else {}
+
+                benchmark = payload.get("benchmark")
+                benchmark = benchmark if isinstance(benchmark, dict) else {}
+                entity_f1 = benchmark.get("entity_f1")
+                entity_f1 = entity_f1 if isinstance(entity_f1, dict) else {}
+                relation_f1 = benchmark.get("relation_f1")
+                relation_f1 = relation_f1 if isinstance(relation_f1, dict) else {}
+
+                mode = payload.get("mode")
+                if mode in (None, ""):
+                    strategy = payload.get("strategy")
+                    if isinstance(strategy, dict):
+                        mode = strategy.get("mode")
+                if mode in (None, ""):
+                    mode = payload.get("run_type")
+
+                status = payload.get("status")
+                if status in (None, ""):
+                    status = payload.get("decision")
+                if status in (None, ""):
+                    status = payload.get("verdict")
+
+                started_at = payload.get("started_at")
+                if started_at in (None, ""):
+                    started_at = payload.get("timestamp")
+
+                entity_improvement = deploy_decision.get("entity_improvement")
+                if entity_improvement in (None, ""):
+                    entity_improvement = benchmark.get("entity_improvement")
+                if entity_improvement in (None, ""):
+                    entity_improvement = entity_f1.get("improvement")
+
+                relation_improvement = deploy_decision.get("relation_improvement")
+                if relation_improvement in (None, ""):
+                    relation_improvement = benchmark.get("relation_improvement")
+                if relation_improvement in (None, ""):
+                    relation_improvement = relation_f1.get("improvement")
+
+                combined_improvement = deploy_decision.get("combined_improvement")
+                if combined_improvement in (None, ""):
+                    combined_improvement = benchmark.get("combined_improvement")
+                if combined_improvement in (None, "") and entity_improvement not in (None, "") and relation_improvement in (None, ""):
+                    # Legacy runs sometimes only tracked a single improvement score.
+                    combined_improvement = entity_improvement
+
                 results.append({
                     "run_id": payload.get("run_id", path.stem),
-                    "mode": payload.get("mode"),
-                    "status": payload.get("status"),
-                    "started_at": payload.get("started_at"),
-                    "combined_improvement": payload.get("deploy_decision", {}).get("combined_improvement"),
-                    "entity_improvement": payload.get("deploy_decision", {}).get("entity_improvement"),
-                    "relation_improvement": payload.get("deploy_decision", {}).get("relation_improvement"),
+                    "mode": mode,
+                    "status": status,
+                    "started_at": started_at,
+                    "combined_improvement": combined_improvement,
+                    "entity_improvement": entity_improvement,
+                    "relation_improvement": relation_improvement,
                     "path": str(path),
                 })
             except Exception:

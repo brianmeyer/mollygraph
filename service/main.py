@@ -955,7 +955,13 @@ def _cooldown_remaining_hours(state: dict) -> int:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return 0
-    strategy = state.get("gliner_last_strategy", "lora")
+    strategy = str(
+        state.get("gliner_last_training_strategy")
+        or state.get("gliner_last_strategy")
+        or "lora"
+    ).strip().lower()
+    if strategy not in {"lora", "full"}:
+        strategy = "lora"
     cooldown_days = config.GLINER_LORA_COOLDOWN_DAYS if strategy == "lora" else config.GLINER_FINETUNE_COOLDOWN_DAYS
     remaining = timedelta(days=cooldown_days) - (datetime.now(timezone.utc) - last_dt)
     return max(0, int(remaining.total_seconds() // 3600))
@@ -972,6 +978,20 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
     # Training history
     runs = await asyncio.to_thread(svc.list_training_runs, 50)
     successful_runs = [r for r in runs if r.get("combined_improvement") is not None]
+    embedding_cfg = get_embedding_registry()
+
+    vector_count: int | str = "unknown"
+    if vector_store is not None:
+        try:
+            vector_stats = vector_store.get_stats()
+        except Exception:
+            vector_stats = {}
+        if isinstance(vector_stats, dict):
+            for key in ("entities", "dense_vectors", "vectors", "count"):
+                value = vector_stats.get(key)
+                if isinstance(value, (int, float)):
+                    vector_count = int(value)
+                    break
 
     # Graph health
     entity_count = await asyncio.to_thread(graph.entity_count)
@@ -1017,7 +1037,10 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
             "total_examples": state.get("gliner_training_examples", 0),
             "total_runs": len(runs),
             "successful_runs": len(successful_runs),
-            "last_strategy": state.get("gliner_last_strategy", "unknown"),
+            "last_strategy": state.get(
+                "gliner_last_training_strategy",
+                state.get("gliner_last_strategy", "unknown"),
+            ),
             "last_status": state.get("gliner_last_cycle_status", "unknown"),
             "last_result": state.get("gliner_last_result", ""),
             "active_model": state.get("gliner_active_model_ref", "base"),
@@ -1047,8 +1070,8 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
         },
         "model_health": model_health,
         "embedding": {
-            "provider": getattr(config, "EMBEDDING_PROVIDER", "unknown"),
-            "vectors": vector_store.count() if hasattr(vector_store, "count") else "unknown",
+            "provider": str(embedding_cfg.get("active_provider") or getattr(config, "EMBEDDING_BACKEND", "unknown")),
+            "vectors": vector_count,
         },
         "timestamp": datetime.utcnow().isoformat(),
     }

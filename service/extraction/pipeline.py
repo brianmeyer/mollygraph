@@ -462,6 +462,9 @@ class ExtractionPipeline:
     @classmethod
     def _get_embedding_model(cls):
         if cls._embedding_model is None:
+            if getattr(service_config, "TEST_MODE", False):
+                cls._embedding_model = "hash"
+                return cls._embedding_model
             try:
                 from sentence_transformers import SentenceTransformer
                 cls._embedding_model = SentenceTransformer("google/embeddinggemma-300m")

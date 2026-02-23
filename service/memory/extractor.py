@@ -467,6 +467,9 @@ def extract_entities(text: str, threshold: float = 0.4) -> list[dict[str, Any]]:
 
     Returns list of {"text": str, "label": str, "score": float}.
     """
+    if getattr(config, "TEST_MODE", False):
+        return []
+
     backend = _active_backend()
     try:
         if backend == "hf_token_classification":
@@ -497,6 +500,9 @@ def extract_entities(text: str, threshold: float = 0.4) -> list[dict[str, Any]]:
 
 def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
     """Full extraction entry point used by the pipeline."""
+    if getattr(config, "TEST_MODE", False):
+        return {"entities": [], "relations": [], "latency_ms": 0}
+
     backend = _active_backend()
     t0 = time.monotonic()
 
@@ -506,10 +512,9 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
         latency_ms = int((time.monotonic() - t0) * 1000)
         return {"entities": entities, "relations": relations, "latency_ms": latency_ms}
 
-    model = _get_model()
-    schema = _build_schema()
-
     try:
+        model = _get_model()
+        schema = _build_schema()
         result = model.extract(text, schema, threshold=threshold, include_confidence=True)
     except Exception as exc:
         if getattr(config, "STRICT_AI", False):
@@ -573,6 +578,17 @@ def prefetch_model(
     relation_model: str | None = None,
 ) -> dict[str, Any]:
     """Download/cache a model now without waiting for first extraction call."""
+    if getattr(config, "TEST_MODE", False):
+        selected_backend = _normalize_backend(backend or _active_backend())
+        selected_model = str(model or "").strip()
+        selected_relation_model = str(relation_model or "").strip()
+        return {
+            "backend": selected_backend,
+            "model": selected_model,
+            "relation_model": selected_relation_model,
+            "status": "skipped_test_mode",
+        }
+
     selected_backend = _normalize_backend(backend or _active_backend())
     selected_model = str(model or "").strip()
     selected_relation_model = str(relation_model or "").strip()
