@@ -460,6 +460,11 @@ class ExtractionPipeline:
     _embedding_model = None
 
     @classmethod
+    def invalidate_embedding_cache(cls) -> None:
+        """Drop cached embedding model after provider/model configuration changes."""
+        cls._embedding_model = None
+
+    @classmethod
     def _get_embedding_model(cls):
         if cls._embedding_model is None:
             if getattr(service_config, "TEST_MODE", False):
