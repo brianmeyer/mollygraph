@@ -58,6 +58,14 @@ MollyGraph doesn't just store — it **tracks what it doesn't know**:
 - Nightly audits → LLM-powered review catches drift and inconsistencies
 - Strength decay → stale entities fade, active ones stay prominent
 
+### Self-Monitoring
+
+Two things that break graph memory in production: **schema explosion** and **retrieval drift**. MollyGraph catches both.
+
+**Schema Drift Alarm** — MollyGraph watches its own ontology. If relationship or entity types grow >5% in a day, it fires an alert. Self-suggestion loops can balloon a schema in days; this kills that before it starts. Hit `/metrics/schema-drift` to see the alarm state.
+
+**Graph Lift** — Every query is tagged with its retrieval source: `graph_exact`, `graph_fuzzy`, `vector`, or `none`. Graph Lift is the ratio of structured graph hits vs. vector fallback. High lift = your graph is doing real work. Low lift = extraction quality problem. Hit `/metrics/retrieval` to see it.
+
 ## Quick Start
 
 ```bash
@@ -158,6 +166,10 @@ Full REST API for custom integrations:
 | `/embeddings/status` | GET | Provider readiness check |
 | `/embeddings/reindex` | POST | Reindex after model switch |
 | `/maintenance/nightly` | POST | Run full maintenance cycle |
+| `/metrics/retrieval` | GET | Retrieval source breakdown (graph_exact, graph_fuzzy, vector, none), latency traces, hit rate |
+| `/metrics/evolution` | GET | Graph stats over time, GLiNER training history, audit feedback, embedding stats |
+| `/metrics/schema-drift` | GET | Schema drift alarm — rel/entity type growth rate, alert threshold (>5%/day) |
+| `/metrics/summary` | GET | Daily request counts and latency percentiles |
 
 ## Architecture
 
@@ -191,6 +203,9 @@ Full REST API for custom integrations:
 - [x] Hot-reload model deployment
 - [x] Strength decay — stale knowledge fades, active knowledge stays prominent
 - [x] Bi-temporal graph (valid_from, valid_to, observed_at, last_seen on all entities & relationships)
+- [x] Schema drift alarm — self-monitoring ontology growth, alerts on >5% daily expansion
+- [x] Retrieval source tracking — Graph Lift metric (graph_exact / graph_fuzzy / vector / none)
+- [x] Metrics endpoints (`/metrics/retrieval`, `/metrics/evolution`, `/metrics/schema-drift`, `/metrics/summary`)
 - [ ] Multi-agent memory isolation
 - [ ] Web UI for graph exploration
 - [ ] Plugin system for custom extractors
