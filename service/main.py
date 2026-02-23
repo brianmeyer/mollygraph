@@ -353,13 +353,14 @@ async def lifespan(_app: FastAPI):
     initialize_extractor_registry()
     initialize_extractor_schema_registry()
 
-    # Verify gliner2 is importable at startup.
-    try:
-        import gliner2  # type: ignore
-        log.info("startup_check: gliner2 OK", extra={"path": gliner2.__file__})
-    except ImportError as e:
-        log.error("startup_check FAILED: %s. Python: %s", e, sys.executable)
-        raise RuntimeError(f"GLiNER2 not importable: {e}")
+    # Verify gliner2 is importable at startup (skip in test mode — CI doesn't install torch).
+    if not config.TEST_MODE:
+        try:
+            import gliner2  # type: ignore
+            log.info("startup_check: gliner2 OK", extra={"path": gliner2.__file__})
+        except ImportError as e:
+            log.error("startup_check FAILED: %s. Python: %s", e, sys.executable)
+            raise RuntimeError(f"GLiNER2 not importable: {e}")
     log.info("boot: python=%s venv=%s", sys.executable, os.environ.get("VIRTUAL_ENV", "none"))
 
     if config.TEST_MODE:
