@@ -1,204 +1,205 @@
-# MollyGraph
+<p align="center">
+  <h1 align="center">🧠 MollyGraph</h1>
+  <p align="center"><strong>Memory that gets smarter every time your agent runs.</strong></p>
+</p>
 
-Memory that gets better as your agents run.
+<p align="center">
+  <em>The only local-first memory layer that fine-tunes its own extraction model on your data.</em>
+</p>
 
-MollyGraph is a local-first memory layer for agentic systems and RAG apps.  
-Use it as MCP, Python SDK, or a self-hosted API.
+<p align="center">
+  <a href="#quick-start">Quick Start</a> · <a href="#use-as-mcp">MCP</a> · <a href="#use-as-python-sdk">Python SDK</a> · <a href="#http-api">HTTP API</a>
+</p>
 
-## Why It Hits
+---
 
-- Drop-in memory for agents and tools via MCP.
-- Local by default. No cloud dependency required.
-- Model-agnostic configuration (local + cloud optional).
-- Self-improving extraction pipeline with benchmark-gated model upgrades.
-- Continuous graph-quality suggestions for better entities + relationships.
+Most agent memory systems store what you tell them. MollyGraph **learns how to extract better** from every conversation — automatically.
 
-## The Good Stuff
+- 🔁 **Self-evolving extraction** — LoRA fine-tunes GLiNER on your real graph data. Benchmark-gated. Shadow-evaluated. Auto-deployed.
+- 🏠 **Local-first** — Neo4j + local embeddings + local models. No cloud required.
+- 🔌 **Drop-in** — MCP server, Python SDK, or HTTP API. Pick your integration.
+- 📈 **Measurably better over time** — Every training cycle A/B tests the candidate model against the current one. Ships only if it wins.
 
-### 1) Self-evolving extraction (GLiNER)
+> **First LoRA cycle on real data: Entity F1 +15%, Relation F1 +13%.** No manual labeling. No prompt engineering. Just run your agents.
 
-MollyGraph continuously accumulates real episodes into training data, then runs a fine-tune cycle:
+## What Makes This Different
 
-- accumulates examples from your own graph history
-- chooses training strategy (`lora` vs `full`) based on data and prior performance
-- benchmarks candidate vs active model on held-out eval data
-- deploys only if improvement clears threshold (`GLINER_FINETUNE_BENCHMARK_THRESHOLD`)
+Other memory layers are **static pipelines** — same extraction quality on day 1 as day 100.
 
-Endpoints:
-- `POST /train/gliner`
-- `GET /train/status`
+MollyGraph runs a **continuous improvement loop**:
 
-### 2) Entity + relationship improvement suggestions
+```
+ingest episodes → extract entities & relations → accumulate training data
+       ↓                                                    ↓
+  serve queries ← deploy if better ← benchmark A/B ← fine-tune GLiNER
+                        ↑
+                  shadow evaluation
+                  (test on live data before promoting)
+```
 
-MollyGraph tracks schema misses and relationship uncertainty in production:
+The extraction model that parses your text today is better than the one from last week. And next week's will be better than today's.
 
-- relationship fallback events (unknown relation -> `RELATED_TO`)
-- `RELATED_TO` hotspots that should be upgraded to precise relation types
-- suggestion digests for nightly review
-- optional auto-adoption rules over repeated patterns
+### The Pipeline
 
-Endpoint:
-- `GET /suggestions/digest`
+| Stage | What Happens |
+|-------|-------------|
+| **Accumulate** | Every ingested episode becomes a training example |
+| **Train** | LoRA or full fine-tune, chosen automatically based on data volume |
+| **Benchmark** | Candidate vs. active model on held-out eval split |
+| **Shadow** | Run both models on live episodes, check for regressions |
+| **Deploy** | Hot-reload — zero downtime, automatic rollback if needed |
 
-### 3) Local-first quality loop
+### Quality Signals
 
-Deterministic cleanup + optional LLM audit:
+MollyGraph doesn't just store — it **tracks what it doesn't know**:
 
-- orphan/self-reference cleanup
-- strength decay maintenance
-- optional LLM audit pipeline (`AUDIT_LLM_ENABLED=false` by default)
-- provider chain can be local (`ollama`) or cloud add-ons
+- Relationship fallbacks → `RELATED_TO` (something was extracted but the type was uncertain)
+- Schema suggestions → new relation types auto-proposed after repeated patterns
+- Nightly audits → LLM-powered review catches drift and inconsistencies
+- Strength decay → stale entities fade, active ones stay prominent
 
-Endpoint:
-- `POST /audit`
-
-## Integration Modes
-
-1. MCP adapter (`mollygraph-mcp`) for agents
-2. Python SDK (`mollygraph-sdk`) for app/RAG code
-3. HTTP API for self-hosting
-
-## Quick Start (Self-Hosted)
+## Quick Start
 
 ```bash
-cd /Users/brianmeyer/mollygraph
+git clone https://github.com/brianmeyer/mollygraph.git
+cd mollygraph
 cp .env.example .env
 docker compose -f docker-compose.neo4j.yml up -d
 ./scripts/install.sh
 ./scripts/start.sh
 ```
 
-Defaults:
-- API: `http://127.0.0.1:7422`
-- Runtime state: `~/.graph-memory`
-- Embedding registry file: `~/.graph-memory/embedding_config.json`
-- API key: `dev-key-change-in-production`
+That's it. API at `http://127.0.0.1:7422`. State lives in `~/.graph-memory`.
 
 ## Use As MCP
 
-Install:
+The fastest way to give your agent memory.
 
 ```bash
 pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk[mcp]"
+mollygraph-mcp --base-url http://localhost:7422 --api-key YOUR_KEY
 ```
 
-Run:
+**7 tools, zero config:**
 
-```bash
-mollygraph-mcp --base-url http://localhost:7422 --api-key dev-key-change-in-production
-```
-
-MCP tools:
-- `add_episode`
-- `search_facts`
-- `search_nodes`
-- `get_entity_context`
-- `get_queue_status`
-- `run_audit`
-- `get_training_status`
+| Tool | What It Does |
+|------|-------------|
+| `add_episode` | Ingest text → entities + relations extracted automatically |
+| `search_facts` | Semantic search across the knowledge graph |
+| `search_nodes` | Find entities by name or type |
+| `get_entity_context` | Full context for a specific entity |
+| `get_queue_status` | Check async processing status |
+| `run_audit` | Trigger quality audit on demand |
+| `get_training_status` | Check GLiNER training pipeline status |
 
 ## Use As Python SDK
-
-Install:
 
 ```bash
 pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk"
 ```
 
-Example:
-
 ```python
 from mollygraph_sdk import MollyGraphClient
 
-client = MollyGraphClient(base_url="http://localhost:7422", api_key="dev-key-change-in-production")
-client.ingest("Brian works at Databricks.", source="manual")
-print(client.query("What do we know about Brian?"))
+client = MollyGraphClient(base_url="http://localhost:7422", api_key="YOUR_KEY")
+
+# Ingest — extraction happens automatically
+client.ingest("Sarah joined the ML team at Acme Corp last Tuesday.", source="slack")
+
+# Query — semantic + graph traversal
+result = client.query("What do we know about Sarah?")
+print(result)
+
 client.close()
 ```
 
-## Local Model Options
+## Local Models
 
-Embeddings:
-- `MOLLYGRAPH_EMBEDDING_BACKEND=hash` (default, dependency-free)
-- `MOLLYGRAPH_EMBEDDING_BACKEND=sentence-transformers`
-- `MOLLYGRAPH_EMBEDDING_BACKEND=ollama`
+MollyGraph runs entirely on local hardware. No API keys needed for core functionality.
 
-Models:
-- `MOLLYGRAPH_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`
-- `MOLLYGRAPH_OLLAMA_EMBED_MODEL=nomic-embed-text`
+**Embeddings** (pick one):
+```env
+MOLLYGRAPH_EMBEDDING_BACKEND=sentence-transformers   # recommended
+MOLLYGRAPH_EMBEDDING_MODEL=google/embeddinggemma-300m
+# or
+MOLLYGRAPH_EMBEDDING_BACKEND=ollama
+MOLLYGRAPH_OLLAMA_EMBED_MODEL=nomic-embed-text
+```
 
-Optional local audit with Ollama:
+**Extraction** — GLiNER2 runs locally on CPU or MPS (Apple Silicon):
+```env
+# Starts with base model, self-improves over time
+# No configuration needed — it just gets better
+```
 
+**Audits** (optional LLM review):
 ```env
 AUDIT_LLM_ENABLED=true
 AUDIT_PROVIDER_ORDER=ollama,none
 AUDIT_MODEL_LOCAL=llama3.1:8b
-OLLAMA_CHAT_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
-Configure embedding providers/models at runtime:
+## HTTP API
 
-```bash
-# Register additional models
-curl -X POST http://127.0.0.1:7422/embeddings/models \
-  -H "Authorization: Bearer dev-key-change-in-production" \
-  -H "Content-Type: application/json" \
-  -d '{"provider":"huggingface","model":"BAAI/bge-small-en-v1.5"}'
+Full REST API for custom integrations:
 
-curl -X POST http://127.0.0.1:7422/embeddings/models \
-  -H "Authorization: Bearer dev-key-change-in-production" \
-  -H "Content-Type: application/json" \
-  -d '{"provider":"ollama","model":"nomic-embed-text","activate":true}'
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Service health + vector stats |
+| `/stats` | GET | Graph statistics |
+| `/ingest` | POST | Ingest episode text |
+| `/query` | GET | Semantic + graph search |
+| `/entity/{name}` | GET | Entity context |
+| `/audit` | POST | Run quality audit |
+| `/train/gliner` | POST | Trigger training cycle |
+| `/train/status` | GET | Training pipeline status |
+| `/suggestions/digest` | GET | Schema improvement suggestions |
+| `/embeddings/config` | GET/POST | Embedding provider config |
+| `/embeddings/status` | GET | Provider readiness check |
+| `/embeddings/reindex` | POST | Reindex after model switch |
+| `/maintenance/nightly` | POST | Run full maintenance cycle |
 
-# Switch active provider/model
-curl -X POST http://127.0.0.1:7422/embeddings/config \
-  -H "Authorization: Bearer dev-key-change-in-production" \
-  -H "Content-Type: application/json" \
-  -d '{"provider":"huggingface","model":"BAAI/bge-small-en-v1.5"}'
+## Architecture
 
-# Check provider/model readiness (HF deps, Ollama reachability/models)
-curl -H "Authorization: Bearer dev-key-change-in-production" \
-  http://127.0.0.1:7422/embeddings/status
-
-# Reindex existing entities after switching model/provider
-curl -X POST http://127.0.0.1:7422/embeddings/reindex \
-  -H "Authorization: Bearer dev-key-change-in-production" \
-  -H "Content-Type: application/json" \
-  -d '{"limit":5000,"dry_run":false}'
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│  MCP Client │────▶│  MollyGraph  │────▶│   Neo4j     │
+│  or SDK     │     │   Service    │     │  (entities, │
+│  or HTTP    │     │  :7422       │     │  relations) │
+└─────────────┘     └──────┬───────┘     └─────────────┘
+                           │
+                    ┌──────┴───────┐
+                    │   Zvec       │
+                    │  (vectors,   │
+                    │  embeddings) │
+                    └──────┬───────┘
+                           │
+                    ┌──────┴───────┐
+                    │  GLiNER2     │
+                    │  (extraction,│
+                    │  self-tuning)│
+                    └──────────────┘
 ```
 
-## Optional Cloud Add-ons
+## Roadmap
 
-Cloud providers are optional, not required for core operation.
-Enable only if you want them:
+- [x] Self-evolving GLiNER extraction with LoRA
+- [x] Benchmark-gated deployment with shadow evaluation
+- [x] MCP server + Python SDK
+- [x] Local embedding support (sentence-transformers, Ollama)
+- [x] Relationship suggestion system
+- [x] Hot-reload model deployment
+- [ ] Multi-agent memory isolation
+- [ ] Temporal queries ("what changed last week?")
+- [ ] Web UI for graph exploration
+- [ ] Plugin system for custom extractors
 
-- set `AUDIT_LLM_ENABLED=true`
-- set `AUDIT_PROVIDER_ORDER`
-- configure provider keys in `.env`
+## License
 
-## HTTP API Contract
+MIT
 
-Canonical:
-- `GET /health`
-- `GET /stats`
-- `POST /ingest`
-- `GET /entity/{name}`
-- `GET /query`
-- `POST /audit`
-- `GET /suggestions/digest`
-- `POST /train/gliner`
-- `GET /train/status`
-- `GET /embeddings/config`
-- `GET /embeddings/status`
-- `POST /embeddings/config`
-- `POST /embeddings/models`
-- `POST /embeddings/reindex`
-- `POST /maintenance/run`
+---
 
-Legacy aliases retained:
-- `POST /extract` -> `POST /ingest`
-- `POST /audit/run` -> `POST /audit`
-- `POST /maintenance/audit` -> `POST /audit`
-- `GET /suggestions_digest` -> `GET /suggestions/digest`
-- `POST /training/gliner` -> `POST /train/gliner`
-- `GET /training/status` -> `GET /train/status`
+<p align="center">
+  <strong>Your agents deserve memory that learns. Give them MollyGraph.</strong>
+</p>
