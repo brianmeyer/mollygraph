@@ -205,6 +205,14 @@ class ZvecBackend(VectorStoreBackend):
         collection_exists = self.db_path.exists()
         
         if collection_exists:
+            # Clear stale lock file to prevent "Can't open lock file" on restart
+            lock_file = self.db_path / "LOCK"
+            if lock_file.exists():
+                try:
+                    lock_file.unlink()
+                    log.info("Cleared stale Zvec LOCK file")
+                except OSError:
+                    pass
             # Open existing
             self.collection = zvec.open(str(self.db_path))
             log.info(f"Opened existing Zvec collection: {self.db_path}")
