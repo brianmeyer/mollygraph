@@ -205,18 +205,22 @@ class ZvecBackend(VectorStoreBackend):
         collection_exists = self.db_path.exists()
         
         if collection_exists:
-            # Clear stale lock file to prevent "Can't open lock file" on restart
-            lock_file = self.db_path / "LOCK"
-            if lock_file.exists():
+            # Clear ALL stale lock files to prevent "Can't open lock file" on restart
+            for lock_file in self.db_path.rglob("LOCK"):
                 try:
                     lock_file.unlink()
-                    log.info("Cleared stale Zvec LOCK file")
+                    log.info("Cleared stale Zvec LOCK file: %s", lock_file)
                 except OSError:
                     pass
-            # Open existing
-            self.collection = zvec.open(str(self.db_path))
-            log.info(f"Opened existing Zvec collection: {self.db_path}")
-        else:
+            try:
+                self.collection = zvec.open(str(self.db_path))
+                log.info(f"Opened existing Zvec collection: {self.db_path}")
+            except RuntimeError as exc:
+                log.warning("Failed to open Zvec collection (%s), recreating from scratch", exc)
+                import shutil
+                shutil.rmtree(self.db_path)
+                collection_exists = False  # fall through to creation below
+        if not collection_exists:
             # Create new collection with schema
             # Vector schema with HNSW index for cosine similarity
             from zvec import HnswIndexParam, MetricType

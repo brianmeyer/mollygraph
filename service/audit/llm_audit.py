@@ -108,6 +108,8 @@ def build_audit_prompt(rels: list[dict[str, Any]]) -> str:
 
 
 def _extract_json_array(raw: str) -> str:
+    import re
+
     text = (raw or "").strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -117,9 +119,57 @@ def _extract_json_array(raw: str) -> str:
             text = "\n".join(lines[1:]).strip()
 
     start = text.find("[")
+    if start < 0:
+        return text
+
     end = text.rfind("]")
-    if start >= 0 and end > start:
-        return text[start : end + 1]
+    if end > start:
+        candidate = text[start : end + 1]
+        # Try parsing as-is first
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
+        # Repair: some LLMs drop opening braces on objects inside arrays
+        repaired = re.sub(
+            r'(?<=[,\[])\s*"index"',
+            ' {"index"',
+            candidate,
+        )
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            pass
+
+    # Truncated response (no closing ]) or all repairs failed:
+    # Extract all complete {...} objects from after the opening [
+    remainder = text[start:]
+    obj_pattern = re.compile(r'\{[^{}]*\}')
+    objects = obj_pattern.findall(remainder)
+    if not objects:
+        # Try wrapping bare key-value groups in braces
+        obj_pattern2 = re.compile(
+            r'"index"\s*:\s*\d+\s*,\s*"verdict"\s*:\s*"[^"]*"'
+            r'(?:\s*,\s*"suggested_type"\s*:\s*"[^"]*")?'
+            r'(?:\s*,\s*"note"\s*:\s*"[^"]*")?',
+        )
+        matches = obj_pattern2.findall(remainder)
+        objects = ["{" + m.rstrip().rstrip(",") + "}" for m in matches]
+    if objects:
+        # Validate each object individually, keep only parseable ones
+        valid = []
+        for obj in objects:
+            try:
+                json.loads(obj)
+                valid.append(obj)
+            except json.JSONDecodeError:
+                continue
+        if valid:
+            repaired = "[" + ",".join(valid) + "]"
+            log.info("Recovered %d/%d objects from truncated/broken JSON", len(valid), len(objects))
+            return repaired
     return text
 
 
