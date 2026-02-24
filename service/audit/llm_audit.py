@@ -418,15 +418,22 @@ async def _invoke_anthropic(prompt: str, model: str) -> tuple[str, int]:
 
 
 async def call_audit_model(prompt: str, schedule: str, model_override: str | None = None) -> dict[str, Any]:
-    """Call audit model using configured provider chain."""
+    """Call audit model using the configured provider tier chain.
+
+    Tier order is driven by ``MOLLYGRAPH_AUDIT_PROVIDER_TIERS`` (default:
+    deterministic,local,primary,fallback).  The "deterministic" tier is a
+    no-op here (handled by ``run_llm_audit`` before this is called).
+    Local/primary/fallback map to their respective provider/model env vars.
+
+    Backwards compat: if ``AUDIT_PROVIDER_ORDER`` is set to a non-"none"
+    value and ``MOLLYGRAPH_AUDIT_TIER_PRIMARY`` is empty, the legacy value
+    becomes the primary-tier provider.
+    """
     normalized = schedule.strip().lower()
-    order = [p.strip().lower() for p in str(config.AUDIT_PROVIDER_ORDER).split(",") if p.strip()]
-    if not order:
-        order = ["none"]
 
     def _default_model_for(provider: str) -> str:
-        default_model = config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_NIGHTLY
-        # Per-provider hard-coded fallbacks used when the schedule model is empty.
+        """Best-effort default model when per-tier model is unset."""
+        schedule_model = config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_NIGHTLY
         provider_fallbacks: dict[str, str] = {
             "gemini": "gemini-2.0-flash",
             "moonshot": "kimi-k2.5",
@@ -441,7 +448,7 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
             "together": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
             "fireworks": "accounts/fireworks/models/llama-v3p1-70b-instruct",
         }
-        return str(default_model or provider_fallbacks.get(provider, "llama3.1:8b")).strip()
+        return str(schedule_model or provider_fallbacks.get(provider, "llama3.1:8b")).strip()
 
     async def _run_provider(provider: str, model: str) -> tuple[str, int, str]:
         if provider in {"gemini"}:
@@ -473,6 +480,29 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
             return content, latency_ms, "fireworks"
         raise RuntimeError(f"Unsupported audit provider: {provider}")
 
+    def _resolve_provider_from_override(raw: str) -> str:
+        lowered = raw.lower()
+        if "ollama" in lowered or lowered.startswith("local:"):
+            return "ollama"
+        if "moonshot" in lowered or "kimi" in lowered:
+            return "moonshot"
+        if "groq" in lowered:
+            return "groq"
+        if "claude" in lowered or "anthropic" in lowered or "opus" in lowered:
+            return "anthropic"
+        if "gemini" in lowered:
+            return "gemini"
+        if "gpt" in lowered or "openai" in lowered:
+            return "openai"
+        if "openrouter" in lowered:
+            return "openrouter"
+        if "together" in lowered:
+            return "together"
+        if "fireworks" in lowered:
+            return "fireworks"
+        return ""
+
+    # ── Guard: LLM disabled ───────────────────────────────────────────────
     if not config.AUDIT_LLM_ENABLED and not model_override:
         return {
             "provider": "disabled",
@@ -483,40 +513,26 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
             "skipped": True,
         }
 
+    # ── model_override: bypass tier chain entirely ────────────────────────
     if model_override:
         raw_override = model_override.strip()
-        lowered = raw_override.lower()
         provider = ""
         model = raw_override
+
+        # Accept "provider/model" notation
         if "/" in raw_override:
             maybe_provider, maybe_model = raw_override.split("/", 1)
-            if maybe_provider.strip().lower() in {"gemini", "moonshot", "kimi", "groq", "anthropic", "opus", "ollama", "local", "openai", "openrouter", "together", "fireworks"}:
+            if maybe_provider.strip().lower() in {
+                "gemini", "moonshot", "kimi", "groq", "anthropic", "opus",
+                "ollama", "local", "openai", "openrouter", "together", "fireworks",
+            }:
                 provider = maybe_provider.strip().lower()
                 model = maybe_model.strip()
 
         if not provider:
-            if "ollama" in lowered or lowered.startswith("local:"):
-                provider = "ollama"
-            elif "moonshot" in lowered or "kimi" in lowered:
-                provider = "moonshot"
-            elif "groq" in lowered:
-                provider = "groq"
-            elif "claude" in lowered or "anthropic" in lowered or "opus" in lowered:
-                provider = "anthropic"
-            elif "gemini" in lowered:
-                provider = "gemini"
-            elif "gpt" in lowered or "openai" in lowered:
-                provider = "openai"
-            elif "openrouter" in lowered:
-                provider = "openrouter"
-            elif "together" in lowered:
-                provider = "together"
-            elif "fireworks" in lowered:
-                provider = "fireworks"
-            else:
-                provider = next((p for p in order if p not in {"none", "disabled"}), "ollama")
+            provider = _resolve_provider_from_override(raw_override)
 
-        if provider in {"none", "disabled"}:
+        if not provider or provider in {"none", "disabled"}:
             return {
                 "provider": "disabled",
                 "model": "",
@@ -534,36 +550,94 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
             "content": content,
             "fallback": "",
             "skipped": False,
+            "tier": "override",
         }
 
-    errors: list[str] = []
-    for idx, provider in enumerate(order):
-        if provider in {"none", "disabled"}:
-            return {
-                "provider": "disabled",
-                "model": "",
-                "latency_ms": 0,
-                "content": "",
-                "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
-                "skipped": True,
-            }
+    # ── Tier chain ────────────────────────────────────────────────────────
+    # Backwards compat: if AUDIT_PROVIDER_ORDER is set to a specific provider
+    # and MOLLYGRAPH_AUDIT_TIER_PRIMARY is unset, use the legacy value as primary.
+    tier_primary_provider = (getattr(config, "AUDIT_TIER_PRIMARY", "") or "").strip().lower()
+    if not tier_primary_provider:
+        legacy_order = str(getattr(config, "AUDIT_PROVIDER_ORDER", "none")).strip().lower()
+        if legacy_order and legacy_order not in {"none", "disabled"}:
+            tier_primary_provider = legacy_order.split(",")[0].strip()
+            log.debug("Audit tier 'primary' resolved from legacy AUDIT_PROVIDER_ORDER: %s", tier_primary_provider)
 
-        model = _default_model_for(provider)
+    tier_local_provider    = (getattr(config, "AUDIT_TIER_LOCAL",    "") or "ollama").strip().lower()
+    tier_fallback_provider = (getattr(config, "AUDIT_TIER_FALLBACK", "") or "").strip().lower()
+
+    # Model per tier (fall back to schedule default if unset)
+    tier_local_model    = (getattr(config, "AUDIT_MODEL_LOCAL",    "") or "").strip() or _default_model_for(tier_local_provider)
+    tier_primary_model  = (getattr(config, "AUDIT_MODEL_PRIMARY",  "") or "").strip() or (
+        _default_model_for(tier_primary_provider) if tier_primary_provider else ""
+    )
+    tier_fallback_model = (getattr(config, "AUDIT_MODEL_FALLBACK", "") or "").strip() or (
+        _default_model_for(tier_fallback_provider) if tier_fallback_provider else ""
+    )
+
+    tier_configs: dict[str, tuple[str, str]] = {
+        "local":    (tier_local_provider,    tier_local_model),
+        "primary":  (tier_primary_provider,  tier_primary_model),
+        "fallback": (tier_fallback_provider, tier_fallback_model),
+    }
+
+    provider_tiers: list[str] = [
+        t.strip().lower()
+        for t in getattr(config, "AUDIT_PROVIDER_TIERS", ["deterministic", "local", "primary", "fallback"])
+        if t.strip()
+    ]
+
+    tried: list[str] = []
+    errors: list[str] = []
+
+    for tier in provider_tiers:
+        if tier in {"deterministic", ""}:
+            # Deterministic checks are always done in run_llm_audit; skip here.
+            continue
+
+        entry = tier_configs.get(tier)
+        if entry is None:
+            log.warning("Unknown audit tier %r — skipping", tier)
+            continue
+
+        provider, model = entry
+        if not provider:
+            log.debug("Audit tier %r: provider not configured — skipping", tier)
+            continue
+        if provider in {"none", "disabled"}:
+            continue
+
         try:
             content, latency_ms, resolved_provider = await _run_provider(provider, model)
+            log.info("Audit tier %r succeeded (provider=%s model=%s)", tier, resolved_provider, model)
             return {
                 "provider": resolved_provider,
                 "model": model,
                 "latency_ms": latency_ms,
                 "content": content,
-                "fallback": " -> ".join(order[:idx]) if idx > 0 else "",
+                "fallback": " -> ".join(tried) if tried else "",
                 "skipped": False,
+                "tier": tier,
             }
         except Exception as exc:
-            errors.append(f"{provider}:{exc}")
-            continue
+            err_str = f"{tier}/{provider}: {exc}"
+            errors.append(err_str)
+            tried.append(f"{tier}/{provider}")
+            log.warning("Audit tier %r (%s) failed: %s — trying next tier", tier, provider, exc)
 
-    raise RuntimeError(f"All audit providers failed: {' | '.join(errors)}")
+    # All LLM tiers exhausted
+    if tried:
+        raise RuntimeError(f"All audit tiers failed: {' | '.join(errors)}")
+
+    # No LLM tiers were configured (only deterministic) — return skipped
+    return {
+        "provider": "deterministic",
+        "model": "",
+        "latency_ms": 0,
+        "content": "",
+        "fallback": "",
+        "skipped": True,
+    }
 
 
 async def apply_verdicts(

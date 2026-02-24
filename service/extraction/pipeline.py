@@ -592,84 +592,203 @@ class ExtractionPipeline:
         )
         return {"refreshed": refreshed, "failed": failed, "total_stale": len(stale)}
 
-    # ── Embedding model (lazy singleton) ─────────────────────────────────
-    _embedding_model = None
+    # ── Embedding model (lazy tier-chain) ────────────────────────────────
+    _embedding_model = None           # loaded SentenceTransformer or sentinel string
+    _embedding_active_tier: "str | None" = None   # which tier is currently active
+    _embedding_failed_tiers: set = set()           # tiers that have permanently failed this run
 
     @classmethod
     def invalidate_embedding_cache(cls) -> None:
-        """Drop cached embedding model after provider/model configuration changes."""
+        """Drop cached embedding state after provider/model configuration changes."""
         cls._embedding_model = None
+        cls._embedding_active_tier = None
+        cls._embedding_failed_tiers = set()
 
     @classmethod
-    def _get_embedding_model(cls):
-        if cls._embedding_model is None:
-            if getattr(service_config, "TEST_MODE", False):
-                cls._embedding_model = "hash"
-                return cls._embedding_model
+    def _try_load_tier(cls, tier: str) -> bool:
+        """Attempt to load/validate one embedding tier. Returns True on success."""
+        tier = tier.strip()
 
-            backend = getattr(service_config, "EMBEDDING_BACKEND", "sentence-transformers")
+        if tier == "hash":
+            cls._embedding_model = "hash"
+            cls._embedding_active_tier = "hash"
+            return True
 
-            if backend in ("sentence-transformers", "st"):
-                model_name = getattr(service_config, "EMBEDDING_MODEL", "google/embeddinggemma-300m")
-                try:
-                    from sentence_transformers import SentenceTransformer
-                    cls._embedding_model = SentenceTransformer(model_name)
-                    log.info("Loaded sentence-transformers embedding model: %s", model_name)
-                except Exception as exc:
-                    log.warning(
-                        "Failed to load sentence-transformers model %s: %s — falling back to hash",
-                        model_name, exc,
-                    )
-                    cls._embedding_model = "hash"
-            elif backend == "ollama":
-                # Sentinel string; actual call happens in _text_embedding
-                cls._embedding_model = "ollama"
-                log.info(
-                    "Embedding backend: ollama (model=%s)",
-                    getattr(service_config, "OLLAMA_EMBED_MODEL", "nomic-embed-text"),
-                )
-            elif backend == "hash":
-                cls._embedding_model = "hash"
-                log.info("Embedding backend: hash (deterministic fallback)")
-            else:
-                log.warning("Unknown EMBEDDING_BACKEND %r — falling back to hash", backend)
-                cls._embedding_model = "hash"
-
-        return cls._embedding_model
-
-    @staticmethod
-    def _text_embedding(text: str, dim: int = 768) -> list[float]:
-        """Embed text using the configured backend (sentence-transformers / ollama / hash)."""
-        model = ExtractionPipeline._get_embedding_model()
-
-        if model == "ollama":
+        if tier in ("sentence-transformers", "st"):
+            model_name = (
+                getattr(service_config, "EMBEDDING_ST_MODEL", "").strip()
+                or getattr(service_config, "EMBEDDING_MODEL", "").strip()
+                or "google/embeddinggemma-300m"
+            )
             try:
-                import urllib.request, json as _json
-                ollama_model = getattr(service_config, "OLLAMA_EMBED_MODEL", "nomic-embed-text")
+                from sentence_transformers import SentenceTransformer
+                cls._embedding_model = SentenceTransformer(model_name)
+                cls._embedding_active_tier = tier
+                log.info("Embedding tier '%s' loaded: %s", tier, model_name)
+                return True
+            except Exception as exc:
+                log.warning("Embedding tier '%s' failed (model=%s): %s", tier, model_name, exc)
+                return False
+
+        if tier == "ollama":
+            # Validate connectivity before committing
+            try:
+                import urllib.request as _ur, json as _json
+                ollama_model = getattr(service_config, "EMBEDDING_OLLAMA_MODEL", "nomic-embed-text")
                 base_url = getattr(service_config, "OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-                payload = _json.dumps({"model": ollama_model, "prompt": text}).encode()
-                req = urllib.request.Request(
+                payload = _json.dumps({"model": ollama_model, "prompt": "ping"}).encode()
+                req = _ur.Request(
                     f"{base_url}/api/embeddings",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with _ur.urlopen(req, timeout=10) as resp:
+                    _json.loads(resp.read())
+                cls._embedding_model = "ollama"
+                cls._embedding_active_tier = "ollama"
+                log.info("Embedding tier 'ollama' ready (model=%s)", ollama_model)
+                return True
+            except Exception as exc:
+                log.warning("Embedding tier 'ollama' failed: %s", exc)
+                return False
+
+        if tier == "cloud":
+            provider = getattr(service_config, "EMBEDDING_CLOUD_PROVIDER", "openai").strip().lower()
+            cloud_model = getattr(service_config, "EMBEDDING_CLOUD_MODEL", "text-embedding-3-small").strip()
+            if provider == "openai":
+                api_key = getattr(service_config, "OPENAI_API_KEY", "")
+                if not api_key:
+                    log.warning("Embedding tier 'cloud/openai' skipped: no API key")
+                    return False
+                try:
+                    import urllib.request as _ur, json as _json
+                    payload = _json.dumps({"model": cloud_model, "input": "ping"}).encode()
+                    req = _ur.Request(
+                        "https://api.openai.com/v1/embeddings",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {api_key}",
+                        },
+                    )
+                    with _ur.urlopen(req, timeout=15) as resp:
+                        _json.loads(resp.read())
+                    cls._embedding_model = f"cloud:{provider}:{cloud_model}"
+                    cls._embedding_active_tier = "cloud"
+                    log.info("Embedding tier 'cloud' ready (provider=%s model=%s)", provider, cloud_model)
+                    return True
+                except Exception as exc:
+                    log.warning("Embedding tier 'cloud/%s' failed: %s", provider, exc)
+                    return False
+            log.warning("Embedding tier 'cloud' provider '%s' not yet supported", provider)
+            return False
+
+        log.warning("Unknown embedding tier %r — skipping", tier)
+        return False
+
+    @classmethod
+    def _get_embedding_model(cls):
+        """Return active embedding model, loading via tier chain when necessary."""
+        if cls._embedding_model is not None:
+            return cls._embedding_model
+
+        if getattr(service_config, "TEST_MODE", False):
+            cls._embedding_model = "hash"
+            cls._embedding_active_tier = "hash"
+            return cls._embedding_model
+
+        # Legacy single-backend override: MOLLYGRAPH_EMBEDDING_BACKEND non-empty
+        legacy_backend = getattr(service_config, "EMBEDDING_BACKEND", "").strip().lower()
+        if legacy_backend:
+            if cls._try_load_tier(legacy_backend):
+                return cls._embedding_model
+            log.warning("Legacy EMBEDDING_BACKEND=%r failed — falling back to hash", legacy_backend)
+            cls._embedding_model = "hash"
+            cls._embedding_active_tier = "hash"
+            return cls._embedding_model
+
+        # Tier chain: walk in order, skip already-failed tiers
+        tier_order = getattr(
+            service_config, "EMBEDDING_TIER_ORDER",
+            ["sentence-transformers", "ollama", "cloud", "hash"],
+        )
+        for tier in tier_order:
+            tier = tier.strip()
+            if not tier or tier in cls._embedding_failed_tiers:
+                continue
+            if cls._try_load_tier(tier):
+                return cls._embedding_model
+            cls._embedding_failed_tiers.add(tier)
+
+        # Absolute last resort
+        log.warning("All embedding tiers failed — using hash")
+        cls._embedding_model = "hash"
+        cls._embedding_active_tier = "hash"
+        return cls._embedding_model
+
+    @classmethod
+    def _text_embedding(cls, text: str, dim: int = 768) -> list[float]:
+        """Embed text using the configured tier chain (sentence-transformers / ollama / cloud / hash)."""
+        model = cls._get_embedding_model()
+
+        if model == "ollama":
+            try:
+                import urllib.request as _ur, json as _json
+                ollama_model = getattr(service_config, "EMBEDDING_OLLAMA_MODEL", "nomic-embed-text")
+                base_url = getattr(service_config, "OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+                payload = _json.dumps({"model": ollama_model, "prompt": text}).encode()
+                req = _ur.Request(
+                    f"{base_url}/api/embeddings",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                with _ur.urlopen(req, timeout=30) as resp:
                     result = _json.loads(resp.read())
                 return result["embedding"]
             except Exception as exc:
-                log.warning("Ollama embedding failed: %s — falling back to hash", exc)
-                # Fall through to hash
+                log.warning("Ollama embedding call failed: %s — marking tier failed, trying next", exc)
+                cls._embedding_model = None
+                cls._embedding_failed_tiers.add("ollama")
+                return cls._text_embedding(text, dim)
 
-        elif model != "hash":
+        if isinstance(model, str) and model.startswith("cloud:"):
+            _, provider, cloud_model = model.split(":", 2)
+            try:
+                if provider == "openai":
+                    import urllib.request as _ur, json as _json
+                    api_key = getattr(service_config, "OPENAI_API_KEY", "")
+                    payload = _json.dumps({"model": cloud_model, "input": text}).encode()
+                    req = _ur.Request(
+                        "https://api.openai.com/v1/embeddings",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {api_key}",
+                        },
+                    )
+                    with _ur.urlopen(req, timeout=30) as resp:
+                        result = _json.loads(resp.read())
+                    return result["data"][0]["embedding"]
+            except Exception as exc:
+                log.warning("Cloud embedding (%s) call failed: %s — marking tier failed, trying next", provider, exc)
+                cls._embedding_model = None
+                cls._embedding_failed_tiers.add("cloud")
+                return cls._text_embedding(text, dim)
+
+        if model != "hash":
             # sentence-transformers model object
             try:
                 vec = model.encode(text, normalize_embeddings=True).tolist()
                 return vec
             except Exception as exc:
-                log.warning("sentence-transformers encode failed: %s — falling back to hash", exc)
-                # Fall through to hash
+                log.warning(
+                    "sentence-transformers encode failed: %s — marking tier failed, trying next", exc
+                )
+                cls._embedding_model = None
+                cls._embedding_failed_tiers.add(cls._embedding_active_tier or "sentence-transformers")
+                return cls._text_embedding(text, dim)
 
-        # Hash fallback
+        # Hash fallback — deterministic, never fails
         tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
         vector = [0.0] * dim
         if not tokens:

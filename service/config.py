@@ -54,7 +54,21 @@ AUDIT_LLM_ENABLED    = os.environ.get("AUDIT_LLM_ENABLED", "0").strip().lower() 
 AUDIT_MODEL_NIGHTLY  = os.environ.get("AUDIT_MODEL_NIGHTLY", "llama3.1:8b")
 AUDIT_MODEL_WEEKLY   = os.environ.get("AUDIT_MODEL_WEEKLY", "llama3.1:8b")
 AUDIT_MODEL_PRETRAIN = os.environ.get("AUDIT_MODEL_PRETRAIN", "llama3.1:8b")  # used by gliner pre-training validation
-AUDIT_PROVIDER_ORDER = os.environ.get("AUDIT_PROVIDER_ORDER", "none")
+AUDIT_PROVIDER_ORDER = os.environ.get("AUDIT_PROVIDER_ORDER", "none")  # legacy single-provider override
+
+# Audit LLM tier chain (deterministic always runs; LLM tiers fall through on failure)
+AUDIT_PROVIDER_TIERS = os.environ.get(
+    "MOLLYGRAPH_AUDIT_PROVIDER_TIERS",
+    "deterministic,local,primary,fallback",
+).split(",")
+# Per-tier provider mapping
+AUDIT_TIER_LOCAL    = os.environ.get("MOLLYGRAPH_AUDIT_TIER_LOCAL", "ollama")   # ollama, llama-cpp, etc.
+AUDIT_TIER_PRIMARY  = os.environ.get("MOLLYGRAPH_AUDIT_TIER_PRIMARY", "")       # moonshot, openai, groq, etc.
+AUDIT_TIER_FALLBACK = os.environ.get("MOLLYGRAPH_AUDIT_TIER_FALLBACK", "")      # different provider as backup
+# Per-tier model
+AUDIT_MODEL_LOCAL    = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_LOCAL", "llama3.1:8b")
+AUDIT_MODEL_PRIMARY  = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_PRIMARY", "")
+AUDIT_MODEL_FALLBACK = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_FALLBACK", "")
 
 # ── LLM provider base URLs ────────────────────────────────────────────────────
 GEMINI_BASE_URL    = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -81,9 +95,21 @@ STRICT_AI = (
 SPACY_ENRICHMENT = os.environ.get("MOLLYGRAPH_SPACY_ENRICHMENT", "1").strip().lower() in {"1", "true", "yes", "on"}
 SPACY_MODEL = os.environ.get("MOLLYGRAPH_SPACY_MODEL", "en_core_web_sm")
 SPACY_MIN_GLINER_ENTITIES = int(os.environ.get("MOLLYGRAPH_SPACY_MIN_GLINER_ENTITIES", "2"))
-EMBEDDING_BACKEND = os.environ.get("MOLLYGRAPH_EMBEDDING_BACKEND", "sentence-transformers").strip().lower()
-EMBEDDING_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_MODEL", "google/embeddinggemma-300m")
-OLLAMA_EMBED_MODEL = os.environ.get("MOLLYGRAPH_OLLAMA_EMBED_MODEL", "nomic-embed-text")
+EMBEDDING_BACKEND = os.environ.get("MOLLYGRAPH_EMBEDDING_BACKEND", "").strip().lower()  # legacy override; empty = use tier chain
+# Embedding tier chain (falls through on failure; hash is always last resort)
+EMBEDDING_TIER_ORDER = os.environ.get(
+    "MOLLYGRAPH_EMBEDDING_TIER_ORDER",
+    "sentence-transformers,ollama,cloud,hash",
+).split(",")
+# Per-tier embedding config
+EMBEDDING_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_MODEL", "")  # empty = use tier default
+EMBEDDING_ST_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_ST_MODEL", "")  # sentence-transformers model
+EMBEDDING_OLLAMA_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_OLLAMA_MODEL",
+    os.environ.get("MOLLYGRAPH_OLLAMA_EMBED_MODEL", "nomic-embed-text"))  # also accepts old var
+EMBEDDING_CLOUD_PROVIDER = os.environ.get("MOLLYGRAPH_EMBEDDING_CLOUD_PROVIDER", "openai")  # openai, google, etc.
+EMBEDDING_CLOUD_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_CLOUD_MODEL", "text-embedding-3-small")
+# Legacy alias kept for backward compat
+OLLAMA_EMBED_MODEL = EMBEDDING_OLLAMA_MODEL
 EXTRACTOR_BACKEND = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "gliner2").strip().lower()
 EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
 EXTRACTOR_RELATION_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_MODEL", "Babelscape/rebel-large").strip()
