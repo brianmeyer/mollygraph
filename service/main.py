@@ -301,20 +301,37 @@ def _validate_strict_ai_startup() -> None:
         raise RuntimeError("strict_ai startup validation failed: " + " | ".join(errors))
 
 
+def _active_embedding_info() -> tuple[str, str]:
+    """Return (provider, model) for the currently active embedding tier."""
+    tier = ExtractionPipeline._embedding_active_tier or "unknown"
+    if tier in ("sentence-transformers", "st"):
+        return ("sentence-transformers", config.EMBEDDING_ST_MODEL or config.EMBEDDING_MODEL or "google/embeddinggemma-300m")
+    if tier == "ollama":
+        return ("ollama", config.EMBEDDING_OLLAMA_MODEL or config.OLLAMA_EMBED_MODEL or "nomic-embed-text")
+    if tier == "cloud":
+        return ("cloud", config.EMBEDDING_CLOUD_MODEL or "")
+    if tier == "hash":
+        return ("hash", "")
+    # Fallback: read legacy config
+    backend = (config.EMBEDDING_BACKEND or "").strip().lower()
+    if backend in ("huggingface", "sentence-transformers", "st", "hf"):
+        return ("sentence-transformers", config.EMBEDDING_ST_MODEL or config.EMBEDDING_MODEL or "")
+    if backend == "ollama":
+        return ("ollama", config.OLLAMA_EMBED_MODEL or "")
+    return ("unknown", "")
+
+
 def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
     if graph is None or vector_store is None:
         raise RuntimeError("Service not ready")
 
     rows = graph.list_entities_for_embedding(limit=limit)
+    active_provider, active_model = _active_embedding_info()
     if dry_run:
         return {
             "status": "dry_run",
-            "provider": config.EMBEDDING_BACKEND,
-            "model": (
-                config.EMBEDDING_MODEL
-                if config.EMBEDDING_BACKEND in {"huggingface", "sentence-transformers", "sentence_transformers", "st", "hf"}
-                else config.OLLAMA_EMBED_MODEL if config.EMBEDDING_BACKEND == "ollama" else ""
-            ),
+            "provider": active_provider,
+            "model": active_model,
             "entities_found": len(rows),
             "reindexed": 0,
             "failed": 0,
@@ -357,12 +374,8 @@ def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
 
     return {
         "status": "ok" if failed == 0 else "partial",
-        "provider": config.EMBEDDING_BACKEND,
-        "model": (
-            config.EMBEDDING_MODEL
-            if config.EMBEDDING_BACKEND in {"huggingface", "sentence-transformers", "sentence_transformers", "st", "hf"}
-            else config.OLLAMA_EMBED_MODEL if config.EMBEDDING_BACKEND == "ollama" else ""
-        ),
+        "provider": active_provider,
+        "model": active_model,
         "entities_found": len(rows),
         "reindexed": reindexed,
         "failed": failed,
@@ -1574,7 +1587,8 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
         },
         "model_health": model_health,
         "embedding": {
-            "provider": str(embedding_cfg.get("active_provider") or getattr(config, "EMBEDDING_BACKEND", "unknown")),
+            "provider": _active_embedding_info()[0],
+            "model": _active_embedding_info()[1],
             "vectors": vector_count,
         },
         "timestamp": datetime.utcnow().isoformat(),
