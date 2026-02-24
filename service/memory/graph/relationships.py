@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Dict, List, Tuple
 
 from memory.models import Relationship
@@ -102,7 +102,7 @@ class RelationshipMixin:
                 """,
                 source=rel.source_entity,
                 target=rel.target_entity,
-                valid_at=rel.valid_at.isoformat() if rel.valid_at else datetime.utcnow().isoformat(),
+                valid_at=rel.valid_at.isoformat() if rel.valid_at else datetime.now(UTC).isoformat(),
             ).single()
 
             if existing:
@@ -115,7 +115,7 @@ class RelationshipMixin:
                             r.status = 'historical'
                         """,
                         id=existing["id"],
-                        new_valid_at=(rel.valid_at or datetime.utcnow()).isoformat(),
+                        new_valid_at=(rel.valid_at or datetime.now(UTC)).isoformat(),
                     )
                     return self._create_relationship(session, rel), "superseded"
 
@@ -146,7 +146,7 @@ class RelationshipMixin:
                         END
                     """,
                     id=existing["id"],
-                    now=datetime.utcnow().isoformat(),
+                    now=datetime.now(UTC).isoformat(),
                     new_snippets=rel.context_snippets,
                     new_episode_ids=rel.episode_ids,
                 )
@@ -238,7 +238,7 @@ class RelationshipMixin:
             tier=tier,
         )
 
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.now(UTC).isoformat()
         valid_at_iso = rel.valid_at.isoformat() if rel.valid_at else now_iso
         valid_until_iso = rel.valid_until.isoformat() if rel.valid_until else None
         observed_iso = rel.observed_at.isoformat()

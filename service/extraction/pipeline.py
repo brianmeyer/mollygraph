@@ -15,7 +15,7 @@ import math
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Any
 
 import config as service_config
@@ -172,7 +172,7 @@ class ExtractionPipeline:
         written_entity_names: list[str] = []
         try:
             job.status = "processing"
-            job.started_at = datetime.utcnow()
+            job.started_at = datetime.now(UTC)
 
             extracted = await asyncio.to_thread(gliner_extractor.extract, job.content, 0.4)
             raw_entities = extracted.get("entities", []) if isinstance(extracted, dict) else []
@@ -277,7 +277,7 @@ class ExtractionPipeline:
             job.extracted_entities = stored_entities
             job.extracted_relationships = relationships
             job.status = "completed"
-            job.completed_at = datetime.utcnow()
+            job.completed_at = datetime.now(UTC)
             job.error = None
 
             # ── Metrics logging ───────────────────────────────────────────────
@@ -339,7 +339,7 @@ class ExtractionPipeline:
             log.error("Extraction failed", exc_info=True)
             job.status = "failed"
             job.error = str(exc)
-            job.completed_at = datetime.utcnow()
+            job.completed_at = datetime.now(UTC)
 
             # Issue 3: Log partial graph writes so operators can reconcile.
             # We do not attempt Neo4j rollback (too complex); instead we mark
@@ -387,8 +387,8 @@ class ExtractionPipeline:
                     name=name,
                     entity_type=entity_type,
                     confidence=max(0.0, min(1.0, score)),
-                    first_mentioned=datetime.utcnow(),
-                    last_mentioned=datetime.utcnow(),
+                    first_mentioned=datetime.now(UTC),
+                    last_mentioned=datetime.now(UTC),
                     created_from_episode="pending",
                 )
             )

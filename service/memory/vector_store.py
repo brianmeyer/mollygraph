@@ -115,7 +115,7 @@ class SqliteVecBackend(VectorStoreBackend):
     
     def add_entity(self, entity_id: str, name: str, entity_type: str,
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
-        from datetime import datetime
+        from datetime import datetime, UTC
         
         self.db.execute(
             "INSERT OR REPLACE INTO dense_vectors (entity_id, embedding) VALUES (?, ?)",
@@ -129,7 +129,7 @@ class SqliteVecBackend(VectorStoreBackend):
             """INSERT OR REPLACE INTO entity_meta 
                (entity_id, name, entity_type, confidence, last_updated)
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_id, name, entity_type, confidence, datetime.utcnow().isoformat())
+            (entity_id, name, entity_type, confidence, datetime.now(UTC).isoformat())
         )
         self.db.commit()
     

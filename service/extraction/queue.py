@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import List, Optional, Callable
 from contextlib import contextmanager
@@ -131,7 +131,7 @@ class ExtractionQueue:
                     UPDATE jobs 
                     SET status = 'processing', started_at = ?
                     WHERE id = ? AND status = 'pending'
-                """, (datetime.utcnow().isoformat(), row['id']))
+                """, (datetime.now(UTC).isoformat(), row['id']))
                 
                 conn.commit()
                 
@@ -163,7 +163,7 @@ class ExtractionQueue:
                 WHERE id = ?
             """, (
                 status,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 error,
                 json.dumps(_serialize(result)) if result else None,
                 job_id

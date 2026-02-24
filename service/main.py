@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from typing import Any
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request, status
@@ -484,7 +484,7 @@ async def global_exception_handler(_request: Request, exc: Exception):
             error="Internal server error",
             code="INTERNAL_ERROR",
             detail=str(exc) if config.TEST_MODE else None,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
         ).model_dump(),
     )
 
@@ -496,7 +496,7 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
         content=ErrorResponse(
             error=str(exc.detail),
             code=f"HTTP_{exc.status_code}",
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
         ).model_dump(),
     )
 
@@ -578,7 +578,7 @@ async def metrics_retrieval(_api_key: str = Depends(verify_api_key)) -> dict[str
         "retrieval": get_retrieval_summary(),
         "recent_queries": get_recent_retrieval_queries(limit=10),
         "vector_store": vector_store.get_stats() if vector_store else {},
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -710,7 +710,7 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
         graph=graph_summary,
         relationship_type_distribution=rel_distribution,
         gliner_training=get_gliner_stats(),
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(UTC).isoformat(),
     )
 
 
@@ -745,7 +745,7 @@ async def ingest(
         content=content,
         source=source,
         priority=priority,
-        reference_time=datetime.utcnow(),
+        reference_time=datetime.now(UTC),
     )
     job_id = await asyncio.to_thread(queue.submit, job)
     queue_depth = await asyncio.to_thread(queue.get_pending_count)
@@ -770,7 +770,7 @@ async def get_entity(name: str, _api_key: str = Depends(verify_api_key)) -> Enti
         entity=name,
         facts=facts,
         context=context,
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(UTC).isoformat(),
     )
 
 
@@ -982,7 +982,7 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
         entities_found=entities,
         results=results,
         result_count=len(results),
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(UTC).isoformat(),
         reranked=reranked,
     )
 
@@ -1025,7 +1025,7 @@ async def audit_signals_stats(_api_key: str = Depends(verify_api_key)) -> dict[s
         "signal_counts": full_counts,
         "total_signals": total,
         "note": "Counts reset on service restart",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -1036,7 +1036,7 @@ async def suggestions_digest(_api_key: str = Depends(verify_api_key)) -> dict[st
     return {
         "digest": digest,
         "has_suggestions": bool(digest.strip()),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -1210,7 +1210,7 @@ async def trigger_maintenance(
     _api_key: str = Depends(verify_api_key),
 ) -> dict[str, Any]:
     background_tasks.add_task(run_maintenance_cycle)
-    return {"status": "maintenance_triggered", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "maintenance_triggered", "timestamp": datetime.now(UTC).isoformat()}
 
 
 @app.post("/maintenance/backfill-temporal", operation_id="post_maintenance_backfill_temporal")
@@ -1233,7 +1233,7 @@ async def backfill_temporal_properties(
     return {
         "status": "temporal_backfill_completed",
         "summary": _json_safe(summary),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -1280,7 +1280,7 @@ async def reconcile_vectors(
                 ),
                 "neo4j_entities": len(neo4j_ids),
                 "orphans_removed": 0,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
 
         # Step 3 – find orphan vectors (in vector store but not in Neo4j).
@@ -1309,7 +1309,7 @@ async def reconcile_vectors(
             "neo4j_entities": len(neo4j_ids),
             "orphans_found": len(orphan_ids),
             "orphans_removed": removed,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
     except Exception as exc:
@@ -1343,7 +1343,7 @@ async def maintenance_refresh_embeddings(
         return {
             "status": "ok",
             **result,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
     except Exception as exc:
         log.error("refresh-embeddings endpoint failed", exc_info=True)
@@ -1408,7 +1408,7 @@ async def maintenance_quality_check(
     return {
         "status": "passed" if results.get("passed") else "failed",
         "results": results,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -1431,7 +1431,7 @@ async def cleanup_training_data(
         return {
             "status": "ok",
             "result": result,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
     except Exception as exc:
         log.error("cleanup_training_data endpoint failed", exc_info=True)
@@ -1475,7 +1475,7 @@ async def training_runs(
         return {
             "runs": runs,
             "count": len(runs),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"training_runs_error: {exc}") from exc
@@ -1539,7 +1539,7 @@ async def trigger_nightly_maintenance(
     background_tasks.add_task(_nightly_bg)
     return {
         "status": "nightly_maintenance_triggered",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "sequence": ["llm_audit", "model_health_check", "stale_training_cleanup", "lora_pipeline"],
     }
 
@@ -1674,7 +1674,7 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
             "model": _active_embedding_info()[1],
             "vectors": vector_count,
         },
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 

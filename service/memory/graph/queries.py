@@ -1,7 +1,7 @@
 """Query/read operations for the bi-temporal graph."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Any, Dict, List, Optional
 
 
@@ -15,7 +15,7 @@ class QueryMixin:
             as_of: Point in time (default: now)
         """
         if as_of is None:
-            as_of = datetime.utcnow()
+            as_of = datetime.now(UTC)
         
         with self.driver.session() as session:
             # Handle mixed types: some valid_at are strings, some neo4j DateTime.
