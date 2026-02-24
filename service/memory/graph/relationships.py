@@ -221,64 +221,93 @@ class RelationshipMixin:
         return False
 
     def _create_relationship(self, session, rel: Relationship) -> str:
-        """Create a new relationship edge."""
+        """Create (or idempotently upsert) a relationship edge.
+
+        Uses MERGE instead of CREATE so that two concurrent workers racing
+        on the same (head, rel_type, tail) triple will converge to a single
+        edge rather than producing a duplicate.  ON CREATE initialises all
+        properties; ON MATCH increments mention_count to account for the
+        concurrent write (Issue 4).
+        """
         rel_id = str(uuid.uuid4())
-        
+
         tier = _tier_for_rel_type(rel.relation_type)
         strength = calculate_strength(
             mention_count=rel.mention_count,
             days_since=0,
-            tier=tier
+            tier=tier,
         )
-        
-        # Note: Relationship type cannot be parameterized in Cypher CREATE.
-        # Use MERGE on entities first, then verify both exist before creating edge.
-        result = session.run(f"""
+
+        now_iso = datetime.utcnow().isoformat()
+        valid_at_iso = rel.valid_at.isoformat() if rel.valid_at else now_iso
+        valid_until_iso = rel.valid_until.isoformat() if rel.valid_until else None
+        observed_iso = rel.observed_at.isoformat()
+
+        # Relationship type cannot be parameterised in Cypher — the f-string
+        # is safe because relation_type is already validated by _is_valid_rel_type
+        # (regex + allowlist) before this method is called.
+        result = session.run(
+            f"""
             MATCH (a:Entity {{name: $source}}), (b:Entity {{name: $target}})
-            CREATE (a)-[r:{rel.relation_type} {{
-                id: $id,
-                valid_at: datetime($valid_at),
-                valid_until: $valid_until,
-                valid_from: datetime($valid_at),
-                valid_to: NULL,
-                observed_at: datetime($observed_at),
-                first_mentioned: datetime($first_mentioned),
-                last_mentioned: datetime($last_mentioned),
-                confidence: $confidence,
-                strength: $strength,
-                mention_count: $mention_count,
-                context_snippets: $context_snippets,
-                episode_ids: $episode_ids,
-                audit_status: $audit_status
-            }}]->(b)
+            MERGE (a)-[r:{rel.relation_type}]->(b)
+            ON CREATE SET
+                r.id             = $id,
+                r.valid_at       = datetime($valid_at),
+                r.valid_until    = $valid_until,
+                r.valid_from     = datetime($valid_at),
+                r.valid_to       = NULL,
+                r.observed_at    = datetime($observed_at),
+                r.first_mentioned = datetime($first_mentioned),
+                r.last_mentioned = datetime($last_mentioned),
+                r.confidence     = $confidence,
+                r.strength       = $strength,
+                r.mention_count  = $mention_count,
+                r.context_snippets = $context_snippets,
+                r.episode_ids    = $episode_ids,
+                r.audit_status   = $audit_status
+            ON MATCH SET
+                r.mention_count  = coalesce(r.mention_count, 0) + 1,
+                r.strength       = coalesce(r.strength, 0.0) + log(1 + coalesce(r.mention_count, 1)),
+                r.last_mentioned = datetime($last_mentioned),
+                r.context_snippets = CASE
+                    WHEN size(coalesce(r.context_snippets, [])) >= 3
+                    THEN coalesce(r.context_snippets, [])[1..] + $context_snippets
+                    ELSE coalesce(r.context_snippets, []) + $context_snippets
+                END,
+                r.episode_ids = coalesce(r.episode_ids, []) + [
+                    eid IN $episode_ids WHERE NOT eid IN coalesce(r.episode_ids, [])
+                ]
             RETURN r.id AS created_id
-        """, 
+            """,
             source=rel.source_entity,
             target=rel.target_entity,
-            type=rel.relation_type,
             id=rel_id,
-            valid_at=rel.valid_at.isoformat() if rel.valid_at else datetime.utcnow().isoformat(),
-            valid_until=rel.valid_until.isoformat() if rel.valid_until else None,
-            observed_at=rel.observed_at.isoformat(),
-            first_mentioned=rel.observed_at.isoformat(),
-            last_mentioned=rel.observed_at.isoformat(),
+            valid_at=valid_at_iso,
+            valid_until=valid_until_iso,
+            observed_at=observed_iso,
+            first_mentioned=observed_iso,
+            last_mentioned=observed_iso,
             confidence=rel.confidence,
             strength=strength,
             mention_count=rel.mention_count,
             context_snippets=rel.context_snippets,
             episode_ids=rel.episode_ids,
-            audit_status=rel.audit_status
+            audit_status=rel.audit_status,
         )
-        
+
         record = result.single()
         if record is None:
             log.warning(
                 "Relationship not created — missing entity: '%s' -[%s]-> '%s'",
-                rel.source_entity, rel.relation_type, rel.target_entity,
+                rel.source_entity,
+                rel.relation_type,
+                rel.target_entity,
             )
             return ""
-        
-        return rel_id
+
+        # Return the id that is actually on the edge (may be a pre-existing id
+        # if a concurrent worker won the MERGE race).
+        return str(record["created_id"])
 
     def _maybe_log_related_to_hotspot(self, source: str, target: str, relationship_id: str) -> None:
         """Emit suggestion signal when RELATED_TO reaches hotspot threshold."""

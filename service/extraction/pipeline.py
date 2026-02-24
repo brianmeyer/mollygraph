@@ -135,10 +135,41 @@ class ExtractionPipeline:
         embedding = self._text_embedding(query)
         return self.vector_store.similarity_search(embedding, top_k=top_k)
 
+    def _mark_episode_incomplete(self, episode_id: str, reason: str = "") -> None:
+        """Mark a Neo4j episode node as incomplete after a mid-job failure.
+
+        This makes partial writes visible so operators can reconcile or retry
+        without creating silent duplicates.
+        """
+        try:
+            with self.graph.driver.session() as session:
+                session.run(
+                    """
+                    MATCH (ep:Episode {id: $episode_id})
+                    SET ep.incomplete = true,
+                        ep.incomplete_reason = $reason,
+                        ep.incomplete_at = datetime()
+                    """,
+                    episode_id=episode_id,
+                    reason=reason[:500],
+                )
+            log.info("Marked episode %s as incomplete (mid-job failure)", episode_id)
+        except Exception:
+            log.warning(
+                "Failed to mark episode %s as incomplete — manual reconciliation required",
+                episode_id,
+                exc_info=True,
+            )
+
     async def process_job(self, job: ExtractionJob) -> ExtractionJob:
         _t_start = time.perf_counter()
         embedding_time_ms = 0.0
         vector_store_time_ms = 0.0
+        # Track partial writes so we can reconcile on failure (Issue 3).
+        # These are initialised before the try block so the except clause can
+        # reference them regardless of how far processing got.
+        episode_id_written: str | None = None
+        written_entity_names: list[str] = []
         try:
             job.status = "processing"
             job.started_at = datetime.utcnow()
@@ -163,6 +194,7 @@ class ExtractionPipeline:
                 entity_id, _ = self.graph.upsert_entity(entity)
                 canonical_names[self._normalize(entity.name)] = entity.name
                 stored_entities.append(entity)
+                written_entity_names.append(entity.name)  # track for failure reconciliation
 
                 # Keep vector index in sync with graph entities.
                 _embed_start = time.perf_counter()
@@ -202,6 +234,7 @@ class ExtractionPipeline:
                 entities_extracted=[entity.name for entity in stored_entities],
             )
             self.graph.create_episode(episode)
+            episode_id_written = episode.id  # track for failure reconciliation
 
             # Embed episode into vector store for semantic search
             try:
@@ -307,6 +340,25 @@ class ExtractionPipeline:
             job.status = "failed"
             job.error = str(exc)
             job.completed_at = datetime.utcnow()
+
+            # Issue 3: Log partial graph writes so operators can reconcile.
+            # We do not attempt Neo4j rollback (too complex); instead we mark
+            # the episode as incomplete so queries and training can filter it.
+            if episode_id_written is not None or written_entity_names:
+                log.warning(
+                    "Partial graph write — episode=%s entities=%s — marking incomplete for reconciliation",
+                    episode_id_written,
+                    written_entity_names,
+                    extra={
+                        "job_id": getattr(job, "id", "unknown"),
+                        "episode_id": episode_id_written,
+                        "written_entities": written_entity_names,
+                        "error": str(exc),
+                    },
+                )
+                if episode_id_written is not None:
+                    self._mark_episode_incomplete(episode_id_written, reason=str(exc))
+
             return job
 
     def _build_entities(self, raw_entities: list[dict[str, Any]]) -> list[Entity]:

@@ -125,6 +125,10 @@ pipeline: ExtractionPipeline | None = None
 queue: ExtractionQueue | None = None
 queue_worker: QueueWorker | None = None
 _worker_task: asyncio.Task | None = None
+# Tracks how many times the worker has been auto-restarted since it last ran
+# cleanly.  Reset to 0 whenever we observe the task running; incremented each
+# time we attempt a restart so we don't spin-restart a persistently broken worker.
+_worker_restart_count: int = 0
 
 
 class ErrorResponse(BaseModel):
@@ -485,16 +489,64 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    global _worker_task, _worker_restart_count
+
     queue_pending = await asyncio.to_thread(queue.get_pending_count) if queue else 0
     queue_processing = await asyncio.to_thread(queue.get_processing_count) if queue else 0
+
+    # Issue 5: Check worker task liveness; auto-restart once if it has crashed.
+    worker_status = "running"
+    worker_error: str | None = None
+
+    if _worker_task is None:
+        worker_status = "not_started"
+    elif _worker_task.done():
+        # Extract crash reason (exception() raises CancelledError for cancelled tasks).
+        try:
+            exc = _worker_task.exception()
+            worker_error = str(exc) if exc else "task exited unexpectedly"
+        except asyncio.CancelledError:
+            worker_error = "task was cancelled"
+        except Exception as meta_exc:
+            worker_error = f"could not retrieve exception: {meta_exc}"
+
+        worker_status = "degraded"
+        log.error("Worker task is no longer running: %s", worker_error)
+
+        # Auto-restart once per death event.  Once a new task is running the
+        # restart count is reset to 0 so a future crash can be retried too.
+        if queue_worker is not None and _worker_restart_count < 1:
+            try:
+                log.warning("Attempting automatic worker restart (attempt #%d)", _worker_restart_count + 1)
+                _worker_task = asyncio.create_task(queue_worker.start())
+                _worker_restart_count += 1
+                worker_status = "restarting"
+                log.info("Worker restarted successfully")
+            except Exception as restart_exc:
+                log.error("Worker auto-restart failed: %s", restart_exc, exc_info=True)
+                worker_status = "degraded"
+        else:
+            log.error(
+                "Worker is degraded and restart limit reached (%d); manual intervention required",
+                _worker_restart_count,
+            )
+    else:
+        # Task is alive — reset restart counter so the next crash gets a retry.
+        _worker_restart_count = 0
+
+    overall_status = "degraded" if worker_status == "degraded" else "healthy"
+
     return {
-        "status": "healthy",
+        "status": overall_status,
         "version": "1.0.0",
         "port": config.PORT,
         "test_mode": config.TEST_MODE,
         "queue_pending": queue_pending,
         "queue_processing": queue_processing,
         "vector_stats": vector_store.get_stats() if vector_store else {},
+        "worker_status": worker_status,
+        "worker_error": worker_error,
+        "worker_restart_count": _worker_restart_count,
     }
 
 
