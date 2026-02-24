@@ -7,6 +7,7 @@ pydantic==2.*
 python-dotenv==1.*
 pyyaml==6.*
 gliner2
+glirel
 zvec
 sqlite-vec
 numpy
