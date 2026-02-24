@@ -47,16 +47,28 @@ def _get_allowed_rel_types() -> frozenset[str]:
     """Derive allowed relation type labels from the active extractor schema.
 
     Returns labels as normalized lowercase strings (matching the training record format).
-    Falls back to empty frozenset (= allow all) if schema cannot be loaded.
+    Falls back to VALID_REL_TYPES from graph constants when the extractor schema
+    cannot be loaded, ensuring training examples are always schema-filtered.
+    Returns empty frozenset (= allow all) only as a last resort.
     """
     try:
         from extractor_schema_registry import get_effective_extractor_schema
 
         schema = get_effective_extractor_schema()
         rels = schema.get("relations") or {}
-        return frozenset(
-            str(k).strip().lower().replace("_", " ") for k in rels if k
-        )
+        if rels:
+            return frozenset(
+                str(k).strip().lower().replace("_", " ") for k in rels if k
+            )
+    except Exception:
+        pass
+    # Fall back to the hardcoded VALID_REL_TYPES from graph constants so that
+    # training examples are always schema-filtered even when the extractor
+    # schema registry is unavailable.
+    try:
+        from memory.graph.constants import VALID_REL_TYPES
+
+        return frozenset(k.strip().lower().replace("_", " ") for k in VALID_REL_TYPES)
     except Exception:
         pass
     return frozenset()
