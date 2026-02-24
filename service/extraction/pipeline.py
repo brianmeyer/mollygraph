@@ -1060,8 +1060,24 @@ class ExtractionPipeline:
         return cls._embedding_model
 
     @classmethod
-    def _text_embedding(cls, text: str, dim: int = 768) -> list[float]:
-        """Embed text using the configured tier chain (sentence-transformers / ollama / cloud / hash)."""
+    def _text_embedding(cls, text: str, dim: int = 768, _depth: int = 0) -> list[float]:
+        """Embed text using the configured tier chain (sentence-transformers / ollama / cloud / hash).
+
+        ``_depth`` is an internal recursion guard — callers should not pass it.
+        Each tier failure increments the depth; if it exceeds the number of
+        configured tiers a RuntimeError is raised instead of looping forever.
+        """
+        tier_order = getattr(
+            service_config,
+            "EMBEDDING_TIER_ORDER",
+            ["sentence-transformers", "ollama", "cloud", "hash"],
+        )
+        if _depth > len(tier_order):
+            raise RuntimeError(
+                f"_text_embedding: recursion depth {_depth} exceeded tier count "
+                f"{len(tier_order)}; all embedding tiers exhausted"
+            )
+
         model = cls._get_embedding_model()
 
         if model == "ollama":
@@ -1082,7 +1098,7 @@ class ExtractionPipeline:
                 log.warning("Ollama embedding call failed: %s — marking tier failed, trying next", exc)
                 cls._embedding_model = None
                 cls._embedding_failed_tiers.add("ollama")
-                return cls._text_embedding(text, dim)
+                return cls._text_embedding(text, dim, _depth + 1)
 
         if isinstance(model, str) and model.startswith("cloud:"):
             _, provider, cloud_model = model.split(":", 2)
@@ -1106,7 +1122,7 @@ class ExtractionPipeline:
                 log.warning("Cloud embedding (%s) call failed: %s — marking tier failed, trying next", provider, exc)
                 cls._embedding_model = None
                 cls._embedding_failed_tiers.add("cloud")
-                return cls._text_embedding(text, dim)
+                return cls._text_embedding(text, dim, _depth + 1)
 
         if model != "hash":
             # sentence-transformers model object
@@ -1119,7 +1135,7 @@ class ExtractionPipeline:
                 )
                 cls._embedding_model = None
                 cls._embedding_failed_tiers.add(cls._embedding_active_tier or "sentence-transformers")
-                return cls._text_embedding(text, dim)
+                return cls._text_embedding(text, dim, _depth + 1)
 
         # Hash fallback — deterministic, never fails
         tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
