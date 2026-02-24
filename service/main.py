@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import config
 from metrics.stats_logger import (
@@ -57,7 +57,7 @@ from metrics.model_health import model_health_monitor
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
 from maintenance.auditor import run_maintenance_cycle
-from memory.graph import BiTemporalGraph
+from memory.graph import BiTemporalGraph, VALID_REL_TYPES
 from memory import extractor as memory_extractor
 from memory.graph_suggestions import build_suggestion_digest
 from memory.models import ExtractionJob
@@ -206,6 +206,16 @@ class DeleteRelationshipRequest(BaseModel):
     source: str
     target: str
     rel_type: str | None = None
+
+    @field_validator("rel_type")
+    @classmethod
+    def validate_rel_type(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        normalized = v.strip().upper().replace(" ", "_")
+        if normalized not in VALID_REL_TYPES:
+            raise ValueError(f"Unknown rel_type '{v}'. Must be one of: {sorted(VALID_REL_TYPES)}")
+        return normalized
 
 
 class PruneRequest(BaseModel):
@@ -523,6 +533,8 @@ async def health() -> dict[str, Any]:
 
     queue_pending = await asyncio.to_thread(queue.get_pending_count) if queue else 0
     queue_processing = await asyncio.to_thread(queue.get_processing_count) if queue else 0
+    queue_stuck = await asyncio.to_thread(queue.get_stuck_count) if queue else 0
+    queue_dead = await asyncio.to_thread(queue.get_dead_count) if queue else 0
 
     # Issue 5: Check worker task liveness; auto-restart once if it has crashed.
     worker_status = "running"
@@ -573,6 +585,8 @@ async def health() -> dict[str, Any]:
         "test_mode": config.TEST_MODE,
         "queue_pending": queue_pending,
         "queue_processing": queue_processing,
+        "queue_stuck": queue_stuck,
+        "queue_dead": queue_dead,
         "vector_stats": vector_store.get_stats() if vector_store else {},
         "worker_status": worker_status,
         "worker_error": worker_error,
@@ -698,6 +712,8 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     queue_stats = {
         "pending": await asyncio.to_thread(queue.get_pending_count) if queue else 0,
         "processing": await asyncio.to_thread(queue.get_processing_count) if queue else 0,
+        "stuck": await asyncio.to_thread(queue.get_stuck_count) if queue else 0,
+        "dead": await asyncio.to_thread(queue.get_dead_count) if queue else 0,
     }
 
     vector_stats = vector_store.get_stats() if vector_store else {}

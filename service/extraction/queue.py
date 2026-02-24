@@ -58,9 +58,17 @@ class ExtractionQueue:
                     started_at TEXT,
                     completed_at TEXT,
                     error TEXT,
-                    result_json TEXT
+                    result_json TEXT,
+                    retry_count INTEGER DEFAULT 0
                 )
             """)
+
+            # Migration: add retry_count column to existing databases.
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN retry_count INTEGER DEFAULT 0")
+                conn.commit()
+            except Exception:
+                pass  # Column already exists — no-op
             
             # Index for efficient queue polling
             conn.execute("""
@@ -103,15 +111,47 @@ class ExtractionQueue:
         log.debug(f"Job {job.id} submitted (priority={job.priority})")
         return job.id
     
+    _STUCK_JOB_TIMEOUT_SECONDS: int = 300   # jobs processing > 5 min are considered stuck
+    _MAX_RETRIES: int = 3                    # jobs retried ≥ this many times become 'dead'
+
     def claim_next(self, timeout: float = 5.0) -> Optional[ExtractionJob]:
         """
         Atomically claim the next pending job.
         Uses SELECT FOR UPDATE pattern for concurrency safety.
+
+        Before claiming, resets any stuck 'processing' jobs whose worker died:
+        - Jobs in 'processing' with started_at older than STUCK_JOB_TIMEOUT_SECONDS
+          are reset to 'pending' (retry_count incremented).
+        - Jobs that have exceeded MAX_RETRIES are moved to 'dead' instead.
         """
         with self._get_conn() as conn:
-            # Begin immediate transaction for write lock
+            # ── Step 1: Reset stuck processing jobs ──────────────────────────
             conn.execute("BEGIN IMMEDIATE")
-            
+            try:
+                result = conn.execute("""
+                    UPDATE jobs
+                    SET status = CASE
+                            WHEN COALESCE(retry_count, 0) + 1 >= ? THEN 'dead'
+                            ELSE 'pending'
+                        END,
+                        retry_count = COALESCE(retry_count, 0) + 1
+                    WHERE status = 'processing'
+                      AND started_at IS NOT NULL
+                      AND started_at < datetime('now', '-' || ? || ' seconds')
+                """, (self._MAX_RETRIES, self._STUCK_JOB_TIMEOUT_SECONDS))
+                if result.rowcount:
+                    log.warning(
+                        "Reset %d stuck processing job(s) (timeout=%ds, max_retries=%d)",
+                        result.rowcount, self._STUCK_JOB_TIMEOUT_SECONDS, self._MAX_RETRIES,
+                    )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                log.warning("Failed to reset stuck jobs: %s", e)
+
+            # ── Step 2: Claim the next pending job ────────────────────────────
+            conn.execute("BEGIN IMMEDIATE")
+
             try:
                 # Find highest priority, oldest pending job
                 cursor = conn.execute("""
@@ -185,7 +225,29 @@ class ExtractionQueue:
                 "SELECT COUNT(*) FROM jobs WHERE status = 'processing'"
             )
             return cursor.fetchone()[0]
-    
+
+    def get_stuck_count(self) -> int:
+        """Get count of jobs stuck in 'processing' beyond the timeout threshold."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE status = 'processing'
+                  AND started_at IS NOT NULL
+                  AND started_at < datetime('now', '-' || ? || ' seconds')
+                """,
+                (self._STUCK_JOB_TIMEOUT_SECONDS,),
+            )
+            return cursor.fetchone()[0]
+
+    def get_dead_count(self) -> int:
+        """Get count of jobs that exhausted all retries and are permanently dead."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'dead'"
+            )
+            return cursor.fetchone()[0]
+
     def get_recent_jobs(self, limit: int = 100) -> List[ExtractionJob]:
         """Get recent jobs for monitoring."""
         with self._get_conn() as conn:
