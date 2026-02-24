@@ -422,134 +422,28 @@ def _adopt_rel_type(rel_type: str) -> bool:
         return False
 
 
-_GLIREL_SYNONYMS_PATH = Path.home() / ".graph-memory" / "glirel_synonyms.json"
-
-# Hand-crafted overrides for common relation types.  The deterministic
-# generator handles the rest automatically.
-_SYNONYM_OVERRIDES: dict[str, list[str]] = {
-    "works at": ["works at", "employed at", "employee of", "works for"],
-    "works on": ["works on", "working on", "contributing to", "involved in"],
-    "located in": ["located in", "based in", "situated in", "found in"],
-    "related to": ["related to", "connected to", "associated with", "linked to"],
-    "knows": ["knows", "is acquainted with", "is familiar with"],
-    "uses": ["uses", "utilizes", "makes use of", "employs"],
-    "created": ["created", "authored", "built", "made"],
-    "manages": ["manages", "is manager of", "leads", "oversees"],
-    "advises": ["advises", "advisor to", "counsels", "gives advice to"],
-    "mentors": ["mentors", "mentor of", "coaches", "guides"],
-    "depends on": ["depends on", "relies on", "requires", "is dependent on"],
-    "mentions": ["mentions", "references", "cites", "refers to"],
-    "interested in": ["interested in", "enthusiast of", "passionate about"],
-    "discussed with": ["discussed with", "talked about with", "spoke about with"],
-    "created by": ["created by", "authored by", "built by", "made by"],
-    "owned by": ["owned by", "belongs to", "property of"],
-    "reports to": ["reports to", "managed by", "answers to", "works under"],
-    "collaborates with": ["collaborates with", "works with", "partners with"],
-    "invested in": ["invested in", "funded", "backed", "supported financially"],
-    "founded": ["founded", "co-founded", "established", "started"],
-}
-
-
-def _generate_synonyms(relation_name: str) -> list[str]:
-    """Deterministically generate 2-4 natural-language phrasings for a relation.
-
-    Args:
-        relation_name: Normalised lowercase form with spaces, e.g. ``'works at'``.
-
-    Returns:
-        List of synonym strings (2-4 entries, deduped).
-    """
-    name = relation_name.strip().lower()
-
-    if name in _SYNONYM_OVERRIDES:
-        return _SYNONYM_OVERRIDES[name]
-
-    # Build generic variants from the words in the label
-    words = name.split()
-    synonyms: list[str] = [name]   # always include the label itself
-
-    if len(words) == 1:
-        verb = words[0]
-        # simple verb → add "is <verb>ed by" and "<verb>er of" variants
-        if verb.endswith("e"):
-            synonyms.append(f"{verb}d by")       # "advise" → "advised by"
-            synonyms.append(f"{verb}r of")        # "advise" → "adviser of"
-        else:
-            synonyms.append(f"{verb}ed by")
-            synonyms.append(f"{verb}er of")
-    elif len(words) == 2:
-        verb, prep = words
-        synonyms.append(f"{verb}s {prep}")        # e.g. "work at" → "works at"
-        if prep in {"at", "for"}:
-            synonyms.append(f"employed {prep}")
-        elif prep == "in":
-            synonyms.append(f"based in")
-        elif prep == "to":
-            synonyms.append(f"connected to")
-        elif prep == "with":
-            synonyms.append(f"associated with")
-    else:
-        # Multi-word: add a "X of" style and "is X" prefix variant
-        synonyms.append(f"is {name}")
-        synonyms.append(f"has {name}")
-
-    # Dedup while preserving order, cap at 4
-    seen: set[str] = set()
-    clean: list[str] = []
-    for s in synonyms:
-        s = s.strip()
-        if s and s not in seen:
-            seen.add(s)
-            clean.append(s)
-    return clean[:4]
-
-
 def _persist_glirel_synonyms_for_relation(relation_name: str) -> None:
-    """Generate and write GLiREL synonym phrasings for a newly adopted relation.
+    """Generate and persist GLiREL synonym phrasings for a newly approved relation.
 
-    The synonym store lives at ``~/.graph-memory/glirel_synonyms.json`` and is
-    keyed by uppercase relation type (e.g. ``"WORKS_AT"``).  The GLiREL
-    enrichment layer merges this file with its built-in defaults at inference
-    time (``GLiRELEnrichment._effective_synonym_groups()``).
+    Delegates to ``extraction.glirel_synonyms.add_synonym_group`` which writes
+    the canonical JSON store at ``~/.graph-memory/glirel_synonyms.json``.
+    ``GLiRELEnrichment._effective_synonym_groups()`` merges that file with the
+    built-in defaults at inference time so no restart is required.
 
-    This function is non-fatal: if the file cannot be read or written the
-    adoption still completes — GLiREL will fall back to built-in synonyms.
+    This function is non-fatal: if the import or write fails, adoption still
+    completes and GLiREL will fall back to built-in synonym defaults.
 
     Args:
         relation_name: Lowercase natural-language form, e.g. ``'works at'``.
     """
     try:
-        name = relation_name.strip().lower()
-        rel_key = name.upper().replace(" ", "_")   # canonical key: "WORKS_AT"
+        try:
+            from extraction.glirel_synonyms import add_synonym_group
+        except ImportError:
+            from glirel_synonyms import add_synonym_group  # type: ignore[no-redef]
 
-        # Load existing synonyms (best-effort)
-        synonyms_map: dict[str, list[str]] = {}
-        if _GLIREL_SYNONYMS_PATH.exists():
-            try:
-                with _GLIREL_SYNONYMS_PATH.open("r", encoding="utf-8") as fh:
-                    payload = json.load(fh)
-                if isinstance(payload, dict):
-                    synonyms_map = payload
-            except Exception:
-                log.debug("glirel_synonyms.json unreadable — starting fresh", exc_info=True)
-
-        if rel_key in synonyms_map:
-            # Already present — nothing to do
-            log.debug("GLiREL synonyms for '%s' already recorded, skipping", rel_key)
-            return
-
-        synonyms = _generate_synonyms(name)
-        synonyms_map[rel_key] = synonyms
-
-        _GLIREL_SYNONYMS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _GLIREL_SYNONYMS_PATH.open("w", encoding="utf-8") as fh:
-            json.dump(synonyms_map, fh, indent=2, ensure_ascii=False)
-
-        log.info(
-            "GLiREL synonyms written for '%s': %s",
-            rel_key,
-            ", ".join(f'"{s}"' for s in synonyms),
-        )
+        add_synonym_group(relation_name)
+        log.info("GLiREL synonyms persisted for auto-adopted relation: '%s'", relation_name)
     except Exception:
         # Non-fatal — GLiREL will still work with its built-in defaults.
         log.debug(
