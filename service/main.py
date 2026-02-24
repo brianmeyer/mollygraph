@@ -66,12 +66,16 @@ from runtime_vector_store import set_vector_store_instance
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps({
+        entry = {
             "timestamp": self.formatTime(record),
             "level": record.levelname,
             "message": record.getMessage(),
             "module": record.module,
-        })
+        }
+        if record.exc_info and record.exc_info[1] is not None:
+            import traceback
+            entry["traceback"] = "".join(traceback.format_exception(*record.exc_info))
+        return json.dumps(entry)
 
 
 _handler = logging.StreamHandler()

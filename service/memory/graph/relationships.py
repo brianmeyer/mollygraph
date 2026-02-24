@@ -206,6 +206,15 @@ class RelationshipMixin:
 
         if existing_valid is None:
             return False
+
+        # Normalize timezone awareness for safe subtraction
+        if new.valid_at and existing_valid:
+            from datetime import timezone as _tz
+            if new.valid_at.tzinfo is not None and existing_valid.tzinfo is None:
+                existing_valid = existing_valid.replace(tzinfo=_tz.utc)
+            elif new.valid_at.tzinfo is None and existing_valid.tzinfo is not None:
+                existing_valid = existing_valid.replace(tzinfo=None)
+
         if new.valid_at and (new.valid_at - existing_valid).days > 30:
             return True
         
