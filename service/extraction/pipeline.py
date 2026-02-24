@@ -20,6 +20,7 @@ from datetime import datetime, UTC
 from typing import Any
 
 import config as service_config
+from extraction.glirel_enrichment import GLiRELEnrichment
 from memory.models import Entity, Episode, ExtractionJob, Relationship
 from memory.graph import BiTemporalGraph
 from memory.vector_store import VectorStore
@@ -207,6 +208,7 @@ class ExtractionPipeline:
     def __init__(self, graph: BiTemporalGraph, vector_store: VectorStore):
         self.graph = graph
         self.vector_store = vector_store
+        self._glirel_enrichment = GLiRELEnrichment()
         self._spacy_nlp: Any | None = None
         self._spacy_attempted = False
         # Give the graph access to the vector store so entity merge/delete
@@ -248,6 +250,10 @@ class ExtractionPipeline:
         _t_start = time.perf_counter()
         embedding_time_ms = 0.0
         vector_store_time_ms = 0.0
+        glirel_relations_found = 0
+        glirel_overrides = 0
+        glirel_additions = 0
+        glirel_training_examples = 0
         # Track partial writes so we can reconcile on failure (Issue 3).
         # These are initialised before the try block so the except clause can
         # reference them regardless of how far processing got.
@@ -307,8 +313,48 @@ class ExtractionPipeline:
                 except Exception:
                     log.debug("Vector index upsert failed for %s", entity.name, exc_info=True)
 
+            raw_relations_with_source: list[dict[str, Any]] = [
+                {**rel, "source": str(rel.get("source") or "gliner2").strip().lower() or "gliner2"}
+                for rel in raw_relations
+                if isinstance(rel, dict)
+            ]
+            if service_config.GLIREL_ENABLED:
+                try:
+                    glirel_relations = await asyncio.to_thread(
+                        self._glirel_enrichment.enrich_relations,
+                        job.content,
+                        raw_entities,
+                    )
+                    glirel_relations_found = len(glirel_relations)
+                    (
+                        raw_relations_with_source,
+                        glirel_overrides,
+                        glirel_additions,
+                    ) = self._merge_glirel_relations(
+                        base_relations=raw_relations_with_source,
+                        glirel_relations=glirel_relations,
+                        canonical_names=canonical_names,
+                    )
+
+                    training_examples = await asyncio.to_thread(
+                        self._glirel_enrichment.generate_training_examples,
+                        job.content,
+                        glirel_relations,
+                    )
+                    glirel_training_examples = len(training_examples)
+                    if training_examples:
+                        await asyncio.to_thread(
+                            self._glirel_enrichment.persist_training_examples,
+                            training_examples,
+                        )
+                except Exception:
+                    log.warning(
+                        "GLiREL enrichment failed; continuing with GLiNER2-only relations",
+                        exc_info=True,
+                    )
+
             relationships, fallback_count = self._build_relationships(
-                raw_relations=raw_relations,
+                raw_relations=raw_relations_with_source,
                 canonical_names=canonical_names,
                 reference_time=job.reference_time,
                 context=job.content,
@@ -365,6 +411,10 @@ class ExtractionPipeline:
 
             job.extracted_entities = stored_entities
             job.extracted_relationships = relationships
+            job.glirel_relations_found = glirel_relations_found
+            job.glirel_overrides = glirel_overrides
+            job.glirel_additions = glirel_additions
+            job.glirel_training_examples = glirel_training_examples
             job.status = "completed"
             job.completed_at = datetime.now(UTC)
             job.error = None
@@ -387,6 +437,10 @@ class ExtractionPipeline:
                     "entities": len(stored_entities),
                     "relationships": len(relationships),
                     "fallbacks": fallback_count,
+                    "glirel_relations_found": glirel_relations_found,
+                    "glirel_overrides": glirel_overrides,
+                    "glirel_additions": glirel_additions,
+                    "glirel_training_examples": glirel_training_examples,
                     "conf_min": round(conf_min, 4),
                     "conf_max": round(conf_max, 4),
                     "conf_avg": round(conf_avg, 4),
@@ -462,6 +516,88 @@ class ExtractionPipeline:
 
             return job
 
+    def _merge_glirel_relations(
+        self,
+        base_relations: list[dict[str, Any]],
+        glirel_relations: list[dict[str, Any]],
+        canonical_names: dict[str, str],
+    ) -> tuple[list[dict[str, Any]], int, int]:
+        """Merge GLiREL second-pass output into GLiNER2 relations.
+
+        Rules:
+        - GLiREL relations with confidence > threshold override GLiNER2 for the same pair.
+        - GLiREL relations above threshold for unseen pairs are added.
+        """
+        if not glirel_relations:
+            return base_relations, 0, 0
+
+        threshold = float(getattr(service_config, "GLIREL_CONFIDENCE_THRESHOLD", 0.5))
+        base_pairs: set[tuple[str, str]] = set()
+        for rel in base_relations:
+            head = self._canonicalize_name(str(rel.get("head") or ""), canonical_names)
+            tail = self._canonicalize_name(str(rel.get("tail") or ""), canonical_names)
+            if not head or not tail or self._normalize(head) == self._normalize(tail):
+                continue
+            base_pairs.add((self._normalize(head), self._normalize(tail)))
+
+        glirel_best_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+        for rel in glirel_relations:
+            if not isinstance(rel, dict):
+                continue
+            confidence = self._safe_float(rel.get("confidence"), default=0.0)
+            if confidence <= threshold:
+                continue
+
+            head = self._canonicalize_name(str(rel.get("head") or ""), canonical_names)
+            tail = self._canonicalize_name(str(rel.get("tail") or ""), canonical_names)
+            rel_type = str(rel.get("rel_type") or "").strip()
+            if not head or not tail or not rel_type:
+                continue
+            if self._normalize(head) == self._normalize(tail):
+                continue
+
+            pair = (self._normalize(head), self._normalize(tail))
+            existing = glirel_best_by_pair.get(pair)
+            if existing and self._safe_float(existing.get("score"), default=0.0) >= confidence:
+                continue
+
+            glirel_best_by_pair[pair] = {
+                "head": head,
+                "tail": tail,
+                "label": rel_type,
+                "score": confidence,
+                "source": "glirel",
+            }
+
+        if not glirel_best_by_pair:
+            return base_relations, 0, 0
+
+        merged_base: list[dict[str, Any]] = []
+        for rel in base_relations:
+            head = self._canonicalize_name(str(rel.get("head") or ""), canonical_names)
+            tail = self._canonicalize_name(str(rel.get("tail") or ""), canonical_names)
+            if head and tail:
+                pair = (self._normalize(head), self._normalize(tail))
+                if pair in glirel_best_by_pair:
+                    continue
+            merged_base.append(
+                {
+                    **rel,
+                    "source": str(rel.get("source") or "gliner2").strip().lower() or "gliner2",
+                }
+            )
+
+        overrides = sum(1 for pair in glirel_best_by_pair if pair in base_pairs)
+        additions = sum(1 for pair in glirel_best_by_pair if pair not in base_pairs)
+        merged = merged_base + list(glirel_best_by_pair.values())
+        return merged, overrides, additions
+
+    def _canonicalize_name(self, name: str, canonical_names: dict[str, str]) -> str:
+        normalized = self._normalize(name)
+        if not normalized:
+            return ""
+        return canonical_names.get(normalized, name.strip())
+
     def _build_entities(self, raw_entities: list[dict[str, Any]]) -> list[Entity]:
         entities: list[Entity] = []
         seen: set[str] = set()
@@ -517,17 +653,17 @@ class ExtractionPipeline:
             if not source_raw or not target_raw:
                 continue
 
-            source = canonical_names.get(self._normalize(source_raw), source_raw)
-            target = canonical_names.get(self._normalize(target_raw), target_raw)
-            if source == target:
+            source_entity = canonical_names.get(self._normalize(source_raw), source_raw)
+            target_entity = canonical_names.get(self._normalize(target_raw), target_raw)
+            if source_entity == target_entity:
                 continue
 
             raw_rel = str(item.get("label") or "related to").strip()
             rel_type = self._normalize_rel_type(raw_rel)
             if rel_type not in _ALLOWED_REL_TYPES:
                 log_relationship_fallback(
-                    head=source,
-                    tail=target,
+                    head=source_entity,
+                    tail=target_entity,
                     original_type=raw_rel,
                     confidence=self._safe_float(item.get("score"), default=0.5),
                     context=context[:200],
@@ -535,20 +671,22 @@ class ExtractionPipeline:
                 rel_type = "RELATED_TO"
                 fallback_count += 1
 
-            dedupe_key = (source.lower(), rel_type, target.lower())
+            dedupe_key = (source_entity.lower(), rel_type, target_entity.lower())
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
 
             score = self._safe_float(item.get("score"), default=0.5)
+            relation_source = str(item.get("source") or "gliner2").strip().lower() or "gliner2"
             relationships.append(
                 Relationship(
-                    source_entity=source,
-                    target_entity=target,
+                    source_entity=source_entity,
+                    target_entity=target_entity,
                     relation_type=rel_type,
                     confidence=max(0.0, min(1.0, score)),
                     valid_at=reference_time,
                     context_snippets=[context[:200]],
+                    source=relation_source,
                     episode_ids=[],
                 )
             )
