@@ -110,14 +110,16 @@ EMBEDDING_CLOUD_PROVIDER = os.environ.get("MOLLYGRAPH_EMBEDDING_CLOUD_PROVIDER",
 EMBEDDING_CLOUD_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_CLOUD_MODEL", "text-embedding-3-small")
 # Legacy alias kept for backward compat
 OLLAMA_EMBED_MODEL = EMBEDDING_OLLAMA_MODEL
-EXTRACTOR_BACKEND = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "gliner2").strip().lower()
+_extractor_backend_raw = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "gliner2").strip().lower()
+if _extractor_backend_raw not in {"gliner2", "gliner"}:
+    import logging as _logging
+    _logging.getLogger(__name__).error(
+        "Unsupported MOLLYGRAPH_EXTRACTOR_BACKEND=%r — GLiNER2 is the only supported backend. "
+        "Overriding to 'gliner2'.",
+        _extractor_backend_raw,
+    )
+EXTRACTOR_BACKEND = "gliner2"
 EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
-EXTRACTOR_RELATION_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_MODEL", "Babelscape/rebel-large").strip()
-# Optional: force HF seq2seq relation extraction even when entity backend is
-# gliner2.  Set to "hf" or "rebel" to enable mixed-mode (gliner2 entities +
-# REBEL relations).  Leave empty to use the entity backend's native relation
-# extraction (default: gliner2 handles both).
-EXTRACTOR_RELATION_BACKEND = os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_BACKEND", "").strip().lower()
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")
