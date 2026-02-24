@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -409,10 +410,75 @@ def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
     }
 
 
+# ── PID file management ────────────────────────────────────────────────────────
+_PID_FILE = config.GRAPH_MEMORY_DIR / "mollygraph.pid"
+
+
+def _check_pid_conflict() -> None:
+    """Abort startup if another MollyGraph instance is already running.
+
+    Reads the PID file at ``~/.graph-memory/mollygraph.pid``:
+    - If the file exists and the recorded PID is *alive*, log CRITICAL and exit(1).
+    - If the file exists but the PID is dead (stale), remove it and continue.
+    - If no file exists, continue normally.
+    """
+    if not _PID_FILE.exists():
+        return
+
+    try:
+        saved_pid = int(_PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        log.warning("PID file '%s' is corrupt — removing it", _PID_FILE)
+        _PID_FILE.unlink(missing_ok=True)
+        return
+
+    try:
+        os.kill(saved_pid, 0)  # signal 0 = existence check, no actual signal sent
+        pid_alive = True
+    except (OSError, ProcessLookupError):
+        pid_alive = False
+
+    if pid_alive:
+        log.critical(
+            "Port conflict detected: MollyGraph PID %d is already running "
+            "(PID file: %s). Exiting to prevent dual-process corruption.",
+            saved_pid, _PID_FILE,
+        )
+        sys.exit(1)
+    else:
+        log.warning(
+            "Stale PID file found (pid=%d is dead) — removing and continuing",
+            saved_pid,
+        )
+        _PID_FILE.unlink(missing_ok=True)
+
+
+def _write_pid_file() -> None:
+    """Write the current process PID to the PID file."""
+    _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PID_FILE.write_text(str(os.getpid()))
+    log.info("PID file written: %s (pid=%d)", _PID_FILE, os.getpid())
+
+
+def _remove_pid_file() -> None:
+    """Remove the PID file on clean shutdown."""
+    try:
+        _PID_FILE.unlink(missing_ok=True)
+        log.info("PID file removed: %s", _PID_FILE)
+    except OSError as exc:
+        log.warning("Failed to remove PID file %s: %s", _PID_FILE, exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global graph, vector_store, pipeline, queue, queue_worker, _worker_task, _SERVICE_STARTED_AT
     _SERVICE_STARTED_AT = datetime.now(UTC)
+
+    # Check for port conflicts before initialising anything else.
+    # In test mode skip this so unit tests can run multiple in-process instances.
+    if not config.TEST_MODE:
+        _check_pid_conflict()
+        _write_pid_file()
 
     initialize_embedding_registry()
     initialize_extractor_registry()
@@ -496,6 +562,8 @@ async def lifespan(_app: FastAPI):
         set_pipeline_instance(None)
         set_graph_instance(None)
         graph = None
+        if not config.TEST_MODE:
+            _remove_pid_file()
 
 
 app.router.lifespan_context = lifespan
