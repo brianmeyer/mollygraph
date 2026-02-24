@@ -327,6 +327,7 @@ class ExtractionPipeline:
             ]
             if service_config.GLIREL_ENABLED:
                 try:
+                    log.info("GLiREL enrichment starting: %d entities", len(raw_entities))
                     glirel_relations = await asyncio.to_thread(
                         self._glirel_enrichment.enrich_relations,
                         job.content,
@@ -341,6 +342,12 @@ class ExtractionPipeline:
                         base_relations=raw_relations_with_source,
                         glirel_relations=glirel_relations,
                         canonical_names=canonical_names,
+                    )
+                    log.info(
+                        "GLiREL enrichment complete: found=%d overrides=%d additions=%d",
+                        glirel_relations_found,
+                        glirel_overrides,
+                        glirel_additions,
                     )
 
                     training_examples = await asyncio.to_thread(
