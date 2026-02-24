@@ -606,28 +606,70 @@ class ExtractionPipeline:
             if getattr(service_config, "TEST_MODE", False):
                 cls._embedding_model = "hash"
                 return cls._embedding_model
-            try:
-                from sentence_transformers import SentenceTransformer
-                cls._embedding_model = SentenceTransformer("google/embeddinggemma-300m")
-                log.info("Loaded embedding model: google/embeddinggemma-300m")
-            except Exception as exc:
-                log.warning("Failed to load embeddinggemma-300m: %s — falling back to hash", exc)
-                cls._embedding_model = "hash"  # sentinel for fallback
+
+            backend = getattr(service_config, "EMBEDDING_BACKEND", "sentence-transformers")
+
+            if backend in ("sentence-transformers", "st"):
+                model_name = getattr(service_config, "EMBEDDING_MODEL", "google/embeddinggemma-300m")
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    cls._embedding_model = SentenceTransformer(model_name)
+                    log.info("Loaded sentence-transformers embedding model: %s", model_name)
+                except Exception as exc:
+                    log.warning(
+                        "Failed to load sentence-transformers model %s: %s — falling back to hash",
+                        model_name, exc,
+                    )
+                    cls._embedding_model = "hash"
+            elif backend == "ollama":
+                # Sentinel string; actual call happens in _text_embedding
+                cls._embedding_model = "ollama"
+                log.info(
+                    "Embedding backend: ollama (model=%s)",
+                    getattr(service_config, "OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+                )
+            elif backend == "hash":
+                cls._embedding_model = "hash"
+                log.info("Embedding backend: hash (deterministic fallback)")
+            else:
+                log.warning("Unknown EMBEDDING_BACKEND %r — falling back to hash", backend)
+                cls._embedding_model = "hash"
+
         return cls._embedding_model
 
     @staticmethod
     def _text_embedding(text: str, dim: int = 768) -> list[float]:
-        """Embed text using google/embeddinggemma-300m (with hash fallback)."""
+        """Embed text using the configured backend (sentence-transformers / ollama / hash)."""
         model = ExtractionPipeline._get_embedding_model()
-        
-        if model != "hash":
+
+        if model == "ollama":
+            try:
+                import urllib.request, json as _json
+                ollama_model = getattr(service_config, "OLLAMA_EMBED_MODEL", "nomic-embed-text")
+                base_url = getattr(service_config, "OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+                payload = _json.dumps({"model": ollama_model, "prompt": text}).encode()
+                req = urllib.request.Request(
+                    f"{base_url}/api/embeddings",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = _json.loads(resp.read())
+                return result["embedding"]
+            except Exception as exc:
+                log.warning("Ollama embedding failed: %s — falling back to hash", exc)
+                # Fall through to hash
+
+        elif model != "hash":
+            # sentence-transformers model object
             try:
                 vec = model.encode(text, normalize_embeddings=True).tolist()
                 return vec
-            except Exception:
-                pass
-        
-        # Hash fallback (shouldn't normally be hit)
+            except Exception as exc:
+                log.warning("sentence-transformers encode failed: %s — falling back to hash", exc)
+                # Fall through to hash
+
+        # Hash fallback
         tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
         vector = [0.0] * dim
         if not tokens:
