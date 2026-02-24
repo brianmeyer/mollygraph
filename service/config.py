@@ -121,6 +121,10 @@ if _extractor_backend_raw not in {"gliner2", "gliner"}:
 EXTRACTOR_BACKEND = "gliner2"
 EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
 
+# ── Reranker ──────────────────────────────────────────────────────────────────
+RERANKER_ENABLED = os.environ.get("MOLLYGRAPH_RERANKER_ENABLED", "false").lower() == "true"
+RERANKER_MODEL = os.environ.get("MOLLYGRAPH_RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual")
+
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")
 GLINER_FINETUNE_MIN_EXAMPLES       = int(os.environ.get("GLINER_FINETUNE_MIN_EXAMPLES", "500"))

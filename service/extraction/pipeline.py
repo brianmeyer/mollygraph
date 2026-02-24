@@ -597,6 +597,10 @@ class ExtractionPipeline:
     _embedding_active_tier: "str | None" = None   # which tier is currently active
     _embedding_failed_tiers: set = set()           # tiers that have permanently failed this run
 
+    # ── Reranker model (lazy-loaded, optional) ────────────────────────────────
+    _reranker_model = None            # loaded CrossEncoder or None if not yet loaded/failed
+    _reranker_loaded: bool = False    # True once load was attempted (avoids repeated attempts)
+
     @classmethod
     def invalidate_embedding_cache(cls) -> None:
         """Drop cached embedding state after provider/model configuration changes."""
@@ -804,3 +808,34 @@ class ExtractionPipeline:
         if norm == 0:
             return vector
         return [v / norm for v in vector]
+
+    # ── Reranker (lazy-loaded cross-encoder) ──────────────────────────────────
+    @classmethod
+    def _get_reranker_model(cls):
+        """Return the cached cross-encoder reranker, or None if disabled/unavailable.
+
+        Loads lazily on first call; subsequent calls return the cached instance.
+        Model is only loaded when ``RERANKER_ENABLED`` is True in config.
+        """
+        if cls._reranker_loaded:
+            return cls._reranker_model
+
+        cls._reranker_loaded = True  # Mark attempted regardless of outcome
+
+        if not getattr(service_config, "RERANKER_ENABLED", False):
+            log.debug("Reranker disabled (MOLLYGRAPH_RERANKER_ENABLED not set)")
+            cls._reranker_model = None
+            return None
+
+        model_name = getattr(
+            service_config, "RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual"
+        )
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+            cls._reranker_model = CrossEncoder(model_name, trust_remote_code=True)
+            log.info("Reranker loaded: %s", model_name)
+        except Exception as exc:
+            log.warning("Reranker load failed (model=%s): %s — reranking disabled", model_name, exc)
+            cls._reranker_model = None
+
+        return cls._reranker_model
