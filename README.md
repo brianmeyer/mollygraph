@@ -270,7 +270,7 @@ MOLLYGRAPH_OLLAMA_EMBED_MODEL=nomic-embed-text
 ```env
 # GLiNER2 — self-improving LoRA loop
 # Starts with base model, accumulates training data, fine-tunes on your graph
-GLINER_MODEL=urchade/gliner_medium-v2.1
+GLINER_MODEL=fastino/gliner2-large-v1
 SPACY_ENRICHMENT_ENABLED=true  # SpaCy enrichment pass (on by default)
 
 # Training
