@@ -8,9 +8,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import shutil
+import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -69,6 +72,7 @@ class GLiNERTrainingService:
 
     def __init__(self, state_file: Path | None = None):
         self._state_file = state_file or config.STATE_FILE
+        self._state_lock = threading.Lock()
         self.state: dict[str, Any] = self._load_state()
 
     def _load_state(self) -> dict[str, Any]:
@@ -83,9 +87,22 @@ class GLiNERTrainingService:
 
     def save_state(self) -> None:
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-        tmp.replace(self._state_file)
+        with self._state_lock:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=self._state_file.parent,
+                prefix=".state_tmp_",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(self.state, indent=2, ensure_ascii=True) + "\n")
+                Path(tmp_name).replace(self._state_file)
+            except Exception:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
 
     def refresh_state(self) -> None:
         self.state = self._load_state()
@@ -599,6 +616,9 @@ class GLiNERTrainingService:
         seen_episode_ids = self.load_existing_gliner_episode_ids(training_dir)
         opus_analysis_text = self.latest_maintenance_analysis_text()
         cursor = str(self.state.get("gliner_training_cursor", "")).strip()
+        # Issue 6: Load the episode IDs seen at the previous cursor boundary so
+        # we can exclude them from the >= query and avoid re-processing them.
+        cursor_seen_ids: list[str] = list(self.state.get("gliner_training_cursor_seen_ids", []))
 
         # Only accumulate episodes older than 24 hours, giving the nightly audit
         # time to review and quarantine bad data before it enters training.
@@ -607,14 +627,19 @@ class GLiNERTrainingService:
             "GLiNER accumulation: 24-hour audit delay active, cutoff=%s", cutoff_time
         )
 
+        # Issue 6: Use >= (not >) so episodes that share the exact cursor
+        # timestamp are not permanently skipped.  We deduplicate via NOT IN on
+        # the IDs that were already processed in the previous batch.
         where_cursor = (
-            "AND datetime(coalesce(ep.created_at, toString(ep.ingested_at), toString(ep.occurred_at))) > datetime($cursor)"
+            "AND datetime(coalesce(ep.created_at, toString(ep.ingested_at), toString(ep.occurred_at))) >= datetime($cursor)"
+            " AND ep.id NOT IN $seen_ids"
             if cursor
             else ""
         )
         params: dict[str, Any] = {"limit": int(limit), "cutoff_time": cutoff_time}
         if cursor:
             params["cursor"] = cursor
+            params["seen_ids"] = cursor_seen_ids
 
         driver = require_graph_instance().driver
         with driver.session() as session:
@@ -674,7 +699,7 @@ class GLiNERTrainingService:
 
         batch_path: str | None = None
         if new_examples:
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
             path = training_dir / f"examples-{ts}.jsonl"
             with path.open("w", encoding="utf-8") as f:
                 for example in new_examples:
@@ -686,6 +711,24 @@ class GLiNERTrainingService:
 
         if latest_seen_created_at:
             self.state["gliner_training_cursor"] = latest_seen_created_at
+            # Issue 6: Persist the episode IDs that sit exactly at the new
+            # cursor timestamp.  The next run queries >= cursor, so we must
+            # exclude these already-processed IDs to avoid re-processing them.
+            boundary_ids = [
+                str(row.get("episode_id") or "")
+                for row in rows
+                if str(row.get("created_at") or "") == latest_seen_created_at
+                and str(row.get("episode_id") or "").strip()
+            ]
+            self.state["gliner_training_cursor_seen_ids"] = boundary_ids
+            log.debug(
+                "GLiNER cursor advanced to %s with %d boundary IDs",
+                latest_seen_created_at,
+                len(boundary_ids),
+            )
+        else:
+            # No episodes processed this run; clear stale boundary IDs.
+            self.state.pop("gliner_training_cursor_seen_ids", None)
 
         total_examples = self.count_accumulated_gliner_examples(training_dir)
         self.state["gliner_training_examples"] = total_examples
@@ -1029,6 +1072,8 @@ class GLiNERTrainingService:
             return None
 
         selected_names = sorted({str(ent["text"]).strip() for ent in selected_entities})
+        episode_id = str(episode.get("episode_id") or "").strip()
+        episode_created_at = str(episode.get("created_at") or "").strip()
         relation_rows = [
             dict(record)
             for record in session.run(
@@ -1036,12 +1081,22 @@ class GLiNERTrainingService:
                 MATCH (h:Entity)-[r]->(t:Entity)
                 WHERE h.name IN $names AND t.name IN $names
                   AND (r.audit_status IS NULL OR NOT r.audit_status IN ['quarantined', 'deleted'])
+                  AND (
+                    r.episode_id = $episode_id
+                    OR (
+                      r.valid_at IS NOT NULL
+                      AND $episode_created_at <> ''
+                      AND abs(duration.between(r.valid_at, datetime($episode_created_at)).seconds) < 300
+                    )
+                  )
                 RETURN h.name AS head,
                        t.name AS tail,
                        type(r) AS label,
                        coalesce(r.mention_count, 0) AS mention_count
                 """,
                 names=selected_names,
+                episode_id=episode_id,
+                episode_created_at=episode_created_at,
             )
         ]
 
@@ -1067,12 +1122,22 @@ class GLiNERTrainingService:
                 MATCH (h:Entity)-[r]->(t:Entity)
                 WHERE h.name IN $names AND t.name IN $names
                   AND r.audit_status IN ['quarantined', 'deleted']
+                  AND (
+                    r.episode_id = $episode_id
+                    OR (
+                      r.valid_at IS NOT NULL
+                      AND $episode_created_at <> ''
+                      AND abs(duration.between(r.valid_at, datetime($episode_created_at)).seconds) < 300
+                    )
+                  )
                 RETURN h.name AS head,
                        t.name AS tail,
                        type(r) AS label,
                        r.audit_status AS audit_status
                 """,
                 names=selected_names,
+                episode_id=episode_id,
+                episode_created_at=episode_created_at,
             )
         ]
 
