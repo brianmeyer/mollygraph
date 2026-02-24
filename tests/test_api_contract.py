@@ -206,37 +206,15 @@ def test_embedding_status_and_reindex_dry_run(client) -> None:
     assert body["entities_found"] >= 1
 
 
-def test_extractor_registry_supports_gliner_and_hf_token_models(client) -> None:
+def test_extractor_registry_supports_gliner2(client) -> None:
     baseline = client.get("/extractors/config", headers=AUTH_HEADERS)
     assert baseline.status_code == 200
-    assert {"gliner2", "hf_token_classification"}.issubset(set(baseline.json()["supported_backends"]))
-
-    add_hf = client.post(
-        "/extractors/models",
-        json={"backend": "hf_token_classification", "model": "dslim/bert-base-NER"},
-        headers=AUTH_HEADERS,
-    )
-    assert add_hf.status_code == 200
-    assert "dslim/bert-base-NER" in add_hf.json()["models"]["hf_token_classification"]
-
-    activate_hf = client.post(
-        "/extractors/config",
-        json={
-            "backend": "hf_token_classification",
-            "model": "dslim/bert-base-NER",
-            "relation_model": "Babelscape/rebel-large",
-        },
-        headers=AUTH_HEADERS,
-    )
-    assert activate_hf.status_code == 200
-    assert activate_hf.json()["active_backend"] == "hf_token_classification"
-    assert activate_hf.json()["active_model"] == "dslim/bert-base-NER"
-    assert activate_hf.json()["active_relation_model"] == "Babelscape/rebel-large"
+    assert "gliner2" in baseline.json()["supported_backends"]
 
     status = client.get("/extractors/status", headers=AUTH_HEADERS)
     assert status.status_code == 200
     payload = status.json()
-    assert payload["active_backend"] in {"gliner2", "hf_token_classification"}
+    assert payload["active_backend"] == "gliner2"
     assert payload["supports_relations"] is True
     assert "backends" in payload
 
