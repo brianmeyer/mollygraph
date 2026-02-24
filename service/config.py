@@ -70,6 +70,14 @@ AUDIT_MODEL_LOCAL    = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_LOCAL", "llama3.1:
 AUDIT_MODEL_PRIMARY  = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_PRIMARY", "")
 AUDIT_MODEL_FALLBACK = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_FALLBACK", "")
 
+# ── GLiREL synonym LLM enrichment ─────────────────────────────────────────────
+# When enabled, the auto-adoption pipeline calls the audit LLM to generate
+# 2-3 additional natural-language phrasings per new relation type and merges
+# them with the deterministic synonyms (capped at 5 total).
+# This runs very rarely (only on new relation type adoption).  Set to "false"
+# to skip the LLM call and rely on deterministic synonyms only.
+GLIREL_LLM_SYNONYMS = os.environ.get("MOLLYGRAPH_GLIREL_LLM_SYNONYMS", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # ── LLM provider base URLs ────────────────────────────────────────────────────
 GEMINI_BASE_URL    = "https://generativelanguage.googleapis.com/v1beta/openai"
 MOONSHOT_BASE_URL  = os.environ.get("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")

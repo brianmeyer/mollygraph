@@ -19,8 +19,11 @@ acts as built-in defaults.  This module:
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
+import os
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -269,6 +272,74 @@ def save_synonyms(synonyms: dict[str, tuple[str, ...]]) -> None:
         log.warning("Failed to save glirel_synonyms.json", exc_info=True)
 
 
+def _llm_enrich_synonyms(label: str) -> list[str]:
+    """Call the audit LLM to generate additional natural-language synonym phrasings.
+
+    This is **optional and non-fatal**: returns an empty list if the feature
+    is disabled (``MOLLYGRAPH_GLIREL_LLM_SYNONYMS=false``), the LLM is
+    unavailable, or any error occurs.
+
+    Runs the async ``call_audit_model`` in a fresh thread/event-loop so it is
+    safe to call from a synchronous context even when an outer async event loop
+    is already running (e.g. inside the nightly audit pipeline).
+
+    Args:
+        label: Normalised relation label, e.g. ``'consulted on'``.
+
+    Returns:
+        Up to 3 additional lowercase short phrasings from the LLM.
+    """
+    # Feature gate — check env var directly to avoid import-time side-effects.
+    enabled = os.environ.get("MOLLYGRAPH_GLIREL_LLM_SYNONYMS", "true").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        log.debug("GLiREL LLM synonym enrichment disabled via env var.")
+        return []
+
+    # Lazy import to avoid circular deps at module load time.
+    try:
+        try:
+            from audit.llm_audit import call_audit_model
+        except ImportError:
+            from service.audit.llm_audit import call_audit_model  # type: ignore[no-redef]
+    except ImportError:
+        log.debug("audit.llm_audit not importable; skipping LLM synonym enrichment.")
+        return []
+
+    prompt = (
+        f"Generate 3 short natural language phrasings for the relationship type "
+        f"'{label}' between two entities. "
+        f"Return only the phrasings, one per line, no explanations, no numbering."
+    )
+
+    async def _call() -> dict:
+        return await call_audit_model(prompt, schedule="nightly")
+
+    try:
+        # ThreadPoolExecutor gives us a fresh thread with a fresh event loop,
+        # which is safe whether or not an outer async loop is already running.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            result: dict = pool.submit(asyncio.run, _call()).result(timeout=30)
+    except Exception:
+        log.debug("LLM synonym enrichment call failed (non-fatal).", exc_info=True)
+        return []
+
+    content: str = result.get("content", "") if isinstance(result, dict) else ""
+    if not content or result.get("skipped"):
+        return []
+
+    extras: list[str] = []
+    for line in content.splitlines():
+        # Strip common list prefixes: "1. ", "- ", "• ", etc.
+        phrase = line.strip().lower().lstrip("-•*0123456789.) \t")
+        if phrase and len(phrase) < 80:
+            extras.append(phrase)
+        if len(extras) >= 3:
+            break
+
+    log.debug("LLM synonym enrichment for '%s' returned: %s", label, extras)
+    return extras
+
+
 def add_synonym_group(
     canonical: str,
     synonyms: tuple[str, ...] | None = None,
@@ -289,6 +360,7 @@ def add_synonym_group(
     if not normalized:
         return load_synonyms()
 
+    auto_generated = synonyms is None
     if synonyms is None:
         synonyms = generate_synonyms_for_label(normalized)
 
@@ -297,10 +369,21 @@ def add_synonym_group(
     if normalized not in variants:
         variants.insert(0, normalized)
 
+    # Optionally enrich with LLM-generated phrasings (non-fatal, cap total at 5).
+    # Only attempt enrichment when synonyms were auto-generated (not explicitly provided),
+    # and only when there is room below the cap.
+    if auto_generated and len(variants) < 5:
+        llm_extras = _llm_enrich_synonyms(normalized)
+        for phrase in llm_extras:
+            if phrase and phrase not in variants:
+                variants.append(phrase)
+            if len(variants) >= 5:
+                break
+
     current = load_synonyms()
-    current[normalized] = tuple(variants[:4])
+    current[normalized] = tuple(variants[:5])
     save_synonyms(current)
-    log.info("GLiREL synonym group added/updated for '%s': %s", normalized, variants[:4])
+    log.info("GLiREL synonym group added/updated for '%s': %s", normalized, variants[:5])
     return current
 
 
