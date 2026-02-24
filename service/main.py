@@ -160,6 +160,7 @@ class QueryResponse(BaseModel):
     results: list[dict[str, Any]]
     result_count: int
     timestamp: str
+    reranked: bool = False
 
 
 def _json_safe(value: Any) -> Any:
@@ -809,74 +810,154 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
     graph_fuzzy_lookup_ms = 0.0
     embedding_ms = 0.0
     vector_search_ms = 0.0
+    reranker_ms = 0.0
 
     _entity_extract_start = time.perf_counter()
     entities = _extract_query_entities(q)
     entity_extraction_ms = (time.perf_counter() - _entity_extract_start) * 1000
 
-    results: list[dict[str, Any]] = []
-    retrieval_source = "none"
+    # ── Parallel branch: graph (exact → fuzzy) ────────────────────────────────
+    async def _graph_branch() -> tuple[list[dict[str, Any]], float, float, str]:
+        """Run graph exact lookup; fall back to fuzzy CONTAINS if exact misses.
+        Returns (results, exact_ms, fuzzy_ms, source_label).
+        """
+        _exact_start = time.perf_counter()
+        _graph_results: list[dict[str, Any]] = []
+        for entity_name in entities[:5]:
+            facts = graph.get_current_facts(entity_name)
+            if facts:
+                _graph_results.append({
+                    "entity": entity_name,
+                    "facts": facts[:10],
+                    "retrieval_source": "graph_exact",
+                })
+        _exact_ms = (time.perf_counter() - _exact_start) * 1000
 
-    _exact_start = time.perf_counter()
-    for entity_name in entities[:5]:
-        facts = graph.get_current_facts(entity_name)
-        if facts:
-            results.append({"entity": entity_name, "facts": facts[:10]})
-    graph_exact_lookup_ms = (time.perf_counter() - _exact_start) * 1000
-    if results:
-        retrieval_source = "graph_exact"
+        _fuzzy_ms = 0.0
+        _source = "graph_exact" if _graph_results else "none"
 
-    # Fuzzy Neo4j CONTAINS fallback: if exact-name lookup missed, try substring match
-    if not results:
-        _fuzzy_start = time.perf_counter()
+        # Fuzzy CONTAINS secondary strategy if exact missed
+        if not _graph_results:
+            _fuzzy_start = time.perf_counter()
+            try:
+                with graph.driver.session() as _session:
+                    for entity_name in entities[:5]:
+                        _contains_q = entity_name.lower()
+                        _rows = _session.run(
+                            "MATCH (e:Entity) WHERE toLower(e.name) CONTAINS $q "
+                            "RETURN e.name AS name LIMIT 5",
+                            q=_contains_q,
+                        )
+                        for _row in _rows:
+                            _name = str(_row.get("name") or "").strip()
+                            if _name:
+                                _facts = graph.get_current_facts(_name)
+                                if _facts:
+                                    _graph_results.append({
+                                        "entity": _name,
+                                        "facts": _facts[:10],
+                                        "match": "fuzzy_contains",
+                                        "retrieval_source": "graph_fuzzy",
+                                    })
+                        if _graph_results:
+                            break
+            except Exception:
+                log.debug("Fuzzy CONTAINS fallback failed", exc_info=True)
+            _fuzzy_ms = (time.perf_counter() - _fuzzy_start) * 1000
+            if _graph_results:
+                _source = "graph_fuzzy"
+
+        return _graph_results, _exact_ms, _fuzzy_ms, _source
+
+    # ── Parallel branch: vector similarity search ─────────────────────────────
+    async def _vector_branch() -> tuple[list[dict[str, Any]], float, float]:
+        """Embed query and run vector similarity search.
+        Returns (results, embedding_ms, vector_search_ms).
+        """
+        if vector_store is None:
+            return [], 0.0, 0.0
+
+        _emb_start = time.perf_counter()
         try:
-            with graph.driver.session() as _session:
-                for entity_name in entities[:5]:
-                    _contains_q = entity_name.lower()
-                    _rows = _session.run(
-                        "MATCH (e:Entity) WHERE toLower(e.name) CONTAINS $q "
-                        "RETURN e.name AS name LIMIT 5",
-                        q=_contains_q,
-                    )
-                    for _row in _rows:
-                        _name = str(_row.get("name") or "").strip()
-                        if _name:
-                            _facts = graph.get_current_facts(_name)
-                            if _facts:
-                                results.append({
-                                    "entity": _name,
-                                    "facts": _facts[:10],
-                                    "match": "fuzzy_contains",
-                                })
-                    if results:
-                        break
-        except Exception:
-            log.debug("Fuzzy CONTAINS fallback failed", exc_info=True)
-        graph_fuzzy_lookup_ms = (time.perf_counter() - _fuzzy_start) * 1000
-        if results:
-            retrieval_source = "graph_fuzzy"
+            embedding = await asyncio.to_thread(ExtractionPipeline._text_embedding, q)
+        except Exception as exc:
+            log.debug("Vector embedding failed: %s", exc)
+            return [], (time.perf_counter() - _emb_start) * 1000, 0.0
+        _emb_ms = (time.perf_counter() - _emb_start) * 1000
 
-    # Fallback: query vector index using deterministic embedding.
-    if not results and vector_store is not None:
-        _embedding_start = time.perf_counter()
+        _vec_start = time.perf_counter()
         try:
-            embedding = ExtractionPipeline._text_embedding(q)
-        finally:
-            embedding_ms = (time.perf_counter() - _embedding_start) * 1000
+            vector_hits = await asyncio.to_thread(vector_store.similarity_search, embedding, 5)
+        except Exception as exc:
+            log.debug("Vector similarity_search failed: %s", exc)
+            return [], _emb_ms, (time.perf_counter() - _vec_start) * 1000
+        _vec_ms = (time.perf_counter() - _vec_start) * 1000
 
-        _vector_start = time.perf_counter()
-        vector_hits = vector_store.similarity_search(embedding, top_k=5)
-        vector_search_ms = (time.perf_counter() - _vector_start) * 1000
-
+        _vec_results: list[dict[str, Any]] = []
         for item in vector_hits:
             name = str(item.get("name") or "").strip()
             if not name:
                 continue
             facts = graph.get_current_facts(name)
             if facts:
-                results.append({"entity": name, "facts": facts[:5], "score": item.get("score", 0.0)})
-        if results:
-            retrieval_source = "vector"
+                _vec_results.append({
+                    "entity": name,
+                    "facts": facts[:5],
+                    "score": item.get("score", 0.0),
+                    "retrieval_source": "vector",
+                })
+        return _vec_results, _emb_ms, _vec_ms
+
+    # ── Run both branches in parallel ─────────────────────────────────────────
+    (graph_results, graph_exact_lookup_ms, graph_fuzzy_lookup_ms, graph_source), \
+    (vector_results, embedding_ms, vector_search_ms) = await asyncio.gather(
+        _graph_branch(),
+        _vector_branch(),
+    )
+
+    # ── Merge: graph results have priority; vector fills gaps ─────────────────
+    seen_entities: set[str] = set()
+    results: list[dict[str, Any]] = []
+
+    for r in graph_results:
+        key = r["entity"].lower()
+        if key not in seen_entities:
+            seen_entities.add(key)
+            results.append(r)
+
+    for r in vector_results:
+        key = r["entity"].lower()
+        if key not in seen_entities:
+            seen_entities.add(key)
+            results.append(r)
+
+    # Determine combined retrieval source
+    has_graph = bool(graph_results)
+    has_vector = bool(vector_results)
+    if has_graph and has_vector:
+        retrieval_source = "combined"
+    elif has_graph:
+        retrieval_source = graph_source  # "graph_exact" or "graph_fuzzy"
+    elif has_vector:
+        retrieval_source = "vector"
+    else:
+        retrieval_source = "none"
+
+    # ── Optional reranker ─────────────────────────────────────────────────────
+    reranked = False
+    if getattr(config, "RERANKER_ENABLED", False) and len(results) > 1:
+        _rerank_start = time.perf_counter()
+        try:
+            reranker = await asyncio.to_thread(ExtractionPipeline._get_reranker_model)
+            if reranker is not None:
+                pairs = [(q, " ".join(str(f) for f in r.get("facts", []))) for r in results]
+                scores = await asyncio.to_thread(reranker.predict, pairs)
+                scored = sorted(zip(scores, results), key=lambda x: x[0], reverse=True)
+                results = [r for _, r in scored]
+                reranked = True
+        except Exception as exc:
+            log.debug("Reranker step failed: %s", exc)
+        reranker_ms = (time.perf_counter() - _rerank_start) * 1000
 
     total_latency_ms = (time.perf_counter() - query_start) * 1000
     try:
@@ -891,6 +972,7 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
             graph_exact_lookup_ms=graph_exact_lookup_ms,
             graph_fuzzy_lookup_ms=graph_fuzzy_lookup_ms,
             entities_queried=entities,
+            reranker_ms=reranker_ms,
         )
     except Exception:
         log.debug("metrics log_retrieval failed", exc_info=True)
@@ -901,6 +983,7 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
         results=results,
         result_count=len(results),
         timestamp=datetime.utcnow().isoformat(),
+        reranked=reranked,
     )
 
 

@@ -114,12 +114,14 @@ def log_retrieval(
     graph_exact_lookup_ms: float = 0.0,
     graph_fuzzy_lookup_ms: float = 0.0,
     entities_queried: list[str] | None = None,
+    reranker_ms: float = 0.0,
 ) -> None:
     """Append a line to the retrieval JSONL log."""
     source = retrieval_source if retrieval_source in {
         "graph_exact",
         "graph_fuzzy",
         "vector",
+        "combined",
         "none",
     } else "none"
     record = {
@@ -135,6 +137,7 @@ def log_retrieval(
         "graph_exact_lookup_ms": round(graph_exact_lookup_ms, 2),
         "graph_fuzzy_lookup_ms": round(graph_fuzzy_lookup_ms, 2),
         "entities_queried": [str(ent) for ent in (entities_queried or [])],
+        "reranker_ms": round(reranker_ms, 2),
     }
     try:
         with RETRIEVAL_LOG.open("a", encoding="utf-8") as f:
