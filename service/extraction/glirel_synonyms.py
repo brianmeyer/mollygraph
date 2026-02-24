@@ -32,21 +32,23 @@ _SYNONYMS_PATH = Path.home() / ".graph-memory" / "glirel_synonyms.json"
 # ---------------------------------------------------------------------------
 
 # Suffix-based expansion rules.
-# Each entry: (suffix_with_underscore, [template, ...]) where templates may
-# use {base} (full base phrase), {stem} (part before suffix), {verb} (first
-# word of stem).
+# Each entry: (suffix_with_underscore, [template, ...]) where templates may use:
+#   {base}  — full natural-language base phrase (e.g. "works at")
+#   {stem}  — words before the suffix (e.g. "work")
+#   {verb}  — first word of stem, already in infinitive/stem form
+#   {verb3} — third-person singular present form of {verb} (e.g. "works")
 _SUFFIX_RULES: list[tuple[str, list[str]]] = [
-    ("_at",   ["{base}", "{verb}s at", "employed at"]),
-    ("_for",  ["{base}", "{verb}s for", "working for"]),
+    ("_at",   ["{base}", "{verb3} at", "employed at"]),
+    ("_for",  ["{base}", "{verb3} for", "working for"]),
     ("_in",   ["{base}", "based in", "situated in"]),
     ("_of",   ["{base}", "part of", "member of"]),
     ("_to",   ["{base}", "connected to", "reporting to"]),
     ("_by",   ["{base}", "done by", "handled by"]),
-    ("_with", ["{base}", "{verb}s with", "co-{verb}s with"]),
-    ("_on",   ["{base}", "{verb}s on", "contributing to"]),
+    ("_with", ["{base}", "{verb3} with", "co-{verb3} with"]),
+    ("_on",   ["{base}", "{verb3} on", "contributing to"]),
 ]
 
-# Prefix-based expansion rules.
+# Prefix-based expansion rules (same template placeholders as _SUFFIX_RULES).
 _PREFIX_RULES: list[tuple[str, list[str]]] = [
     ("mentored_", ["{base}", "coached by", "guided by", "advised by"]),
     ("managed_",  ["{base}", "run by", "led by", "overseen by"]),
@@ -99,6 +101,35 @@ def _label_to_normalized(label: str) -> str:
     return label.strip().lower().replace("_", " ")
 
 
+def _to_present_third_person(verb: str) -> str:
+    """Return the third-person singular present form of a verb stem.
+
+    E.g. ``'work'`` → ``'works'``, ``'advise'`` → ``'advises'``.
+    Already-conjugated forms (ending in 's', 'es') are returned as-is.
+    """
+    if not verb:
+        return verb
+    if verb.endswith(("ss", "sh", "ch", "x", "z")):
+        return verb + "es"
+    if verb.endswith("s"):
+        return verb  # already plural/3rd-person
+    if verb.endswith("e"):
+        return verb + "s"
+    return verb + "s"
+
+
+def _verb_stem(conjugated: str) -> str:
+    """Return the approximate infinitive stem of a conjugated verb.
+
+    Strips a trailing plain 's' that is not part of the root, e.g.
+    ``'works'`` → ``'work'``, ``'advises'`` → ``'advise'``.
+    Does NOT touch 'ss', 'ous', etc.
+    """
+    if len(conjugated) > 3 and conjugated.endswith("s") and not conjugated.endswith("ss"):
+        return conjugated[:-1]
+    return conjugated
+
+
 def generate_synonyms_for_label(label: str) -> tuple[str, ...]:
     """Generate 2–4 natural-language synonym phrasings for a relation type label.
 
@@ -122,17 +153,22 @@ def generate_synonyms_for_label(label: str) -> tuple[str, ...]:
 
     normalized_key = base.replace(" ", "_")
     parts = base.split()
-    verb = parts[0] if parts else base
 
     synonyms: list[str] = [base]
 
     # Prefix rules
     for prefix, templates in _PREFIX_RULES:
         if normalized_key.startswith(prefix):
-            rest = " ".join(normalized_key[len(prefix):].split("_"))
+            rest_raw = normalized_key[len(prefix):]
+            rest = " ".join(rest_raw.split("_"))
+            rest_verb_stem = _verb_stem(rest.split()[0]) if rest.split() else rest
             for tmpl in templates:
-                variant = tmpl.format(base=base, stem=rest, verb=rest.split()[0] if rest else rest)
-                variant = variant.strip()
+                variant = tmpl.format(
+                    base=base,
+                    stem=rest,
+                    verb=rest_verb_stem,
+                    verb3=_to_present_third_person(rest_verb_stem),
+                ).strip()
                 if variant and variant not in synonyms:
                     synonyms.append(variant)
             if len(synonyms) >= 2:
@@ -144,18 +180,28 @@ def generate_synonyms_for_label(label: str) -> tuple[str, ...]:
             if normalized_key.endswith(suffix):
                 stem_raw = normalized_key[: -len(suffix)]
                 stem = " ".join(stem_raw.split("_"))
-                stem_verb = stem.split()[0] if stem.split() else stem
+                # Stem may be a conjugated verb (e.g. 'works') — strip the 's' to get stem.
+                stem_verb_stem = _verb_stem(stem.split()[0]) if stem.split() else stem
                 for tmpl in templates:
-                    variant = tmpl.format(base=base, stem=stem, verb=stem_verb)
-                    variant = variant.strip()
+                    variant = tmpl.format(
+                        base=base,
+                        stem=stem,
+                        verb=stem_verb_stem,
+                        verb3=_to_present_third_person(stem_verb_stem),
+                    ).strip()
                     if variant and variant not in synonyms:
                         synonyms.append(variant)
                 break
 
     # Generic fallback: add a simple present-tense s-verb variant.
-    if len(synonyms) < 2 and not verb.endswith(("s", "ed", "ing")):
-        s_variant = (verb + "s " + " ".join(parts[1:])).strip() if len(parts) > 1 else verb + "s"
-        if s_variant not in synonyms:
+    if len(synonyms) < 2:
+        verb_stem = _verb_stem(parts[0]) if parts else base
+        s_variant = (
+            (_to_present_third_person(verb_stem) + " " + " ".join(parts[1:])).strip()
+            if len(parts) > 1
+            else _to_present_third_person(verb_stem)
+        )
+        if s_variant and s_variant not in synonyms:
             synonyms.append(s_variant)
 
     return tuple(synonyms[:4])
