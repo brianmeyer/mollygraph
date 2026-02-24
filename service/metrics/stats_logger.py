@@ -5,6 +5,7 @@ Provides:
 - log_request: called by timing middleware to track per-request latency
 - log_retrieval: append per-query retrieval metrics to retrieval_log.jsonl
 - get_summary: compute daily summary stats for /metrics/summary endpoint
+- get_session_retrieval_counters: in-memory session-level hit counters
 """
 from __future__ import annotations
 
@@ -29,6 +30,20 @@ METRICS_DIR.mkdir(parents=True, exist_ok=True)
 # ── In-memory request buffer (for fast P95 without reading disk) ──────────────
 _req_lock = threading.Lock()
 _req_latencies: list[float] = []  # rolling buffer, reset at midnight
+
+# ── In-memory retrieval hit counters (session-level, prove graph value) ───────
+_retrieval_lock = threading.Lock()
+_retrieval_counters: dict[str, int] = {
+    "graph_only_hits": 0,    # graph returned results, vector returned nothing
+    "vector_only_hits": 0,   # vector returned results, graph returned nothing
+    "combined_hits": 0,      # BOTH returned results
+    "none_hits": 0,          # neither returned results
+    "total_queries": 0,
+    # For lift calculation: within combined hits, how many had graph-unique entities?
+    "combined_graph_unique": 0,   # queries where graph found entities vector missed
+    "combined_vector_unique": 0,  # queries where vector found entities graph missed
+}
+_retrieval_latencies: list[float] = []  # for p50 calculation
 
 
 def _today_str() -> str:
@@ -115,8 +130,13 @@ def log_retrieval(
     graph_fuzzy_lookup_ms: float = 0.0,
     entities_queried: list[str] | None = None,
     reranker_ms: float = 0.0,
+    # ── New parallel-retrieval hit counters ───────────────────────────────
+    graph_result_count: int = -1,    # -1 = not provided (legacy caller)
+    vector_result_count: int = -1,   # -1 = not provided (legacy caller)
+    graph_entity_names: list[str] | None = None,   # entities graph found
+    vector_entity_names: list[str] | None = None,  # entities vector found
 ) -> None:
-    """Append a line to the retrieval JSONL log."""
+    """Append a line to the retrieval JSONL log and update in-memory hit counters."""
     source = retrieval_source if retrieval_source in {
         "graph_exact",
         "graph_fuzzy",
@@ -124,6 +144,44 @@ def log_retrieval(
         "combined",
         "none",
     } else "none"
+
+    # ── Update in-memory session counters ─────────────────────────────────
+    with _retrieval_lock:
+        _retrieval_counters["total_queries"] += 1
+        _retrieval_latencies.append(float(latency_ms))
+        # Keep buffer bounded (last 10k)
+        if len(_retrieval_latencies) > 10_000:
+            del _retrieval_latencies[:5_000]
+
+        if graph_result_count >= 0 and vector_result_count >= 0:
+            has_graph = graph_result_count > 0
+            has_vector = vector_result_count > 0
+            if has_graph and has_vector:
+                _retrieval_counters["combined_hits"] += 1
+                # Compute lift: entities unique to each source
+                g_names = set(n.lower() for n in (graph_entity_names or []))
+                v_names = set(n.lower() for n in (vector_entity_names or []))
+                if g_names - v_names:  # graph found something vector missed
+                    _retrieval_counters["combined_graph_unique"] += 1
+                if v_names - g_names:  # vector found something graph missed
+                    _retrieval_counters["combined_vector_unique"] += 1
+            elif has_graph:
+                _retrieval_counters["graph_only_hits"] += 1
+            elif has_vector:
+                _retrieval_counters["vector_only_hits"] += 1
+            else:
+                _retrieval_counters["none_hits"] += 1
+        else:
+            # Legacy path: infer from source string
+            if source in ("graph_exact", "graph_fuzzy"):
+                _retrieval_counters["graph_only_hits"] += 1
+            elif source == "vector":
+                _retrieval_counters["vector_only_hits"] += 1
+            elif source == "combined":
+                _retrieval_counters["combined_hits"] += 1
+            else:
+                _retrieval_counters["none_hits"] += 1
+
     record = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "date": _today_str(),
@@ -138,12 +196,56 @@ def log_retrieval(
         "graph_fuzzy_lookup_ms": round(graph_fuzzy_lookup_ms, 2),
         "entities_queried": [str(ent) for ent in (entities_queried or [])],
         "reranker_ms": round(reranker_ms, 2),
+        "graph_result_count": graph_result_count,
+        "vector_result_count": vector_result_count,
     }
     try:
         with RETRIEVAL_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except Exception:
         log.warning("Failed to write retrieval log", exc_info=True)
+
+
+def get_session_retrieval_counters() -> dict[str, Any]:
+    """Return in-memory session-level retrieval hit counters (not disk-based).
+
+    These reset on service restart.  They prove the value of graph vs vector:
+      - graph_only_hits: queries where graph found results but vector found nothing
+      - vector_only_hits: queries where vector found results but graph found nothing
+      - combined_hits: queries where BOTH found results
+      - graph_lift_pct: % of combined queries where graph found entities vector missed
+      - vector_lift_pct: % of combined queries where vector found entities graph missed
+    """
+    with _retrieval_lock:
+        c = dict(_retrieval_counters)
+        lats = list(_retrieval_latencies)
+
+    total = c["total_queries"]
+    combined = c["combined_hits"]
+    p50 = round(_percentile(lats, 50), 2)
+    avg = round(sum(lats) / total, 2) if total else 0.0
+
+    graph_lift_pct = (
+        round(c["combined_graph_unique"] / combined * 100, 1) if combined > 0 else 0.0
+    )
+    vector_lift_pct = (
+        round(c["combined_vector_unique"] / combined * 100, 1) if combined > 0 else 0.0
+    )
+    hit_count = total - c["none_hits"]
+    hit_rate = round(hit_count / total, 4) if total > 0 else 0.0
+
+    return {
+        "total_queries": total,
+        "graph_only_hits": c["graph_only_hits"],
+        "vector_only_hits": c["vector_only_hits"],
+        "combined_hits": combined,
+        "none_hits": c["none_hits"],
+        "hit_rate": hit_rate,
+        "graph_lift_pct": graph_lift_pct,
+        "vector_lift_pct": vector_lift_pct,
+        "avg_latency_ms": avg,
+        "p50_latency_ms": p50,
+    }
 
 
 # ── Compute summary stats ──────────────────────────────────────────────────────
@@ -191,9 +293,15 @@ def get_retrieval_summary(date_str: str | None = None) -> dict[str, Any]:
         "graph_exact": 0,
         "graph_fuzzy": 0,
         "vector": 0,
+        "combined": 0,
         "none": 0,
     }
     hit_count = 0
+    graph_only = 0
+    vector_only = 0
+    combined_count = 0
+    combined_g_unique = 0
+    combined_v_unique = 0
 
     for rec in recs:
         source = str(rec.get("retrieval_source") or "none")
@@ -203,13 +311,45 @@ def get_retrieval_summary(date_str: str | None = None) -> dict[str, Any]:
         if int(rec.get("result_count", 0) or 0) > 0:
             hit_count += 1
 
+        # Use stored counts when available (new format)
+        g_cnt = rec.get("graph_result_count", -1)
+        v_cnt = rec.get("vector_result_count", -1)
+        if g_cnt is not None and v_cnt is not None and int(g_cnt) >= 0 and int(v_cnt) >= 0:
+            if int(g_cnt) > 0 and int(v_cnt) > 0:
+                combined_count += 1
+            elif int(g_cnt) > 0:
+                graph_only += 1
+            elif int(v_cnt) > 0:
+                vector_only += 1
+        else:
+            # Fall back to source string
+            if source in ("graph_exact", "graph_fuzzy"):
+                graph_only += 1
+            elif source == "vector":
+                vector_only += 1
+            elif source == "combined":
+                combined_count += 1
+
+    graph_lift_pct = (
+        round(combined_g_unique / combined_count * 100, 1) if combined_count > 0 else 0.0
+    )
+    vector_lift_pct = (
+        round(combined_v_unique / combined_count * 100, 1) if combined_count > 0 else 0.0
+    )
+
     return {
         "total_queries_today": total,
         "avg_latency_ms": round(sum(latencies) / total, 2) if total else 0.0,
+        "p50_latency_ms": round(_percentile(latencies, 50), 2),
         "p95_latency_ms": round(_percentile(latencies, 95), 2),
         "avg_vector_search_ms": round(sum(vector_search) / total, 2) if total else 0.0,
         "hit_rate": round(hit_count / total, 4) if total else 0.0,
         "source_breakdown": source_breakdown,
+        "graph_only_hits": graph_only,
+        "vector_only_hits": vector_only,
+        "combined_hits": combined_count,
+        "graph_lift_pct": graph_lift_pct,
+        "vector_lift_pct": vector_lift_pct,
     }
 
 
@@ -248,6 +388,8 @@ def get_recent_retrieval_queries(limit: int = 10) -> list[dict[str, Any]]:
         "vector_search_ms": float(rec.get("vector_search_ms", 0.0) or 0.0),
         "embedding_ms": float(rec.get("embedding_ms", 0.0) or 0.0),
         "entities_queried": [str(v) for v in (rec.get("entities_queried") or [])],
+        "graph_result_count": int(rec.get("graph_result_count", -1) or -1),
+        "vector_result_count": int(rec.get("vector_result_count", -1) or -1),
     } for rec in trimmed]
 
 

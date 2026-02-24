@@ -13,6 +13,7 @@ import hashlib
 import logging
 import math
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, UTC
@@ -121,6 +122,88 @@ _SPACY_LABEL_MAP = {
 class ExtractionPipeline:
     """End-to-end extraction and graph/vector persistence."""
 
+    # ── Class-level daily ingestion counters (reset when date changes) ────────
+    # These are shared across all instances (there's only one per process).
+    _counter_lock = threading.Lock()
+    _counter_date: str = ""  # YYYY-MM-DD; reset when date changes
+    _ingestion_counters: dict[str, Any] = {
+        "jobs_processed": 0,
+        "total_entities_extracted": 0,
+        "total_relationships_extracted": 0,
+        "total_new_entities": 0,       # entities that did NOT exist before
+        "total_existing_entities": 0,  # entities that already existed (upserted)
+        "total_fallback_relationships": 0,  # RELATED_TO fallback count
+    }
+
+    @classmethod
+    def _get_ingestion_counters(cls) -> dict[str, Any]:
+        """Return a snapshot of today's ingestion counters."""
+        from datetime import date
+        today = date.today().isoformat()
+        with cls._counter_lock:
+            if cls._counter_date != today:
+                # Day rolled over — reset
+                cls._counter_date = today
+                cls._ingestion_counters = {
+                    "jobs_processed": 0,
+                    "total_entities_extracted": 0,
+                    "total_relationships_extracted": 0,
+                    "total_new_entities": 0,
+                    "total_existing_entities": 0,
+                    "total_fallback_relationships": 0,
+                }
+            c = dict(cls._ingestion_counters)
+        jobs = c["jobs_processed"]
+        total_ent = c["total_entities_extracted"]
+        total_rel = c["total_relationships_extracted"]
+        new_ent = c["total_new_entities"]
+        unique_rate = round(new_ent / total_ent, 4) if total_ent > 0 else 0.0
+        fallbacks = c["total_fallback_relationships"]
+        fallback_rate = round(fallbacks / total_rel, 4) if total_rel > 0 else 0.0
+        return {
+            "date": today,
+            "jobs_processed": jobs,
+            "avg_entity_yield": round(total_ent / jobs, 2) if jobs > 0 else 0.0,
+            "avg_relationship_yield": round(total_rel / jobs, 2) if jobs > 0 else 0.0,
+            "unique_entity_rate": unique_rate,
+            "related_to_fallback_rate": fallback_rate,
+            "total_entities_extracted": total_ent,
+            "total_relationships_extracted": total_rel,
+            "total_new_entities": new_ent,
+            "total_existing_entities": c["total_existing_entities"],
+            "total_fallback_relationships": fallbacks,
+        }
+
+    @classmethod
+    def _update_ingestion_counters(
+        cls,
+        entities_extracted: int,
+        relationships_extracted: int,
+        new_entities: int,
+        existing_entities: int,
+        fallback_count: int,
+    ) -> None:
+        """Update class-level daily counters after a successful job."""
+        from datetime import date
+        today = date.today().isoformat()
+        with cls._counter_lock:
+            if cls._counter_date != today:
+                cls._counter_date = today
+                cls._ingestion_counters = {
+                    "jobs_processed": 0,
+                    "total_entities_extracted": 0,
+                    "total_relationships_extracted": 0,
+                    "total_new_entities": 0,
+                    "total_existing_entities": 0,
+                    "total_fallback_relationships": 0,
+                }
+            cls._ingestion_counters["jobs_processed"] += 1
+            cls._ingestion_counters["total_entities_extracted"] += entities_extracted
+            cls._ingestion_counters["total_relationships_extracted"] += relationships_extracted
+            cls._ingestion_counters["total_new_entities"] += new_entities
+            cls._ingestion_counters["total_existing_entities"] += existing_entities
+            cls._ingestion_counters["total_fallback_relationships"] += fallback_count
+
     def __init__(self, graph: BiTemporalGraph, vector_store: VectorStore):
         self.graph = graph
         self.vector_store = vector_store
@@ -189,12 +272,18 @@ class ExtractionPipeline:
             entities = self._build_entities(raw_entities)
             canonical_names: dict[str, str] = {}
             stored_entities: list[Entity] = []
+            new_entity_count = 0
+            existing_entity_count = 0
 
             for entity in entities:
-                entity_id, _ = self.graph.upsert_entity(entity)
+                entity_id, is_new = self.graph.upsert_entity(entity)
                 canonical_names[self._normalize(entity.name)] = entity.name
                 stored_entities.append(entity)
                 written_entity_names.append(entity.name)  # track for failure reconciliation
+                if is_new:
+                    new_entity_count += 1
+                else:
+                    existing_entity_count += 1
 
                 # Keep vector index in sync with graph entities.
                 _embed_start = time.perf_counter()
@@ -332,6 +421,18 @@ class ExtractionPipeline:
                     )
                 except Exception:
                     log.debug("model_health record_extraction failed", exc_info=True)
+
+            # ── Daily ingestion counters (class-level, exposed via /metrics/dashboard) ──
+            try:
+                ExtractionPipeline._update_ingestion_counters(
+                    entities_extracted=len(stored_entities),
+                    relationships_extracted=len(relationships),
+                    new_entities=new_entity_count,
+                    existing_entities=existing_entity_count,
+                    fallback_count=fallback_count,
+                )
+            except Exception:
+                log.debug("ingestion_counters update failed", exc_info=True)
 
             return job
 

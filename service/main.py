@@ -20,6 +20,7 @@ import config
 from metrics.stats_logger import (
     get_recent_retrieval_queries,
     get_retrieval_summary,
+    get_session_retrieval_counters,
     get_summary,
     log_request,
     log_retrieval,
@@ -125,6 +126,9 @@ pipeline: ExtractionPipeline | None = None
 queue: ExtractionQueue | None = None
 queue_worker: QueueWorker | None = None
 _worker_task: asyncio.Task | None = None
+
+# Service start time (set in lifespan, used by /metrics/dashboard)
+_SERVICE_STARTED_AT: datetime | None = None
 # Tracks how many times the worker has been auto-restarted since it last ran
 # cleanly.  Reset to 0 whenever we observe the task running; incremented each
 # time we attempt a restart so we don't spin-restart a persistently broken worker.
@@ -386,7 +390,8 @@ def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global graph, vector_store, pipeline, queue, queue_worker, _worker_task
+    global graph, vector_store, pipeline, queue, queue_worker, _worker_task, _SERVICE_STARTED_AT
+    _SERVICE_STARTED_AT = datetime.now(UTC)
 
     initialize_embedding_registry()
     initialize_extractor_registry()
@@ -973,6 +978,10 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
             graph_fuzzy_lookup_ms=graph_fuzzy_lookup_ms,
             entities_queried=entities,
             reranker_ms=reranker_ms,
+            graph_result_count=len(graph_results),
+            vector_result_count=len(vector_results),
+            graph_entity_names=[r["entity"] for r in graph_results],
+            vector_entity_names=[r["entity"] for r in vector_results],
         )
     except Exception:
         log.debug("metrics log_retrieval failed", exc_info=True)
@@ -1673,6 +1682,131 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
             "provider": _active_embedding_info()[0],
             "model": _active_embedding_info()[1],
             "vectors": vector_count,
+        },
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@app.get("/metrics/dashboard")
+async def metrics_dashboard(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Single-call dashboard snapshot for README badges and status pages.
+
+    Returns a comprehensive JSON object covering graph health, retrieval
+    performance (with graph-vs-vector lift metrics), embedding config,
+    extraction stats, training history, and uptime.
+    """
+    require_runtime_ready()
+
+    # ── Graph health ──────────────────────────────────────────────────────────
+    entity_count = await asyncio.to_thread(graph.entity_count)
+    relationship_count = await asyncio.to_thread(graph.relationship_count)
+    density = round(relationship_count / entity_count, 4) if entity_count > 0 else 0.0
+
+    try:
+        dist = await asyncio.to_thread(graph.get_relationship_type_distribution)
+        type_count = len(dist)
+        related_to_count = dist.get("RELATED_TO", 0)
+        total_rels = sum(dist.values())
+        related_to_rate = round(related_to_count / total_rels, 4) if total_rels > 0 else 0.0
+    except Exception:
+        type_count = 0
+        related_to_rate = 0.0
+
+    # ── Retrieval metrics ─────────────────────────────────────────────────────
+    # Use session-level in-memory counters for lift/breakdown (accurate since restart)
+    session_ret = get_session_retrieval_counters()
+    # Also pull disk-based today summary for hit_rate/latency
+    daily_ret = get_retrieval_summary()
+
+    # ── Embedding / vector store ──────────────────────────────────────────────
+    embedding_provider, embedding_model = _active_embedding_info()
+    vector_count: int | str = "unknown"
+    if vector_store is not None:
+        try:
+            vs_stats = vector_store.get_stats()
+            for key in ("entities", "dense_vectors", "vectors", "count"):
+                val = vs_stats.get(key)
+                if isinstance(val, (int, float)):
+                    vector_count = int(val)
+                    break
+        except Exception:
+            pass
+
+    # ── Extraction / ingestion ────────────────────────────────────────────────
+    ing = ExtractionPipeline._get_ingestion_counters()
+    # Supplement avg_yield from disk if class counters are empty (fresh restart)
+    if ing["jobs_processed"] == 0:
+        daily_summary = get_summary()
+        disk_avg_ent = daily_summary.get("ingests", {}).get("avg_entities_per_ingest", 0.0)
+        disk_avg_rel = 0.0
+        ingest_count = daily_summary.get("ingests", {}).get("count_today", 0)
+        if ingest_count > 0:
+            total_rels_today = daily_summary.get("quality", {}).get("total_relationships_today", 0)
+            disk_avg_rel = round(total_rels_today / ingest_count, 2)
+    else:
+        disk_avg_ent = ing["avg_entity_yield"]
+        disk_avg_rel = ing["avg_relationship_yield"]
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    svc = GLiNERTrainingService()
+    state = svc.state
+    runs = await asyncio.to_thread(svc.list_training_runs, 50)
+    successful_runs = [r for r in runs if r.get("combined_improvement") is not None]
+    last_f1_delta = 0.0
+    if successful_runs:
+        last_f1_delta = float(successful_runs[0].get("combined_improvement") or 0.0)
+    cooldown_hours = _cooldown_remaining_hours(state)
+    total_examples = state.get("gliner_training_examples", 0)
+
+    # ── Uptime ────────────────────────────────────────────────────────────────
+    started_at = _SERVICE_STARTED_AT.isoformat() if _SERVICE_STARTED_AT else None
+
+    return {
+        "graph": {
+            "entities": entity_count,
+            "relationships": relationship_count,
+            "density": density,
+            "types": type_count,
+            "related_to_rate": related_to_rate,
+        },
+        "retrieval": {
+            "total_queries": session_ret["total_queries"],
+            "hit_rate": daily_ret["hit_rate"],
+            "graph_only_hits": session_ret["graph_only_hits"],
+            "vector_only_hits": session_ret["vector_only_hits"],
+            "combined_hits": session_ret["combined_hits"],
+            "graph_lift_pct": session_ret["graph_lift_pct"],
+            "vector_lift_pct": session_ret["vector_lift_pct"],
+            "avg_latency_ms": daily_ret["avg_latency_ms"],
+            "p50_latency_ms": daily_ret["p50_latency_ms"],
+            "p95_latency_ms": daily_ret["p95_latency_ms"],
+        },
+        "embedding": {
+            "provider": embedding_provider,
+            "model": embedding_model,
+            "vectors": vector_count,
+            "reranker_enabled": bool(getattr(config, "RERANKER_ENABLED", False)),
+        },
+        "extraction": {
+            "backend": "gliner2",
+            "avg_entity_yield": disk_avg_ent,
+            "avg_relationship_yield": disk_avg_rel,
+            "unique_entity_rate": ing["unique_entity_rate"],
+            "related_to_fallback_rate": ing["related_to_fallback_rate"] or related_to_rate,
+            "jobs_today": ing["jobs_processed"],
+        },
+        "training": {
+            "total_examples": total_examples,
+            "runs": len(runs),
+            "successful_runs": len(successful_runs),
+            "last_f1_delta": round(last_f1_delta, 4),
+            "cooldown_hours": cooldown_hours,
+            "active_model": state.get("gliner_active_model_ref", "base"),
+        },
+        "uptime": {
+            "started_at": started_at,
+            "total_queries": session_ret["total_queries"],
+            "total_ingested_today": ing["jobs_processed"],
         },
         "timestamp": datetime.now(UTC).isoformat(),
     }
