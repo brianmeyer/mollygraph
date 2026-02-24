@@ -251,10 +251,13 @@ def _get_relation_model_hf() -> Any | None:
             return _relation_model
 
         from transformers import pipeline
+        from transformers.pipelines import PIPELINE_REGISTRY
 
         log.info("Loading HF relation model (%s)...", relation_ref)
+        # transformers 5.x merged text2text-generation into text-generation
+        task = "text2text-generation" if "text2text-generation" in PIPELINE_REGISTRY.supported_tasks else "text-generation"
         model = pipeline(
-            "text2text-generation",
+            task,
             model=relation_ref,
             tokenizer=relation_ref,
         )
@@ -615,9 +618,11 @@ def prefetch_model(
             "Set one via /extractors/config or pass relation_model explicitly."
         )
     from transformers import pipeline
+    from transformers.pipelines import PIPELINE_REGISTRY
 
     pipeline("token-classification", model=model_ref, tokenizer=model_ref, aggregation_strategy="simple")
-    pipeline("text2text-generation", model=relation_ref, tokenizer=relation_ref)
+    rel_task = "text2text-generation" if "text2text-generation" in PIPELINE_REGISTRY.supported_tasks else "text-generation"
+    pipeline(rel_task, model=relation_ref, tokenizer=relation_ref)
     return {
         "backend": selected_backend,
         "model": model_ref,
