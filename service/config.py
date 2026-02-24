@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env", override=False)
+
 # ── Core paths ────────────────────────────────────────────────────────────────
 GRAPH_MEMORY_DIR = Path(
     os.environ.get("MOLLYGRAPH_HOME_DIR", str(Path.home() / ".graph-memory"))
