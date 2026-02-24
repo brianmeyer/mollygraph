@@ -337,7 +337,22 @@ class ZvecBackend(VectorStoreBackend):
             }
         )
         self.collection.upsert(doc)
-    
+        self._upsert_count = getattr(self, '_upsert_count', 0) + 1
+        # Flush WAL periodically to make data visible to queries and stats
+        if self._upsert_count % 100 == 0:
+            try:
+                self.collection.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        """Explicitly flush WAL to disk. Call after bulk operations."""
+        if self.collection is not None:
+            try:
+                self.collection.flush()
+            except Exception:
+                pass
+
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
         """Search similar vectors using cosine similarity."""
@@ -526,7 +541,12 @@ class VectorStore:
     def hybrid_search(self, query_embedding: List[float], query_text: str,
                       top_k: int = 10, dense_weight: float = 0.7) -> List[Dict]:
         return self.backend.hybrid_search(query_embedding, query_text, top_k, dense_weight)
-    
+
+    def flush(self):
+        """Flush backend WAL to disk. Call after bulk operations (reindex, etc.)."""
+        if hasattr(self.backend, 'flush'):
+            self.backend.flush()
+
     def get_stats(self) -> Dict:
         backend_stats = self.backend.get_stats()
         with self._search_lock:

@@ -347,6 +347,10 @@ def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
             if len(errors) < 10:
                 errors.append({"entity_id": entity_id, "name": name, "error": str(exc)})
 
+    # Flush WAL after bulk reindex so data is immediately visible
+    if reindexed > 0 and vector_store is not None:
+        vector_store.flush()
+
     return {
         "status": "ok" if failed == 0 else "partial",
         "provider": config.EMBEDDING_BACKEND,
@@ -411,6 +415,25 @@ async def lifespan(_app: FastAPI):
 
     queue_worker = QueueWorker(queue=queue, processor=process_job, max_concurrent=3)
     _worker_task = asyncio.create_task(queue_worker.start())
+
+    # Auto-reindex vectors if Zvec is empty but Neo4j has entities.
+    # This handles restarts after Zvec collection recreation/corruption.
+    try:
+        vs_stats = vector_store.get_stats() if vector_store else {}
+        vs_count = vs_stats.get("entities", 0)
+        if vs_count == 0 and graph is not None:
+            neo4j_count = len(graph.list_entities_for_embedding(limit=1))
+            if neo4j_count > 0:
+                log.info("Zvec empty but Neo4j has entities — triggering startup reindex")
+                reindex_result = _reindex_embeddings_sync(limit=5000, dry_run=False)
+                log.info(
+                    "Startup reindex complete: reindexed=%d failed=%d",
+                    reindex_result.get("reindexed", 0),
+                    reindex_result.get("failed", 0),
+                )
+                vector_store.flush()
+    except Exception:
+        log.warning("Startup vector reindex failed (non-fatal)", exc_info=True)
 
     log.info("MollyGraph ready on %s:%s", config.HOST, config.PORT)
 
