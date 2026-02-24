@@ -58,6 +58,7 @@ from metrics.model_health import model_health_monitor
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
 from maintenance.auditor import run_maintenance_cycle
+from maintenance.lock import is_maintenance_locked
 from memory.graph import BiTemporalGraph, VALID_REL_TYPES
 from memory import extractor as memory_extractor
 from memory.graph_suggestions import build_suggestion_digest
@@ -295,6 +296,20 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials | None = Depends(se
 def require_runtime_ready() -> None:
     if queue is None or pipeline is None or graph is None:
         raise HTTPException(status_code=503, detail="Service not ready")
+
+
+def require_no_maintenance() -> None:
+    """Raise 503 if a maintenance cycle is currently running.
+
+    Delete and prune operations must not run concurrently with
+    run_maintenance_cycle() which iterates the entity graph; doing so risks
+    state corruption (deleting nodes mid-iteration).
+    """
+    if is_maintenance_locked():
+        raise HTTPException(
+            status_code=503,
+            detail="Maintenance cycle in progress — please retry in a moment",
+        )
 
 
 def _refresh_embedding_runtime() -> None:
@@ -883,6 +898,7 @@ async def delete_entity_endpoint(name: str, _api_key: str = Depends(verify_api_k
     corresponding vector store entry was also found and deleted.
     """
     require_runtime_ready()
+    require_no_maintenance()
 
     # Step 1: Look up entity_id and count attached relationships before deletion.
     with graph.driver.session() as _session:
@@ -939,6 +955,7 @@ async def delete_relationship_endpoint(
     entities are deleted.  The count of actually deleted relationships is returned.
     """
     require_runtime_ready()
+    require_no_maintenance()
 
     source = req.source.strip()
     target = req.target.strip()
@@ -1032,6 +1049,7 @@ async def prune_entities_endpoint(
     entry are removed.  Returns the count of pruned entities and removed vectors.
     """
     require_runtime_ready()
+    require_no_maintenance()
 
     names_to_prune: list[str] = []
 
