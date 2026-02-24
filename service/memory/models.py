@@ -2,9 +2,9 @@
 MollyGraph V2 Data Models
 Pydantic models for bi-temporal graph memory.
 """
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 import uuid
 
 class Episode(BaseModel):
@@ -22,7 +22,7 @@ class Episode(BaseModel):
     
     # Bi-temporal
     occurred_at: datetime  # When the event happened (valid time)
-    ingested_at: datetime = Field(default_factory=datetime.utcnow)  # When we learned it
+    ingested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))  # When we learned it
     
     # Processing metadata
     processed_at: Optional[datetime] = None
@@ -31,9 +31,8 @@ class Episode(BaseModel):
     
     # Status
     status: Literal["active", "archived", "quarantined"] = "active"
-    
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
+
+    model_config = ConfigDict()
 
 
 class Entity(BaseModel):
@@ -64,9 +63,8 @@ class Entity(BaseModel):
     created_from_episode: str  # Episode ID where first seen
     verified: bool = False
     zvec_id: Optional[str] = None  # Reference to vector DB
-    
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
+
+    model_config = ConfigDict()
 
 
 class Relationship(BaseModel):
@@ -81,7 +79,7 @@ class Relationship(BaseModel):
     # Bi-temporal tracking
     valid_at: Optional[datetime] = None  # When fact is true (valid time)
     valid_until: Optional[datetime] = None  # When fact expires (for job changes)
-    observed_at: datetime = Field(default_factory=datetime.utcnow)  # When we learned it
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))  # When we learned it
     
     # Evidence
     confidence: float = Field(ge=0.0, le=1.0)
@@ -96,9 +94,8 @@ class Relationship(BaseModel):
     audit_status: Literal["unverified", "verified", "quarantined", "contradicted"] = "unverified"
     verified_by: Optional[str] = None  # Model or user ID
     verified_at: Optional[datetime] = None
-    
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
+
+    model_config = ConfigDict()
 
 
 class ExtractionJob(BaseModel):
@@ -116,7 +113,7 @@ class ExtractionJob(BaseModel):
     
     # Status
     status: Literal["pending", "processing", "completed", "failed"] = "pending"
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
