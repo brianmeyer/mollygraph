@@ -24,6 +24,36 @@ log = logging.getLogger(__name__)
 
 _BATCH_SIZE = 500
 
+# ---------------------------------------------------------------------------
+# Audit state helpers  (coverage metrics + last_full_sweep)
+# ---------------------------------------------------------------------------
+
+def _audit_state_path() -> "Path":
+    from pathlib import Path
+    state_dir = Path.home() / ".graph-memory"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "audit_state.json"
+
+
+def _load_audit_state() -> dict[str, Any]:
+    path = _audit_state_path()
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            log.debug("Failed to read audit_state.json", exc_info=True)
+    return {}
+
+
+def _save_audit_state(state: dict[str, Any]) -> None:
+    path = _audit_state_path()
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception:
+        log.debug("Failed to write audit_state.json", exc_info=True)
+
 
 # ---------------------------------------------------------------------------
 # Training signal helpers
@@ -832,6 +862,14 @@ def _write_maintenance_report(schedule: str, result: dict[str, Any]) -> str:
         f"- Orphans deleted: {result.get('orphans_deleted', 0)}",
         f"- Strength decay updated: {result.get('strength_decay_updated', 0)}",
         "",
+        "## Coverage",
+        "",
+        f"- Total relationships: {result.get('total_relationships', 0)}",
+        f"- Unaudited count: {result.get('unaudited_count', 0)}",
+        f"- Flagged count: {result.get('flagged_count', 0)}",
+        f"- Coverage: {result.get('coverage_pct', 0.0)}%",
+        f"- Last full sweep: {result.get('last_full_sweep', 'never')}",
+        "",
         "## Summary",
         "",
         str(result.get("summary", "")),
@@ -923,6 +961,22 @@ async def run_llm_audit(
     suggestion_digest = build_suggestion_digest()
     auto_adoption_result = run_auto_adoption()
 
+    # ── Coverage metrics ──────────────────────────────────────────────────
+    try:
+        coverage = graph.get_audit_coverage_metrics()
+    except Exception:
+        log.debug("Failed to get audit coverage metrics", exc_info=True)
+        coverage = {"total_relationships": 0, "unaudited_count": 0, "flagged_count": 0, "coverage_pct": 0.0}
+
+    # ── Audit state (last_full_sweep) ─────────────────────────────────────
+    audit_state = _load_audit_state()
+    last_full_sweep = audit_state.get("last_full_sweep", "")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if schedule.strip().lower() == "weekly" and not dry_run:
+        audit_state["last_full_sweep"] = now_iso
+        _save_audit_state(audit_state)
+        last_full_sweep = now_iso
+
     summary = (
         f"Reviewed {len(rels)} relationships: "
         f"{auto_fixed} auto-fixed, {quarantined} quarantined, {verified} verified"
@@ -963,6 +1017,12 @@ async def run_llm_audit(
         "feedback_negative_labels": feedback_negative_labels,
         "feedback_file": feedback_file,
         "duration_seconds": duration_seconds,
+        # ── Coverage metrics ─────────────────────────────────────────────
+        "total_relationships": coverage["total_relationships"],
+        "unaudited_count": coverage["unaudited_count"],
+        "coverage_pct": coverage["coverage_pct"],
+        "flagged_count": coverage["flagged_count"],
+        "last_full_sweep": last_full_sweep,
     }
 
     report_path = _write_maintenance_report(schedule, result)
