@@ -202,6 +202,17 @@ class AuditRequest(BaseModel):
     model: str | None = None
 
 
+class DeleteRelationshipRequest(BaseModel):
+    source: str
+    target: str
+    rel_type: str | None = None
+
+
+class PruneRequest(BaseModel):
+    names: list[str] | None = None
+    orphans: bool = False
+
+
 class TrainRequest(BaseModel):
     force: bool = False
 
@@ -777,6 +788,207 @@ async def get_entity(name: str, _api_key: str = Depends(verify_api_key)) -> Enti
         context=context,
         timestamp=datetime.now(UTC).isoformat(),
     )
+
+
+@app.delete("/entity/{name}", operation_id="delete_entity")
+async def delete_entity_endpoint(name: str, _api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Delete an entity by name from Neo4j (DETACH DELETE) and from the vector store.
+
+    Returns the number of relationships that were also removed (since DETACH DELETE
+    removes all attached edges).  ``vector_removed`` is ``True`` when the
+    corresponding vector store entry was also found and deleted.
+    """
+    require_runtime_ready()
+
+    # Step 1: Look up entity_id and count attached relationships before deletion.
+    with graph.driver.session() as _session:
+        rec = _session.run(
+            """
+            MATCH (e:Entity)
+            WHERE toLower(e.name) = $name
+               OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
+            OPTIONAL MATCH (e)-[r]-()
+            RETURN coalesce(e.id, toLower(e.name)) AS entity_id,
+                   count(r) AS rels
+            """,
+            name=name.lower(),
+        ).single()
+
+    if not rec or rec["entity_id"] is None:
+        raise HTTPException(status_code=404, detail=f"Entity '{name}' not found")
+
+    entity_id: str = str(rec["entity_id"])
+    rels_removed: int = int(rec["rels"]) if rec["rels"] is not None else 0
+
+    # Step 2: Delete from Neo4j.
+    deleted = await asyncio.to_thread(graph.delete_entity, name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Entity '{name}' not found")
+
+    # Step 3: Remove from vector store.
+    vector_removed = False
+    if vector_store is not None:
+        try:
+            vector_removed = bool(await asyncio.to_thread(vector_store.remove_entity, entity_id))
+        except Exception:
+            log.debug("delete_entity: vector remove failed for %s", entity_id, exc_info=True)
+
+    log.info("delete_entity: name=%s entity_id=%s rels_removed=%d vector_removed=%s",
+             name, entity_id, rels_removed, vector_removed)
+    return {
+        "deleted": True,
+        "entity": name,
+        "relationships_removed": rels_removed,
+        "vector_removed": vector_removed,
+    }
+
+
+@app.delete("/relationship", operation_id="delete_relationship")
+async def delete_relationship_endpoint(
+    req: DeleteRelationshipRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Delete a specific relationship (or all relationships) between two entities.
+
+    If ``rel_type`` is provided, only that relationship type is deleted.
+    If ``rel_type`` is omitted, **all** relationship types between the two
+    entities are deleted.  The count of actually deleted relationships is returned.
+    """
+    require_runtime_ready()
+
+    source = req.source.strip()
+    target = req.target.strip()
+    rel_type = req.rel_type.strip() if req.rel_type else None
+
+    if not source or not target:
+        raise HTTPException(status_code=422, detail="source and target are required")
+
+    if rel_type:
+        # Delete a specific typed relationship (both directions for safety).
+        with graph.driver.session() as _session:
+            rec = _session.run(
+                f"""
+                MATCH (h:Entity {{name: $source}})-[r:`{rel_type}`]-(t:Entity {{name: $target}})
+                DELETE r
+                RETURN count(r) AS deleted
+                """,
+                source=source,
+                target=target,
+            ).single()
+        deleted_count = int(rec["deleted"]) if rec else 0
+    else:
+        # Delete ALL relationships between the two entities.
+        with graph.driver.session() as _session:
+            rec = _session.run(
+                """
+                MATCH (h:Entity {name: $source})-[r]-(t:Entity {name: $target})
+                DELETE r
+                RETURN count(r) AS deleted
+                """,
+                source=source,
+                target=target,
+            ).single()
+        deleted_count = int(rec["deleted"]) if rec else 0
+
+    log.info("delete_relationship: source=%s target=%s rel_type=%s deleted=%d",
+             source, target, rel_type, deleted_count)
+    return {
+        "deleted": deleted_count,
+        "source": source,
+        "target": target,
+        "rel_type": rel_type,
+    }
+
+
+async def _delete_entity_and_vector(name: str) -> tuple[bool, bool]:
+    """Helper: delete one entity from Neo4j + vector store.
+
+    Returns (neo4j_deleted, vector_deleted).
+    """
+    # Look up entity_id for vector removal.
+    entity_id: str | None = None
+    try:
+        with graph.driver.session() as _session:
+            rec = _session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) = $name
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
+                RETURN coalesce(e.id, toLower(e.name)) AS entity_id
+                """,
+                name=name.lower(),
+            ).single()
+        if rec:
+            entity_id = str(rec["entity_id"])
+    except Exception:
+        pass
+
+    neo4j_deleted = await asyncio.to_thread(graph.delete_entity, name)
+    vector_deleted = False
+    if entity_id and vector_store is not None:
+        try:
+            vector_deleted = bool(await asyncio.to_thread(vector_store.remove_entity, entity_id))
+        except Exception:
+            log.debug("_delete_entity_and_vector: vector remove failed for %s", entity_id, exc_info=True)
+    return neo4j_deleted, vector_deleted
+
+
+@app.post("/entities/prune", operation_id="post_entities_prune")
+async def prune_entities_endpoint(
+    req: PruneRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Bulk delete entities matching criteria.
+
+    Accepts either:
+    - ``{"names": ["entity1", "entity2"]}`` — delete specific entities by name
+    - ``{"orphans": true}`` — delete all entities with zero relationships
+
+    For each entity both the Neo4j node (DETACH DELETE) and the vector store
+    entry are removed.  Returns the count of pruned entities and removed vectors.
+    """
+    require_runtime_ready()
+
+    names_to_prune: list[str] = []
+
+    if req.names:
+        names_to_prune = [n.strip() for n in req.names if n.strip()]
+    elif req.orphans:
+        # Find all entities with 0 relationships.
+        with graph.driver.session() as _session:
+            rows = _session.run(
+                """
+                MATCH (e:Entity)
+                WHERE NOT (e)--()
+                RETURN e.name AS name
+                """
+            ).data()
+        names_to_prune = [r["name"] for r in rows if r.get("name")]
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide 'names' (list of entity names) or 'orphans': true",
+        )
+
+    pruned: list[str] = []
+    vectors_removed = 0
+    for name in names_to_prune:
+        try:
+            neo4j_ok, vec_ok = await _delete_entity_and_vector(name)
+            if neo4j_ok:
+                pruned.append(name)
+            if vec_ok:
+                vectors_removed += 1
+        except Exception:
+            log.warning("prune_entities: failed to delete %s", name, exc_info=True)
+
+    log.info("prune_entities: requested=%d pruned=%d vectors_removed=%d",
+             len(names_to_prune), len(pruned), vectors_removed)
+    return {
+        "pruned": len(pruned),
+        "entities": pruned,
+        "vectors_removed": vectors_removed,
+    }
 
 
 def _extract_query_entities(query: str) -> list[str]:
@@ -1510,6 +1722,29 @@ async def trigger_nightly_maintenance(
 
             audit_result = await run_llm_audit(limit=200, dry_run=False, schedule="nightly")
             log.info("Nightly audit complete: %s", audit_result.get("status"))
+
+            # Step 1b: Auto-delete entities suggested by audit (only if AUDIT_AUTO_DELETE=true)
+            if config.AUDIT_AUTO_DELETE and graph is not None:
+                suggestions = audit_result.get("suggestions", [])
+                auto_deleted: list[str] = []
+                auto_vectors_removed = 0
+                for s in suggestions:
+                    if str(s.get("action", "")).lower() == "delete":
+                        entity_name = str(s.get("entity") or s.get("name") or "").strip()
+                        if entity_name:
+                            try:
+                                neo4j_ok, vec_ok = await _delete_entity_and_vector(entity_name)
+                                if neo4j_ok:
+                                    auto_deleted.append(entity_name)
+                                if vec_ok:
+                                    auto_vectors_removed += 1
+                            except Exception:
+                                log.warning("Nightly auto-delete failed for %s", entity_name, exc_info=True)
+                if auto_deleted:
+                    log.info(
+                        "Nightly auto-delete: deleted=%d vectors_removed=%d entities=%s",
+                        len(auto_deleted), auto_vectors_removed, auto_deleted,
+                    )
         except Exception:
             log.warning("Nightly audit step failed", exc_info=True)
 
