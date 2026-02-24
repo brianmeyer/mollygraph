@@ -125,6 +125,12 @@ EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
 RERANKER_ENABLED = os.environ.get("MOLLYGRAPH_RERANKER_ENABLED", "false").lower() == "true"
 RERANKER_MODEL = os.environ.get("MOLLYGRAPH_RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual")
 
+# ── GLiREL enrichment (second-pass relation extraction) ──────────────────────
+GLIREL_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_ENABLED", "false").lower() == "true"
+GLIREL_MODEL = os.environ.get("MOLLYGRAPH_GLIREL_MODEL", "jackboyla/glirel-large-v0")
+GLIREL_CONFIDENCE_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_CONFIDENCE", "0.5"))
+GLIREL_TRAINING_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_TRAINING_THRESHOLD", "0.8"))
+
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")
 GLINER_FINETUNE_MIN_EXAMPLES       = int(os.environ.get("GLINER_FINETUNE_MIN_EXAMPLES", "500"))

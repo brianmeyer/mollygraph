@@ -88,6 +88,7 @@ class Relationship(BaseModel):
     context_snippets: List[str] = Field(default=[], max_length=3)  # Evidence quotes
     
     # Source tracking
+    source: str = "gliner2"  # extractor source: gliner2 | glirel | manual
     episode_ids: List[str] = []  # All episodes supporting this relationship
     
     # Audit status
@@ -121,6 +122,10 @@ class ExtractionJob(BaseModel):
     # Results
     extracted_entities: List[Entity] = []
     extracted_relationships: List[Relationship] = []
+    glirel_relations_found: int = 0
+    glirel_overrides: int = 0
+    glirel_additions: int = 0
+    glirel_training_examples: int = 0
 
 
 class RetrievalResult(BaseModel):
