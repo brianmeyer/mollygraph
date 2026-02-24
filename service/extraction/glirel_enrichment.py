@@ -18,20 +18,68 @@ log = logging.getLogger(__name__)
 _GLIREL_TOKEN_RE = re.compile(r'\w+(?:[-_]\w+)*|\S')
 
 # Canonical relation -> natural-language phrasings for GLiREL calibration.
+# These are the built-in defaults; runtime additions live in
+# ~/.graph-memory/glirel_synonyms.json and are merged at inference time via
+# glirel_synonyms.get_merged_synonyms().  Research shows multi-label calls
+# with synonym variants boost GLiREL extraction scores ~37%.
 _RELATION_SYNONYM_GROUPS: dict[str, tuple[str, ...]] = {
-    "works at": ("works at", "employed by", "works for"),
-    "founded": ("founded", "founder of", "co-founded"),
-    "lives in": ("lives in", "resides in", "located in"),
-    "parent of": ("parent of", "father of", "mother of"),
-    "child of": ("child of", "son of", "daughter of"),
-    "member of": ("member of", "belongs to", "part of"),
-    "located in": ("located in", "based in", "headquartered in"),
+    # --- Employment / Affiliation ---
+    "works at":          ("works at",          "employed by",          "works for",           "affiliated with"),
+    "works on":          ("works on",          "is working on",        "contributes to",      "developing"),
+    "founded":           ("founded",           "founder of",           "co-founded",          "established"),
+    # --- Personal / Social ---
+    "knows":             ("knows",             "is acquainted with",   "is friends with",     "connected to"),
+    "classmate of":      ("classmate of",      "studied with",         "went to school with", "cohort of"),
+    "collaborates with": ("collaborates with", "works together with",  "partners with",       "co-works with"),
+    "contact of":        ("contact of",        "is in contact with",   "associated with",     "connected to"),
+    "discussed with":    ("discussed with",    "talked about with",    "conversed with",      "spoke with about"),
+    "interested in":     ("interested in",     "focused on",           "enthusiastic about",  "passionate about"),
+    # --- Location / Education ---
+    "lives in":          ("lives in",          "resides in",           "based in",            "located at"),
+    "located in":        ("located in",        "based in",             "headquartered in",    "situated in"),
+    "studied at":        ("studied at",        "attended",             "enrolled at",         "went to school at"),
+    "alumni of":         ("alumni of",         "graduated from",       "alumnus of",          "alum of"),
+    "attends":           ("attends",           "goes to",              "enrolled in",         "is attending"),
+    # --- Family ---
+    "parent of":         ("parent of",         "father of",            "mother of",           "guardian of"),
+    "child of":          ("child of",          "son of",               "daughter of",         "born to"),
+    # --- Hierarchy / Management ---
+    "manages":           ("manages",           "leads",                "oversees",            "is responsible for"),
+    "reports to":        ("reports to",        "answers to",           "works under",         "is managed by"),
+    "mentors":           ("mentors",           "coaches",              "guides",              "advises"),
+    "mentored by":       ("mentored by",       "coached by",           "guided by",           "advised by"),
+    # --- Technical / Project ---
+    "uses":              ("uses",              "utilizes",             "relies on",           "works with"),
+    "depends on":        ("depends on",        "requires",             "is dependent on",     "needs"),
+    "created":           ("created",           "built",                "developed",           "authored"),
+    "related to":        ("related to",        "associated with",      "linked to",           "connected to"),
+    # --- Grouping / Membership ---
+    "member of":         ("member of",         "belongs to",           "part of",             "affiliated with"),
+    # --- Commerce / Delivery ---
+    "customer of":       ("customer of",       "client of",            "subscriber of",       "account at"),
+    "received from":     ("received from",     "got from",             "delivered by",        "sent by"),
+    # --- Preset-schema extras ---
+    "owns":              ("owns",              "is owner of",          "possesses",           "holds"),
+    "assigned to":       ("assigned to",       "allocated to",         "given to",            "working on"),
+    "blocked by":        ("blocked by",        "waiting on",           "dependent on",        "held up by"),
+    "delivers":          ("delivers",          "ships",                "produces",            "outputs"),
+    "reports":           ("reports",           "files",                "submits",             "raises"),
+    "affects":           ("affects",           "impacts",              "touches",             "influences"),
+    "requested by":      ("requested by",      "asked for by",         "initiated by",        "raised by"),
+    "resolved by":       ("resolved by",       "fixed by",             "closed by",           "handled by"),
 }
 
 # When an ideal canonical label is not configured, map to the closest relation.
 _RELATION_CANONICAL_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "lives in": ("located in",),
-    "located in": ("lives in",),
+    "lives in":          ("located in",),
+    "located in":        ("lives in",),
+    "mentored by":       ("mentors",),
+    "mentors":           ("mentored by",),
+    "knows":             ("contact of", "collaborates with"),
+    "contact of":        ("knows",),
+    "collaborates with": ("knows",),
+    "related to":        ("associated with",),
+    "member of":         ("related to",),
 }
 
 # Relation type constraints in coarse type space: person / organization / location.
@@ -433,19 +481,32 @@ class GLiRELEnrichment:
         )
 
     @classmethod
+    def _effective_synonym_groups(cls) -> dict[str, tuple[str, ...]]:
+        """Return merged synonym groups: built-in defaults + JSON store overrides."""
+        try:
+            from extraction.glirel_synonyms import get_merged_synonyms
+        except ImportError:
+            try:
+                from glirel_synonyms import get_merged_synonyms  # type: ignore[no-redef]
+            except ImportError:
+                return _RELATION_SYNONYM_GROUPS
+        return get_merged_synonyms(_RELATION_SYNONYM_GROUPS)
+
+    @classmethod
     def _relation_labels(cls, configured_relations: set[str] | None = None) -> list[str]:
         configured = configured_relations or cls._configured_relations()
         if not configured:
             return []
 
+        synonym_groups = cls._effective_synonym_groups()
         labels: set[str] = set()
         for relation_name in configured:
             normalized = cls._normalize_relation_label(relation_name)
             if not normalized:
                 continue
             labels.add(normalized)
-            for candidate in cls._synonym_candidates(normalized):
-                variants = _RELATION_SYNONYM_GROUPS.get(candidate)
+            for candidate in cls._synonym_candidates(normalized, synonym_groups=synonym_groups):
+                variants = synonym_groups.get(candidate)
                 if not variants:
                     continue
                 for label in variants:
@@ -486,7 +547,8 @@ class GLiRELEnrichment:
         if normalized_label in configured_relations:
             return normalized_label
 
-        candidates = cls._synonym_candidates(normalized_label)
+        synonym_groups = cls._effective_synonym_groups()
+        candidates = cls._synonym_candidates(normalized_label, synonym_groups=synonym_groups)
         for candidate in candidates:
             if candidate in configured_relations:
                 return candidate
@@ -497,13 +559,19 @@ class GLiRELEnrichment:
         return candidates[0] if candidates else normalized_label
 
     @classmethod
-    def _synonym_candidates(cls, label: str) -> list[str]:
+    def _synonym_candidates(
+        cls,
+        label: str,
+        *,
+        synonym_groups: dict[str, tuple[str, ...]] | None = None,
+    ) -> list[str]:
         normalized = cls._normalize_relation_label(label)
         if not normalized:
             return []
 
+        groups = synonym_groups if synonym_groups is not None else cls._effective_synonym_groups()
         candidates: list[str] = []
-        for canonical, variants in _RELATION_SYNONYM_GROUPS.items():
+        for canonical, variants in groups.items():
             if normalized == canonical or normalized in variants:
                 candidates.append(canonical)
 
