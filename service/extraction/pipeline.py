@@ -299,26 +299,34 @@ class ExtractionPipeline:
                     existing_entity_count += 1
 
                 # Keep vector index in sync with graph entities.
+                embedding = None  # always bound; stays None if _text_embedding raises
                 _embed_start = time.perf_counter()
                 try:
                     embedding = self._text_embedding(f"{entity.name} {entity.entity_type} {job.content[:200]}")
+                except Exception:
+                    log.debug(
+                        "Embedding failed for entity %s — skipping vector upsert",
+                        entity.name,
+                        exc_info=True,
+                    )
                 finally:
                     embedding_time_ms += (time.perf_counter() - _embed_start) * 1000
-                try:
-                    _store_start = time.perf_counter()
+                if embedding is not None:
                     try:
-                        self.vector_store.add_entity(
-                            entity_id=entity_id,
-                            name=entity.name,
-                            entity_type=entity.entity_type,
-                            dense_embedding=embedding,
-                            content=job.content[:500],
-                            confidence=entity.confidence,
-                        )
-                    finally:
-                        vector_store_time_ms += (time.perf_counter() - _store_start) * 1000
-                except Exception:
-                    log.debug("Vector index upsert failed for %s", entity.name, exc_info=True)
+                        _store_start = time.perf_counter()
+                        try:
+                            self.vector_store.add_entity(
+                                entity_id=entity_id,
+                                name=entity.name,
+                                entity_type=entity.entity_type,
+                                dense_embedding=embedding,
+                                content=job.content[:500],
+                                confidence=entity.confidence,
+                            )
+                        finally:
+                            vector_store_time_ms += (time.perf_counter() - _store_start) * 1000
+                    except Exception:
+                        log.debug("Vector index upsert failed for %s", entity.name, exc_info=True)
 
             raw_relations_with_source: list[dict[str, Any]] = [
                 {**rel, "source": str(rel.get("source") or "gliner2").strip().lower() or "gliner2"}
