@@ -226,9 +226,20 @@ class ExtractionPipeline:
             except Exception:
                 log.debug("Vector index upsert failed for episode %s", episode.id, exc_info=True)
 
+            rels_created = 0
+            rels_skipped = 0
             for rel in relationships:
                 rel.episode_ids = [episode.id]
-                self.graph.upsert_relationship(rel)
+                result = self.graph.upsert_relationship(rel)
+                if result and result[0]:  # (id, status) — id is empty string if entity missing
+                    rels_created += 1
+                else:
+                    rels_skipped += 1
+            if rels_skipped:
+                log.info(
+                    "Relationships: %d created/updated, %d skipped (missing entities)",
+                    rels_created, rels_skipped,
+                )
 
             job.extracted_entities = stored_entities
             job.extracted_relationships = relationships

@@ -176,14 +176,14 @@ class GLiNERTrainingService:
     _finetune_running = False  # class-level concurrency guard
 
     async def run_gliner_finetune_pipeline(self) -> dict[str, Any]:
-        if GLiNERTrainingMixin._finetune_running:
+        if GLiNERTrainingService._finetune_running:
             log.warning("GLiNER fine-tune already running, skipping concurrent trigger")
             return {"status": "already_running", "message": "Fine-tune pipeline already in progress"}
-        GLiNERTrainingMixin._finetune_running = True
+        GLiNERTrainingService._finetune_running = True
         try:
             return await self._run_finetune_pipeline_inner()
         finally:
-            GLiNERTrainingMixin._finetune_running = False
+            GLiNERTrainingService._finetune_running = False
 
     async def _run_finetune_pipeline_inner(self) -> dict[str, Any]:
         rows = await asyncio.to_thread(self.load_accumulated_gliner_examples)
@@ -1035,7 +1035,7 @@ class GLiNERTrainingService:
                 """
                 MATCH (h:Entity)-[r]->(t:Entity)
                 WHERE h.name IN $names AND t.name IN $names
-                  AND (r.audit_status IS NULL OR r.audit_status <> 'quarantined')
+                  AND (r.audit_status IS NULL OR NOT r.audit_status IN ['quarantined', 'deleted'])
                 RETURN h.name AS head,
                        t.name AS tail,
                        type(r) AS label,
@@ -1376,8 +1376,8 @@ class GLiNERTrainingService:
                 "quarantine_count": quarantine_count,
             }
         except Exception as exc:
-            log.warning("Pre-training audit failed, allowing training to proceed: %s", exc)
-            return {"passed": True, "reason": f"audit_error_allowing_train: {exc}"}
+            log.error("Pre-training audit failed — BLOCKING training to protect data quality: %s", exc, exc_info=True)
+            return {"passed": False, "reason": f"audit_error_blocking_train: {exc}"}
 
     def to_gliner_training_record(self, row: dict[str, Any]) -> dict[str, Any] | None:
         text = str(row.get("text") or "").strip()

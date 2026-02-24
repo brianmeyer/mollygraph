@@ -231,8 +231,9 @@ class RelationshipMixin:
             tier=tier
         )
         
-        # Note: Relationship type cannot be parameterized in Cypher CREATE
-        session.run(f"""
+        # Note: Relationship type cannot be parameterized in Cypher CREATE.
+        # Use MERGE on entities first, then verify both exist before creating edge.
+        result = session.run(f"""
             MATCH (a:Entity {{name: $source}}), (b:Entity {{name: $target}})
             CREATE (a)-[r:{rel.relation_type} {{
                 id: $id,
@@ -250,6 +251,7 @@ class RelationshipMixin:
                 episode_ids: $episode_ids,
                 audit_status: $audit_status
             }}]->(b)
+            RETURN r.id AS created_id
         """, 
             source=rel.source_entity,
             target=rel.target_entity,
@@ -267,6 +269,14 @@ class RelationshipMixin:
             episode_ids=rel.episode_ids,
             audit_status=rel.audit_status
         )
+        
+        record = result.single()
+        if record is None:
+            log.warning(
+                "Relationship not created — missing entity: '%s' -[%s]-> '%s'",
+                rel.source_entity, rel.relation_type, rel.target_entity,
+            )
+            return ""
         
         return rel_id
 
