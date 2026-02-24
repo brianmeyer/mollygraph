@@ -224,7 +224,12 @@ def _apply_runtime_config(registry: dict[str, Any]) -> None:
         relation_model = ""
         registry["active_relation_model"] = ""
 
-    config.EXTRACTOR_BACKEND = backend
+    # Only apply registry backend if no explicit env override is set.
+    env_backend = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "").strip().lower()
+    if env_backend:
+        log.info("Registry: env MOLLYGRAPH_EXTRACTOR_BACKEND=%s takes precedence over registry backend=%s", env_backend, backend)
+    else:
+        config.EXTRACTOR_BACKEND = backend
     config.EXTRACTOR_MODEL = entity_model
     config.EXTRACTOR_RELATION_MODEL = relation_model
 

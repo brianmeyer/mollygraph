@@ -504,9 +504,11 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
         return {"entities": [], "relations": [], "latency_ms": 0}
 
     backend = _active_backend()
+    log.info("extract() called with backend=%s (config.EXTRACTOR_BACKEND=%s)", backend, getattr(config, "EXTRACTOR_BACKEND", "?"))
     t0 = time.monotonic()
 
     if backend == "hf_token_classification":
+        log.warning("Using HF fallback path for extraction — this should NOT happen if gliner2 is configured")
         entities = extract_entities(text, threshold=threshold)
         relations = _extract_relations_hf(text, entities=entities, threshold=threshold)
         latency_ms = int((time.monotonic() - t0) * 1000)
