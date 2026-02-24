@@ -18,19 +18,37 @@ class QueryMixin:
             as_of = datetime.utcnow()
         
         with self.driver.session() as session:
+            # Handle mixed types: some valid_at are strings, some neo4j DateTime.
+            # Use CASE to coerce strings to datetime for comparison.
             result = session.run("""
                 MATCH (e:Entity {name: $name})-[r]->(target)
-                WHERE coalesce(r.valid_at, r.valid_from) <= datetime($as_of)
-                  AND (
-                      coalesce(r.valid_until, r.valid_to) IS NULL
-                      OR coalesce(r.valid_until, r.valid_to) > datetime($as_of)
-                  )
+                WITH r, target,
+                     CASE
+                       WHEN r.valid_at IS NOT NULL AND r.valid_at starts with '2'
+                         THEN datetime(r.valid_at)
+                       WHEN r.valid_at IS NOT NULL THEN r.valid_at
+                       WHEN r.valid_from IS NOT NULL AND r.valid_from starts with '2'
+                         THEN datetime(r.valid_from)
+                       WHEN r.valid_from IS NOT NULL THEN r.valid_from
+                       ELSE datetime('1970-01-01T00:00:00Z')
+                     END AS effective_start,
+                     CASE
+                       WHEN r.valid_until IS NOT NULL AND r.valid_until starts with '2'
+                         THEN datetime(r.valid_until)
+                       WHEN r.valid_until IS NOT NULL THEN r.valid_until
+                       WHEN r.valid_to IS NOT NULL AND r.valid_to starts with '2'
+                         THEN datetime(r.valid_to)
+                       WHEN r.valid_to IS NOT NULL THEN r.valid_to
+                       ELSE NULL
+                     END AS effective_end
+                WHERE effective_start <= datetime($as_of)
+                  AND (effective_end IS NULL OR effective_end > datetime($as_of))
                 RETURN type(r) as rel_type, 
                        target.name as target_name,
                        target.entity_type as target_type,
                        r.strength as strength,
                        r.confidence as confidence
-                ORDER BY r.strength DESC, coalesce(r.valid_at, r.valid_from) DESC
+                ORDER BY r.strength DESC, effective_start DESC
             """, name=entity_name, as_of=as_of.isoformat())
             
             return [dict(record) for record in result]
