@@ -686,7 +686,18 @@ async def apply_verdicts(
     rels: list[dict[str, Any]],
     verdicts: list[dict[str, Any]],
     dry_run: bool,
+    max_auto_deletes: int | None = None,
+    deletes_so_far: int = 0,
 ) -> dict[str, int]:
+    """Apply LLM audit verdicts to the graph.
+
+    Args:
+        rels: Relationship records that were audited.
+        verdicts: LLM verdict list (index-aligned with rels).
+        dry_run: When True, log only — do not mutate the graph.
+        max_auto_deletes: Cap on total delete actions for this run.  None = no cap.
+        deletes_so_far: Running delete count already applied in previous batches.
+    """
     graph = require_graph_instance()
     auto_fixed = 0
     quarantined = 0
@@ -818,6 +829,17 @@ async def apply_verdicts(
             continue
 
         if decision == "delete":
+            # Enforce blast-radius cap: skip delete if the cap has been reached.
+            if max_auto_deletes is not None and (deletes_so_far + deleted) >= max_auto_deletes:
+                log.warning(
+                    "audit auto-delete cap reached (%d/%d) — skipping delete of %s -[%s]-> %s",
+                    deletes_so_far + deleted,
+                    max_auto_deletes,
+                    rel["head"],
+                    rel["rel_type"],
+                    rel["tail"],
+                )
+                continue
             deleted += 1
             _write_audit_signal({
                 "timestamp": now_iso,
@@ -948,7 +970,28 @@ async def run_llm_audit(
                     parse_failures += 1
                     continue
 
-                outcome = await apply_verdicts(batch, verdicts, dry_run=dry_run)
+                # Determine delete cap: use config value, honour dry_run (no cap in dry runs).
+                max_deletes_cap: int | None = None
+                if not dry_run:
+                    max_deletes_cap = config.AUDIT_MAX_AUTO_DELETES
+
+                # Check if we have already hit the cap before applying this batch.
+                if max_deletes_cap is not None and deleted >= max_deletes_cap:
+                    log.warning(
+                        "audit auto-delete cap (%d) already reached — skipping delete verdicts for this batch",
+                        max_deletes_cap,
+                    )
+                    # Still apply non-delete verdicts (verify, reclassify, quarantine).
+                    verdicts_no_delete = [v for v in verdicts if v.get("verdict") != "delete"]
+                    outcome = await apply_verdicts(
+                        batch, verdicts_no_delete, dry_run=dry_run,
+                        max_auto_deletes=max_deletes_cap, deletes_so_far=deleted,
+                    )
+                else:
+                    outcome = await apply_verdicts(
+                        batch, verdicts, dry_run=dry_run,
+                        max_auto_deletes=max_deletes_cap, deletes_so_far=deleted,
+                    )
                 auto_fixed += outcome["auto_fixed"]
                 quarantined += outcome["quarantined"]
                 deleted += outcome["deleted"]
