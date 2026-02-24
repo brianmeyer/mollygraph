@@ -30,6 +30,12 @@ class FakeQueue:
     def get_processing_count(self):
         return self.processing
 
+    def get_stuck_count(self):
+        return 0
+
+    def get_dead_count(self):
+        return 0
+
 
 class FakeGraph:
     def get_current_facts(self, name: str):
@@ -87,6 +93,9 @@ class FakeVectorStore:
 
     def similarity_search(self, _embedding, top_k: int = 10, entity_type=None):
         return [{"name": "Brian", "score": 0.8}]
+
+    def is_degraded(self):
+        return False
 
 
 @pytest.fixture()
