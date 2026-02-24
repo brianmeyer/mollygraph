@@ -337,12 +337,31 @@ class RelationshipMixin:
     def _is_valid_rel_type(rel_type: str) -> bool:
         return rel_type in VALID_REL_TYPES and bool(_REL_TYPE_RE.match(rel_type))
 
-    def get_relationships_for_audit(self, limit: int = 500) -> List[Dict[str, Any]]:
-        safe_limit = max(1, int(limit))
+    def get_relationships_for_audit(self, limit: int = 500, schedule: str = "nightly") -> List[Dict[str, Any]]:
+        """Return relationships to audit, ordered by priority.
+
+        Nightly strategy (schedule='nightly'):
+          Priority 0 — new/unverified (audit_status IS NULL or 'unverified')
+          Priority 1 — previously flagged/quarantined (needs re-check)
+          Priority 2 — oldest-audited verified relationships (routine sweep)
+          Applies ``limit`` across all three groups.
+
+        Weekly strategy (schedule='weekly'):
+          Full sweep — up to 10 000 relationships regardless of status.
+        """
+        schedule_norm = (schedule or "nightly").strip().lower()
+        safe_limit = 10000 if schedule_norm == "weekly" else max(1, int(limit))
+
         with self.driver.session() as session:
             result = session.run(
                 """
                 MATCH (h:Entity)-[r]->(t:Entity)
+                WITH h, r, t,
+                  CASE
+                    WHEN r.audit_status IS NULL OR r.audit_status = 'unverified' THEN 0
+                    WHEN r.audit_status IN ['flagged', 'quarantined'] THEN 1
+                    ELSE 2
+                  END AS audit_priority
                 RETURN h.name AS head,
                        coalesce(h.entity_type, 'Concept') AS head_type,
                        t.name AS tail,
@@ -353,14 +372,80 @@ class RelationshipMixin:
                        coalesce(r.context_snippets, []) AS context_snippets,
                        coalesce(r.audit_status, 'unverified') AS audit_status,
                        coalesce(r.first_mentioned, r.observed_at, r.valid_at) AS first_mentioned,
-                       coalesce(r.last_mentioned, r.observed_at, r.valid_at) AS last_mentioned
-                ORDER BY coalesce(r.strength, 0.0) ASC,
-                         coalesce(r.last_mentioned, r.observed_at, r.valid_at) ASC
+                       coalesce(r.last_mentioned, r.observed_at, r.valid_at) AS last_mentioned,
+                       r.last_audited_at AS last_audited_at,
+                       elementId(r) AS element_id
+                ORDER BY audit_priority ASC,
+                         r.last_audited_at ASC
                 LIMIT $limit
                 """,
                 limit=safe_limit,
             )
             return [dict(record) for record in result]
+
+    def mark_relationships_audited(
+        self,
+        rel_ids: List[str],
+        status: str,
+        audited_at: datetime,
+    ) -> None:
+        """Batch-update audit_status and last_audited_at by Neo4j elementId.
+
+        Args:
+            rel_ids:    List of Neo4j elementId strings returned by
+                        ``get_relationships_for_audit()`` as ``element_id``.
+            status:     One of 'verified', 'flagged', 'quarantined', 'deleted'.
+            audited_at: Timestamp to record as last_audited_at.
+        """
+        if not rel_ids:
+            return
+        audited_at_iso = audited_at.isoformat()
+        with self.driver.session() as session:
+            session.run(
+                """
+                UNWIND $element_ids AS eid
+                MATCH ()-[r]->()
+                WHERE elementId(r) = eid
+                SET r.audit_status    = $status,
+                    r.last_audited_at = datetime($audited_at)
+                """,
+                element_ids=rel_ids,
+                status=status,
+                audited_at=audited_at_iso,
+            )
+
+    def get_audit_coverage_metrics(self) -> Dict[str, Any]:
+        """Return aggregate audit coverage statistics for the graph."""
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH ()-[r]->()
+                RETURN
+                  count(r) AS total,
+                  sum(CASE WHEN r.audit_status IS NULL OR r.audit_status = 'unverified'
+                           THEN 1 ELSE 0 END) AS unaudited,
+                  sum(CASE WHEN r.audit_status IN ['flagged', 'quarantined']
+                           THEN 1 ELSE 0 END) AS flagged
+                """
+            ).single()
+        if record is None:
+            return {
+                "total_relationships": 0,
+                "unaudited_count": 0,
+                "flagged_count": 0,
+                "coverage_pct": 0.0,
+            }
+        total    = int(record["total"])
+        unaudited = int(record["unaudited"])
+        flagged   = int(record["flagged"])
+        audited   = total - unaudited
+        coverage_pct = round((audited / total * 100), 1) if total > 0 else 0.0
+        return {
+            "total_relationships": total,
+            "unaudited_count": unaudited,
+            "flagged_count": flagged,
+            "coverage_pct": coverage_pct,
+        }
 
     def get_relationship_type_distribution(self) -> Dict[str, int]:
         with self.driver.session() as session:
@@ -382,11 +467,13 @@ class RelationshipMixin:
             session.run(
                 f"""
                 MATCH (h:Entity {{name: $head}})-[r:{normalized_type}]->(t:Entity {{name: $tail}})
-                SET r.audit_status = $status
+                SET r.audit_status    = $status,
+                    r.last_audited_at = datetime($audited_at)
                 """,
                 head=head,
                 tail=tail,
                 status=status,
+                audited_at=datetime.now(timezone.utc).isoformat(),
             )
 
     def reclassify_relationship(
