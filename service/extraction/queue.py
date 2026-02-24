@@ -12,6 +12,7 @@ from typing import List, Optional, Callable
 from contextlib import contextmanager
 
 import config as service_config
+from maintenance.lock import is_maintenance_locked
 from memory.models import ExtractionJob
 
 log = logging.getLogger(__name__)
@@ -246,6 +247,12 @@ class QueueWorker:
         log.info(f"Queue worker started (poll_interval={self.poll_interval}s)")
         
         while self.running:
+            # Pause extraction during maintenance to avoid race conditions
+            if is_maintenance_locked():
+                log.debug("Maintenance lock active — extraction paused")
+                await asyncio.sleep(5.0)
+                continue
+
             # Limit concurrent processing
             active = len([t for t in self._tasks if not t.done()])
             

@@ -27,6 +27,11 @@ _ADOPTION_HISTORY_PATH = SUGGESTIONS_DIR / "adoption_history.json"
 _MIN_DAYS = 3
 _MIN_OCCURRENCES = 5
 _MIN_FREQUENCY = 0.4
+MAX_NEW_RELATIONS_PER_CYCLE = 3
+MAX_NEW_ENTITIES_PER_CYCLE = 2
+MAX_TOTAL_ADOPTED_TYPES = 20
+SCHEMA_BLOCKLIST = {"single_char", "numeric_only", "len_lt_3"}
+_ADOPTED_SCHEMA_PATH = Path.home() / ".graph-memory" / "adopted_schema.json"
 
 
 def _utc_today() -> str:
@@ -430,6 +435,112 @@ def _adopt_entity_type(entity_type: str) -> bool:
         return False
 
 
+def _schema_blocked(value: str) -> bool:
+    compact = value.strip().replace(" ", "").replace("_", "")
+    if not compact:
+        return True
+    if "single_char" in SCHEMA_BLOCKLIST and len(compact) == 1:
+        return True
+    if "numeric_only" in SCHEMA_BLOCKLIST and compact.isdigit():
+        return True
+    if "len_lt_3" in SCHEMA_BLOCKLIST and len(compact) < 3:
+        return True
+    return False
+
+
+def _load_adopted_schema() -> dict[str, dict[str, dict[str, str]]]:
+    empty: dict[str, dict[str, dict[str, str]]] = {
+        "relations": {},
+        "entities": {},
+    }
+    if not _ADOPTED_SCHEMA_PATH.exists():
+        return empty
+
+    try:
+        payload = json.loads(_ADOPTED_SCHEMA_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        log.debug("Failed loading adopted schema file", exc_info=True)
+        return empty
+
+    if not isinstance(payload, dict):
+        return empty
+
+    relations = payload.get("relations", {})
+    entities = payload.get("entities", {})
+    if not isinstance(relations, dict):
+        relations = {}
+    if not isinstance(entities, dict):
+        entities = {}
+
+    cleaned_relations: dict[str, dict[str, str]] = {}
+    for key, value in relations.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            cleaned_relations[key] = {
+                "adopted_at": str(value.get("adopted_at") or ""),
+            }
+
+    cleaned_entities: dict[str, dict[str, str]] = {}
+    for key, value in entities.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            cleaned_entities[key] = {
+                "adopted_at": str(value.get("adopted_at") or ""),
+            }
+
+    return {"relations": cleaned_relations, "entities": cleaned_entities}
+
+
+def _save_adopted_schema(adopted: dict[str, dict[str, dict[str, str]]]) -> None:
+    _ADOPTED_SCHEMA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "relations": adopted.get("relations", {}),
+        "entities": adopted.get("entities", {}),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _ADOPTED_SCHEMA_PATH.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _record_adopted_types(adopted_rel_types: list[str], adopted_entity_types: list[str]) -> int:
+    if not adopted_rel_types and not adopted_entity_types:
+        existing = _load_adopted_schema()
+        return len(existing.get("relations", {})) + len(existing.get("entities", {}))
+
+    store = _load_adopted_schema()
+    now = datetime.now(timezone.utc).isoformat()
+
+    relations = store.setdefault("relations", {})
+    entities = store.setdefault("entities", {})
+
+    for rel_type in adopted_rel_types:
+        relations[str(rel_type)] = {"adopted_at": now}
+    for entity_type in adopted_entity_types:
+        entities[str(entity_type)] = {"adopted_at": now}
+
+    _save_adopted_schema(store)
+    return len(relations) + len(entities)
+
+
+def _apply_adopted_schema_on_load() -> None:
+    adopted = _load_adopted_schema()
+    adopted_rel = sorted(adopted.get("relations", {}).keys())
+    adopted_entities = sorted(adopted.get("entities", {}).keys())
+    total_adopted = len(adopted_rel) + len(adopted_entities)
+    if total_adopted > MAX_TOTAL_ADOPTED_TYPES:
+        log.warning(
+            "Persisted adopted schema has %d types, above limit %d; new auto-adoption will remain disabled",
+            total_adopted,
+            MAX_TOTAL_ADOPTED_TYPES,
+        )
+
+    for rel_type in adopted_rel:
+        _adopt_rel_type(rel_type)
+    for entity_type in adopted_entities:
+        _adopt_entity_type(entity_type)
+
+
 def run_auto_adoption(today: str | None = None) -> str:
     """Track and auto-adopt stable suggestions via frequency-ratio gates.
 
@@ -441,6 +552,19 @@ def run_auto_adoption(today: str | None = None) -> str:
     observed_day = today or _utc_today()
     today_counts = _build_today_counts(observed_day)
     history = _load_adoption_history()
+    existing_adopted_total = _record_adopted_types([], [])
+    if existing_adopted_total >= MAX_TOTAL_ADOPTED_TYPES:
+        log.warning(
+            "Auto-adoption disabled: adopted schema total is %d (limit=%d)",
+            existing_adopted_total,
+            MAX_TOTAL_ADOPTED_TYPES,
+        )
+        _save_adoption_history(history)
+        tracked_today = len(today_counts)
+        tracked_total = len(history)
+        return (
+            f"tracked {tracked_today} suggestions today ({tracked_total} active in history), adopted 0"
+        )
 
     for key, observation in today_counts.items():
         action = str(observation.get("action") or "")
@@ -482,7 +606,8 @@ def run_auto_adoption(today: str | None = None) -> str:
             existing["occurrences_by_day"] = occurrences_by_day
             existing["total_occurrences"] = sum(int(v) for v in occurrences_by_day.values())
 
-    adopted: list[str] = []
+    rel_candidates: list[tuple[str, dict[str, Any]]] = []
+    entity_candidates: list[tuple[str, dict[str, Any]]] = []
 
     for key in list(history.keys()):
         item = history[key]
@@ -504,13 +629,51 @@ def run_auto_adoption(today: str | None = None) -> str:
 
         action = str(item.get("action") or "")
         value = str(item.get("value") or "")
+        if _schema_blocked(value):
+            continue
+        if action == "add_rel_type" and value:
+            rel_candidates.append((key, item))
+        elif action == "add_entity_type" and value:
+            entity_candidates.append((key, item))
 
-        if action == "add_rel_type" and value and _adopt_rel_type(value):
+    rel_candidates.sort(
+        key=lambda item: (-int(item[1].get("total_occurrences") or 0), str(item[1].get("value") or ""))
+    )
+    entity_candidates.sort(
+        key=lambda item: (-int(item[1].get("total_occurrences") or 0), str(item[1].get("value") or ""))
+    )
+
+    remaining_capacity = max(0, MAX_TOTAL_ADOPTED_TYPES - existing_adopted_total)
+    max_rel = min(MAX_NEW_RELATIONS_PER_CYCLE, remaining_capacity)
+
+    adopted: list[str] = []
+    adopted_rel_types: list[str] = []
+    adopted_entity_types: list[str] = []
+
+    for key, item in rel_candidates[:max_rel]:
+        value = str(item.get("value") or "")
+        if _adopt_rel_type(value):
             adopted.append(f"rel_type:{value}")
+            adopted_rel_types.append(value)
             del history[key]
-        elif action == "add_entity_type" and value and _adopt_entity_type(value):
+
+    consumed_capacity = len(adopted_rel_types)
+    remaining_for_entities = max(0, remaining_capacity - consumed_capacity)
+    max_entities = min(MAX_NEW_ENTITIES_PER_CYCLE, remaining_for_entities)
+    for key, item in entity_candidates[:max_entities]:
+        value = str(item.get("value") or "")
+        if _adopt_entity_type(value):
             adopted.append(f"entity_type:{value}")
+            adopted_entity_types.append(value)
             del history[key]
+
+    total_after = _record_adopted_types(adopted_rel_types, adopted_entity_types)
+    if total_after > MAX_TOTAL_ADOPTED_TYPES:
+        log.warning(
+            "Adopted schema total exceeded limit after update (%d > %d); further adoption will stop",
+            total_after,
+            MAX_TOTAL_ADOPTED_TYPES,
+        )
 
     _save_adoption_history(history)
 
@@ -524,6 +687,9 @@ def run_auto_adoption(today: str | None = None) -> str:
         f"tracked {tracked_today} suggestions today ({tracked_total} active in history), "
         f"adopted {len(adopted)}: {adopted_text}"
     )
+
+
+_apply_adopted_schema_on_load()
 
 
 __all__ = [

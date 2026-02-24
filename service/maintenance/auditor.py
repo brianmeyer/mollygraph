@@ -10,6 +10,7 @@ from evolution.gliner_training import (
     cleanup_stale_gliner_training_examples,
     run_gliner_finetune_pipeline,
 )
+from maintenance.lock import maintenance_lock
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
 from runtime_vector_store import get_vector_store_instance
@@ -18,7 +19,17 @@ log = logging.getLogger(__name__)
 
 
 async def run_maintenance_cycle() -> dict[str, Any]:
-    """Run deterministic cleanup + audit + suggestions + GLiNER cycle."""
+    """Run deterministic cleanup + audit + suggestions + GLiNER cycle.
+    
+    Acquires maintenance lock so the extraction queue pauses during
+    bulk graph mutations (merge, delete, reclassify).
+    """
+    with maintenance_lock():
+        return await _run_maintenance_cycle_inner()
+
+
+async def _run_maintenance_cycle_inner() -> dict[str, Any]:
+    """Inner maintenance logic — runs under the maintenance lock."""
     started_at = datetime.now(timezone.utc).isoformat()
     graph = require_graph_instance()
 
