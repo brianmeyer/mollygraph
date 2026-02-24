@@ -131,34 +131,31 @@ def _merge_registry(base: dict[str, Any], payload: dict[str, Any]) -> dict[str, 
 
 
 def _apply_runtime_config(registry: dict[str, Any]) -> None:
-    provider = str(registry.get("active_provider") or "hash").strip().lower()
+    """Sync per-provider model names from registry into config.
+
+    IMPORTANT: This must NEVER override ``config.EMBEDDING_BACKEND``.
+    ``config.py`` (+ env vars) is the sole authority for the active backend.
+    The registry only maintains model lists so the API can report/switch them.
+    Overriding EMBEDDING_BACKEND here was the root cause of the tier chain
+    being bypassed (same class of bug as the extractor registry override).
+    """
     active_model = str(registry.get("active_model") or "").strip()
 
     hf_models = _dedupe_models([str(m) for m in registry.get("models", {}).get("huggingface", [])])
     ollama_models = _dedupe_models([str(m) for m in registry.get("models", {}).get("ollama", [])])
 
+    # Set per-provider model names (these are harmless — just model paths)
     if hf_models:
         config.EMBEDDING_MODEL = hf_models[0]
     if ollama_models:
         config.OLLAMA_EMBED_MODEL = ollama_models[0]
 
-    if provider == "hash":
-        config.EMBEDDING_BACKEND = "hash"
-        return
-
-    if provider == "huggingface":
-        config.EMBEDDING_BACKEND = "huggingface"
-        if active_model:
-            config.EMBEDDING_MODEL = active_model
-        return
-
-    if provider == "ollama":
-        config.EMBEDDING_BACKEND = "ollama"
-        if active_model:
-            config.OLLAMA_EMBED_MODEL = active_model
-        return
-
-    config.EMBEDDING_BACKEND = "hash"
+    # If the registry's active provider matches, update the model for that provider
+    provider = str(registry.get("active_provider") or "hash").strip().lower()
+    if provider == "huggingface" and active_model:
+        config.EMBEDDING_MODEL = active_model
+    elif provider == "ollama" and active_model:
+        config.OLLAMA_EMBED_MODEL = active_model
 
 
 def _load_registry_locked() -> dict[str, Any]:
