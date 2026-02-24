@@ -14,6 +14,9 @@ import config
 
 log = logging.getLogger(__name__)
 
+# Token regex matching GLiREL's internal tokenizer
+_GLIREL_TOKEN_RE = re.compile(r'\w+(?:[-_]\w+)*|\S')
+
 
 class GLiRELEnrichment:
     """Second-pass relation extraction + silver-label generation."""
@@ -34,11 +37,103 @@ class GLiRELEnrichment:
 
             from glirel import GLiREL  # lazy import (optional dependency at runtime)
 
+            cls._apply_glirel_compat_patch(GLiREL)
+
             log.info("Loading GLiREL model (%s)...", model_ref)
             cls._model = GLiREL.from_pretrained(model_ref, trust_remote_code=True)
             cls._model_ref = model_ref
             log.info("GLiREL model loaded.")
             return cls._model
+
+    @staticmethod
+    def _apply_glirel_compat_patch(GLiREL: Any) -> None:
+        """Patch GLiREL._from_pretrained for huggingface_hub >= 1.0 compatibility.
+
+        huggingface_hub dropped 'proxies' and 'resume_download' from the
+        ModelHubMixin.from_pretrained() call chain in v1.0. GLiREL 1.2.1 still
+        declares them as required keyword args in _from_pretrained, causing a
+        TypeError. This patch makes them optional with safe defaults and removes
+        them from hf_hub_download calls that no longer accept them.
+        """
+        import inspect
+        from pathlib import Path as _Path
+        from typing import Dict as _Dict, Optional as _Optional, Union as _Union
+
+        try:
+            orig_sig = inspect.signature(GLiREL._from_pretrained)
+        except Exception:
+            return  # can't introspect; skip patch
+
+        proxies_param = orig_sig.parameters.get("proxies")
+        resume_param = orig_sig.parameters.get("resume_download")
+
+        # Only patch if the params exist AND lack defaults (i.e. are still required)
+        needs_patch = (
+            proxies_param is not None
+            and proxies_param.default is inspect.Parameter.empty
+        ) or (
+            resume_param is not None
+            and resume_param.default is inspect.Parameter.empty
+        )
+        if not needs_patch:
+            return
+
+        log.debug("Applying GLiREL hf_hub compat patch (_from_pretrained)")
+
+        import torch as _torch
+        from huggingface_hub import hf_hub_download as _hf_hub_download
+
+        try:
+            from glirel.model import load_config_as_namespace as _load_cfg
+        except ImportError:
+            return  # can't patch safely
+
+        @classmethod  # type: ignore[misc]
+        def _patched_from_pretrained(
+            klass,
+            *,
+            model_id: str,
+            revision: _Optional[str] = None,
+            cache_dir: _Optional[_Union[str, _Path]] = None,
+            force_download: bool = False,
+            proxies: _Optional[_Dict] = None,  # kept for API compat, not forwarded
+            resume_download: bool = False,      # kept for API compat, not forwarded
+            local_files_only: bool = False,
+            token: _Union[str, bool, None] = None,
+            map_location: str = "cpu",
+            strict: bool = False,
+            **model_kwargs: Any,
+        ) -> Any:
+            model_file = _Path(model_id) / "pytorch_model.bin"
+            if not model_file.exists():
+                model_file = _hf_hub_download(
+                    repo_id=model_id,
+                    filename="pytorch_model.bin",
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    token=token,
+                    local_files_only=local_files_only,
+                )
+            config_file = _Path(model_id) / "glirel_config.json"
+            if not config_file.exists():
+                config_file = _hf_hub_download(
+                    repo_id=model_id,
+                    filename="glirel_config.json",
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    token=token,
+                    local_files_only=local_files_only,
+                )
+            cfg = _load_cfg(config_file)
+            model = klass(cfg)
+            state_dict = _torch.load(model_file, map_location=_torch.device(map_location))
+            model.load_state_dict(state_dict, strict=strict, assign=True)
+            model.to(map_location)
+            return model
+
+        GLiREL._from_pretrained = _patched_from_pretrained  # type: ignore[method-assign]
 
     def enrich_relations(self, text: str, entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Run GLiREL relation extraction over known entities from GLiNER2."""
@@ -47,17 +142,27 @@ class GLiRELEnrichment:
         if not getattr(config, "GLIREL_ENABLED", False):
             return []
 
-        spans = self._build_entity_spans(text, entities)
-        if len(spans) < 2:
+        tokens, ner_spans = self._build_entity_spans(text, entities)
+        if len(ner_spans) < 2:
+            log.debug("GLiREL: fewer than 2 entity spans found, skipping. spans=%s", ner_spans)
             return []
 
         labels = self._relation_labels()
         if not labels:
+            log.debug("GLiREL: no relation labels configured, skipping.")
             return []
 
         model = self._get_model()
-        raw = self._run_inference(model, text=text, spans=spans, labels=labels)
-        return self._normalize_relations(raw, spans)
+        threshold = float(getattr(config, "GLIREL_CONFIDENCE_THRESHOLD", 0.5))
+        raw = model.predict_relations(
+            tokens,
+            labels,
+            flat_ner=True,
+            threshold=threshold,
+            ner=ner_spans,
+            top_k=-1,
+        )
+        return self._normalize_relations(raw)
 
     def generate_training_examples(
         self,
@@ -125,92 +230,92 @@ class GLiRELEnrichment:
                 fh.write(json.dumps(row, ensure_ascii=True) + "\n")
         return str(path)
 
-    def _run_inference(
-        self,
-        model: Any,
-        text: str,
-        spans: list[dict[str, Any]],
-        labels: list[str],
-    ) -> Any:
-        threshold = float(getattr(config, "GLIREL_CONFIDENCE_THRESHOLD", 0.5))
+    def _build_entity_spans(
+        self, text: str, entities: list[dict[str, Any]]
+    ) -> tuple[list[str], list[list]]:
+        """Tokenize text and build GLiREL NER spans as token-index lists.
 
-        # Different GLiREL versions expose different call signatures.
-        if hasattr(model, "predict_relations"):
-            fn = getattr(model, "predict_relations")
-            call_specs = (
-                lambda: fn(text=text, labels=labels, ner=spans, threshold=threshold),
-                lambda: fn(text=text, labels=labels, entities=spans, threshold=threshold),
-                lambda: fn(text, labels, spans, threshold=threshold),
-                lambda: fn(text, labels=labels, threshold=threshold),
-                lambda: fn(text=text, labels=labels, threshold=threshold),
-            )
-        elif hasattr(model, "predict"):
-            fn = getattr(model, "predict")
-            call_specs = (
-                lambda: fn(text=text, labels=labels, ner=spans, threshold=threshold),
-                lambda: fn(text=text, labels=labels, entities=spans, threshold=threshold),
-                lambda: fn(text, labels),
-                lambda: fn(text=text, labels=labels),
-            )
-        else:
-            if not callable(model):
-                raise RuntimeError("GLiREL model has no supported inference method")
-            call_specs = (
-                lambda: model(text=text, labels=labels, ner=spans, threshold=threshold),
-                lambda: model(text=text, labels=labels, entities=spans, threshold=threshold),
-                lambda: model(text, labels),
-            )
+        Returns:
+            tokens: list of token strings (GLiREL's tokenized input)
+            ner_spans: list of [start_token_idx, end_token_idx, entity_type, entity_text]
+        """
+        # Tokenize using GLiREL's internal tokenizer pattern
+        token_matches = list(_GLIREL_TOKEN_RE.finditer(text))
+        tokens = [m.group() for m in token_matches]
+        tok_starts = [m.start() for m in token_matches]
+        tok_ends = [m.end() for m in token_matches]
 
-        last_error: Exception | None = None
-        for call in call_specs:
-            try:
-                return call()
-            except TypeError as exc:
-                last_error = exc
+        ner_spans: list[list] = []
+        seen: set[tuple[int, int]] = set()
+
+        for ent in entities:
+            if not isinstance(ent, dict):
                 continue
-        raise RuntimeError(f"GLiREL inference failed: {last_error}") from last_error
+            # Support both 'text' (GLiNER2 output) and 'name' (MollyGraph entity format)
+            raw_text = str(ent.get("text") or ent.get("name") or "").strip()
+            if not raw_text:
+                continue
+            # Support both 'label' and 'entity_type'
+            label = str(ent.get("label") or ent.get("entity_type") or "Concept").strip() or "Concept"
+
+            # Find first mention of entity name in the text (case-insensitive)
+            match = re.search(re.escape(raw_text), text, flags=re.IGNORECASE)
+            if not match:
+                log.debug("GLiREL: entity %r not found in text", raw_text)
+                continue
+
+            char_start, char_end = match.start(), match.end()
+
+            # Map character offsets → token indices
+            # start_tok: first token whose start >= char_start
+            # end_tok: last token whose end <= char_end
+            start_tok: int | None = None
+            end_tok: int | None = None
+            for i, (ts, te) in enumerate(zip(tok_starts, tok_ends)):
+                if start_tok is None and ts >= char_start:
+                    start_tok = i
+                if te <= char_end:
+                    end_tok = i
+
+            if start_tok is None or end_tok is None or end_tok < start_tok:
+                log.debug("GLiREL: could not map entity %r to token indices", raw_text)
+                continue
+
+            key = (start_tok, end_tok)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            matched_text = " ".join(tokens[start_tok : end_tok + 1])
+            ner_spans.append([start_tok, end_tok, label, matched_text])
+
+        log.debug("GLiREL: tokens=%d, ner_spans=%d", len(tokens), len(ner_spans))
+        return tokens, ner_spans
 
     def _normalize_relations(
         self,
         payload: Any,
-        spans: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        rows = payload if isinstance(payload, list) else payload.get("relations", []) if isinstance(payload, dict) else []
-        if not isinstance(rows, list):
-            return []
+        """Normalize GLiREL output to our standard relation format.
 
-        canonical = {
-            self._normalize(str(ent.get("text") or "")): str(ent.get("text") or "")
-            for ent in spans
-            if str(ent.get("text") or "").strip()
-        }
+        GLiREL returns list of dicts:
+          {'head_text': [tokens...], 'tail_text': [tokens...], 'label': str, 'score': float, ...}
+        """
+        rows = payload if isinstance(payload, list) else []
 
         out: dict[tuple[str, str, str], dict[str, Any]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
 
-            head = self._coerce_entity_text(
-                row.get("head"),
-                row.get("head_text"),
-                row.get("source"),
-                row.get("subject"),
-                row.get("arg1"),
-            )
-            tail = self._coerce_entity_text(
-                row.get("tail"),
-                row.get("tail_text"),
-                row.get("target"),
-                row.get("object"),
-                row.get("arg2"),
-            )
+            # head_text and tail_text are lists of token strings from GLiREL
+            head_raw = row.get("head_text", "")
+            tail_raw = row.get("tail_text", "")
+            head = " ".join(head_raw) if isinstance(head_raw, list) else str(head_raw or "").strip()
+            tail = " ".join(tail_raw) if isinstance(tail_raw, list) else str(tail_raw or "").strip()
+
             rel_type = str(
-                row.get("rel_type")
-                or row.get("relation")
-                or row.get("label")
-                or row.get("predicate")
-                or row.get("type")
-                or ""
+                row.get("label") or row.get("rel_type") or row.get("relation") or ""
             ).strip().upper().replace(" ", "_")
 
             if not head or not tail or not rel_type:
@@ -218,14 +323,12 @@ class GLiRELEnrichment:
             if self._normalize(head) == self._normalize(tail):
                 continue
 
-            head = canonical.get(self._normalize(head), head)
-            tail = canonical.get(self._normalize(tail), tail)
             confidence = max(
                 0.0,
                 min(
                     1.0,
                     self._safe_float(
-                        row.get("confidence", row.get("score", row.get("probability", row.get("prob", 0.0)))),
+                        row.get("score", row.get("confidence", row.get("probability", 0.0))),
                         0.0,
                     ),
                 ),
@@ -241,51 +344,6 @@ class GLiRELEnrichment:
                 }
 
         return sorted(out.values(), key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
-
-    @staticmethod
-    def _coerce_entity_text(*candidates: Any) -> str:
-        for candidate in candidates:
-            if isinstance(candidate, dict):
-                text = str(candidate.get("text") or candidate.get("name") or "").strip()
-                if text:
-                    return text
-            elif isinstance(candidate, str):
-                text = candidate.strip()
-                if text:
-                    return text
-        return ""
-
-    def _build_entity_spans(self, text: str, entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        spans: list[dict[str, Any]] = []
-        seen: set[tuple[int, int, str]] = set()
-
-        for ent in entities:
-            if not isinstance(ent, dict):
-                continue
-            raw_text = str(ent.get("text") or "").strip()
-            if not raw_text:
-                continue
-            label = str(ent.get("label") or "Concept").strip() or "Concept"
-
-            # Use first mention only to keep inference cost predictable.
-            match = re.search(re.escape(raw_text), text, flags=re.IGNORECASE)
-            if not match:
-                continue
-
-            start, end = int(match.start()), int(match.end())
-            key = (start, end, label)
-            if key in seen:
-                continue
-            seen.add(key)
-            spans.append(
-                {
-                    "text": text[start:end],
-                    "start": start,
-                    "end": end,
-                    "label": label,
-                }
-            )
-        return spans
 
     @staticmethod
     def _relation_labels() -> list[str]:
