@@ -748,7 +748,15 @@ def run_auto_adoption(today: str | None = None) -> str:
     )
 
 
-_apply_adopted_schema_on_load()
+def init_adopted_schema() -> None:
+    """Apply the persisted adopted schema to the in-memory state.
+
+    Must be called explicitly during application startup (e.g. from the
+    FastAPI lifespan handler) instead of at module import time.  Calling
+    at import time hits disk, mutates globals, and makes unit tests
+    non-hermetic because every import triggers side-effects.
+    """
+    _apply_adopted_schema_on_load()
 
 
 def persist_glirel_synonyms_for_relation(relation_name: str) -> None:
@@ -771,6 +779,7 @@ __all__ = [
     "build_suggestion_digest",
     "get_related_to_hotspots",
     "get_suggestions",
+    "init_adopted_schema",
     "log_entity_type_fallback",
     "log_relationship_fallback",
     "log_repeated_related_to",

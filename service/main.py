@@ -61,7 +61,7 @@ from maintenance.auditor import run_maintenance_cycle
 from maintenance.lock import is_maintenance_locked
 from memory.graph import BiTemporalGraph, VALID_REL_TYPES
 from memory import extractor as memory_extractor
-from memory.graph_suggestions import build_suggestion_digest
+from memory.graph_suggestions import build_suggestion_digest, init_adopted_schema
 from memory.models import ExtractionJob
 from memory.vector_store import VectorStore
 from runtime_graph import set_graph_instance
@@ -519,6 +519,11 @@ async def lifespan(_app: FastAPI):
 
     log.info("Starting MollyGraph service")
 
+    # Apply the persisted adopted schema to in-memory state.  Moved here from
+    # module-level execution (graph_suggestions.py) so that tests importing the
+    # module do not trigger disk I/O or mutate globals at import time.
+    init_adopted_schema()
+
     graph = BiTemporalGraph(config.NEO4J_URI, config.NEO4J_USER, config.NEO4J_PASSWORD)
     set_graph_instance(graph)
     try:
@@ -540,6 +545,24 @@ async def lifespan(_app: FastAPI):
 
     queue_worker = QueueWorker(queue=queue, processor=process_job, max_concurrent=3)
     _worker_task = asyncio.create_task(queue_worker.start())
+
+    # Reconcile any incomplete episodes left over from a previous crash.
+    try:
+        with graph.driver.session() as _s:
+            _incomplete_count = _s.run(
+                "MATCH (ep:Episode {incomplete: true}) RETURN count(ep) AS n"
+            ).single()["n"]
+        if _incomplete_count:
+            log.warning(
+                "Startup reconciliation: %d incomplete episode(s) found "
+                "(partial writes from a prior crash). "
+                "Inspect with: MATCH (ep:Episode {incomplete: true}) RETURN ep",
+                _incomplete_count,
+            )
+        else:
+            log.info("Startup reconciliation: no incomplete episodes found")
+    except Exception:
+        log.warning("Startup incomplete-episode reconciliation failed (non-fatal)", exc_info=True)
 
     # Auto-reindex vectors if Zvec is empty but Neo4j has entities.
     # This handles restarts after Zvec collection recreation/corruption.
@@ -659,7 +682,18 @@ async def health() -> dict[str, Any]:
         # Task is alive — reset restart counter so the next crash gets a retry.
         _worker_restart_count = 0
 
-    overall_status = "degraded" if worker_status == "degraded" else "healthy"
+    vector_degraded = bool(vector_store and vector_store.is_degraded())
+    if vector_degraded:
+        log.error(
+            "Vector store is in degraded mode — collection failed to open; "
+            "writes are no-ops and searches return empty results"
+        )
+
+    overall_status = (
+        "degraded"
+        if worker_status == "degraded" or vector_degraded
+        else "healthy"
+    )
 
     return {
         "status": overall_status,
@@ -671,6 +705,7 @@ async def health() -> dict[str, Any]:
         "queue_stuck": queue_stuck,
         "queue_dead": queue_dead,
         "vector_stats": vector_store.get_stats() if vector_store else {},
+        "vector_degraded": vector_degraded,
         "worker_status": worker_status,
         "worker_error": worker_error,
         "worker_restart_count": _worker_restart_count,
@@ -797,6 +832,7 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
         "processing": await asyncio.to_thread(queue.get_processing_count) if queue else 0,
         "stuck": await asyncio.to_thread(queue.get_stuck_count) if queue else 0,
         "dead": await asyncio.to_thread(queue.get_dead_count) if queue else 0,
+        "incomplete_episodes": incomplete_episodes,
     }
 
     vector_stats = vector_store.get_stats() if vector_store else {}
@@ -809,12 +845,20 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
     }
     rel_distribution: dict[str, int] = {}
 
+    incomplete_episodes = 0
     if not config.TEST_MODE and graph is not None:
         try:
             graph_summary = graph.get_graph_summary()
             rel_distribution = graph.get_relationship_type_distribution()
         except Exception:
             log.debug("Graph summary unavailable", exc_info=True)
+        try:
+            with graph.driver.session() as _s:
+                incomplete_episodes = _s.run(
+                    "MATCH (ep:Episode {incomplete: true}) RETURN count(ep) AS n"
+                ).single()["n"]
+        except Exception:
+            log.debug("Incomplete episode count unavailable", exc_info=True)
 
     graph_summary = _json_safe(graph_summary)
     rel_distribution = {str(k): int(v) for k, v in _json_safe(rel_distribution).items()}
