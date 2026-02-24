@@ -2628,7 +2628,9 @@ class GLiNERTrainingService:
         if last_finetune:
             now = datetime.now(timezone.utc)
             elapsed = now - last_finetune
-            cooldown = timedelta(days=GLINER_FINETUNE_COOLDOWN_DAYS)
+            last_strategy = str(self.state.get("gliner_last_training_strategy", "lora") or "lora")
+            cooldown_days = GLINER_LORA_COOLDOWN_DAYS if last_strategy == "lora" else GLINER_FINETUNE_COOLDOWN_DAYS
+            cooldown = timedelta(days=cooldown_days)
             if elapsed < cooldown:
                 cooldown_remaining_hours = int((cooldown - elapsed).total_seconds() // 3600)
 
