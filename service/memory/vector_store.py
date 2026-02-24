@@ -245,21 +245,46 @@ class ZvecBackend(VectorStoreBackend):
         collection_exists = self.db_path.exists()
         
         if collection_exists:
-            # Clear ALL stale lock files to prevent "Can't open lock file" on restart
+            # Clear ALL stale lock files to prevent "Can't open lock file" on restart.
+            # These are RocksDB-style lock files that persist after unclean shutdown.
             for lock_file in self.db_path.rglob("LOCK"):
                 try:
                     lock_file.unlink()
                     log.info("Cleared stale Zvec LOCK file: %s", lock_file)
                 except OSError:
                     pass
-            try:
-                self.collection = zvec.open(str(self.db_path))
-                log.info(f"Opened existing Zvec collection: {self.db_path}")
-            except RuntimeError as exc:
-                log.warning("Failed to open Zvec collection (%s), recreating from scratch", exc)
-                import shutil
-                shutil.rmtree(self.db_path)
-                collection_exists = False  # fall through to creation below
+
+            # Retry open after lock cleanup — RocksDB sometimes needs a moment
+            import time
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    self.collection = zvec.open(str(self.db_path))
+                    log.info("Opened existing Zvec collection: %s (attempt %d)", self.db_path, attempt + 1)
+                    break
+                except RuntimeError as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        # Clear locks again and retry
+                        for lock_file in self.db_path.rglob("LOCK"):
+                            try:
+                                lock_file.unlink()
+                            except OSError:
+                                pass
+                        time.sleep(0.5 * (attempt + 1))
+                        log.warning("Zvec open attempt %d failed (%s), retrying...", attempt + 1, exc)
+            else:
+                # All retries failed — but DON'T destroy the data.
+                # Fall back to SQLite vec backend instead of wiping.
+                log.error(
+                    "Failed to open Zvec collection after 3 attempts (%s). "
+                    "NOT wiping data. Falling back to in-memory mode. "
+                    "Vector search will be degraded until next successful restart.",
+                    last_exc,
+                )
+                # Create a minimal in-memory stub so the service can still start
+                self.collection = None
+                return  # skip creation, run degraded
         if not collection_exists:
             # Create new collection with schema
             # Vector schema with HNSW index for cosine similarity
@@ -302,6 +327,9 @@ class ZvecBackend(VectorStoreBackend):
     def add_entity(self, entity_id: str, name: str, entity_type: str,
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
         """Insert entity into Zvec collection."""
+        if self.collection is None:
+            log.debug("Zvec degraded — skipping add_entity(%s)", entity_id)
+            return
         doc = zvec.Doc(
             id=entity_id,
             vectors={"embedding": dense_embedding},
@@ -318,6 +346,9 @@ class ZvecBackend(VectorStoreBackend):
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
         """Search similar vectors using cosine similarity."""
+        if self.collection is None:
+            log.debug("Zvec degraded — returning empty results for similarity_search")
+            return []
         # Build filter if entity_type specified
         filter_expr = None
         if entity_type:
@@ -359,6 +390,8 @@ class ZvecBackend(VectorStoreBackend):
     
     def remove_entity(self, entity_id: str) -> bool:
         """Delete a vector by entity_id using zvec collection.delete()."""
+        if self.collection is None:
+            return False
         try:
             result = self.collection.delete(ids=entity_id)
             # result is a Status-like object; code=0 means success
@@ -386,6 +419,8 @@ class ZvecBackend(VectorStoreBackend):
 
     def get_stats(self) -> Dict:
         """Get collection stats."""
+        if self.collection is None:
+            return {"entities": 0, "backend": "zvec", "degraded": True}
         stats = self.collection.stats
         entities = getattr(stats, "num_entities", None)
         if entities is None:
