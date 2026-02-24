@@ -224,12 +224,43 @@ def _apply_runtime_config(registry: dict[str, Any]) -> None:
         relation_model = ""
         registry["active_relation_model"] = ""
 
-    # NEVER override config.EXTRACTOR_BACKEND from the registry.
-    # The registry file was the source of persistent hf_token_classification bugs.
-    # config.py sets the canonical backend from env var / default.
-    log.debug("Registry backend=%s (not applied — config.EXTRACTOR_BACKEND=%s is canonical)", backend, getattr(config, "EXTRACTOR_BACKEND", "?"))
-    config.EXTRACTOR_MODEL = entity_model
-    config.EXTRACTOR_RELATION_MODEL = relation_model
+    # ── Env-var priority: NEVER let the registry file override explicit env vars ──
+    #
+    # config.EXTRACTOR_BACKEND is already canonical (never overridden from registry).
+    # We apply the same protection to EXTRACTOR_MODEL and EXTRACTOR_RELATION_MODEL:
+    # if the user set either env var explicitly, we must not clobber it with a stale
+    # registry value, especially when the registry's backend differs from the active
+    # backend (e.g. registry saved hf_token_classification model but env says gliner2).
+    canonical_backend = str(getattr(config, "EXTRACTOR_BACKEND", "gliner2") or "gliner2").strip().lower()
+    canonical_backend = _BACKEND_ALIASES.get(canonical_backend, canonical_backend)
+    if canonical_backend not in SUPPORTED_BACKENDS:
+        canonical_backend = "gliner2"
+
+    log.debug(
+        "Registry backend=%s (not applied — config.EXTRACTOR_BACKEND=%s is canonical)",
+        backend,
+        canonical_backend,
+    )
+
+    # Only apply entity_model from registry when:
+    # 1. MOLLYGRAPH_EXTRACTOR_MODEL env var is not explicitly set, AND
+    # 2. The registry's backend matches the active canonical backend
+    #    (prevents a stale hf model from leaking into a gliner2 session)
+    if not os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL"):
+        if backend == canonical_backend:
+            config.EXTRACTOR_MODEL = entity_model
+        else:
+            # Backend mismatch: registry has a model for a different backend.
+            # Leave config.EXTRACTOR_MODEL at its default (empty) so
+            # _resolve_gliner_model_ref() picks the correct local model.
+            log.debug(
+                "Registry entity_model=%r skipped (registry backend=%s != canonical=%s)",
+                entity_model, backend, canonical_backend,
+            )
+
+    # Only apply relation_model from registry when env var is not explicitly set
+    if not os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_MODEL"):
+        config.EXTRACTOR_RELATION_MODEL = relation_model
 
 
 def _load_registry_locked() -> dict[str, Any]:

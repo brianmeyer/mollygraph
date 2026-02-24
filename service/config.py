@@ -87,6 +87,11 @@ OLLAMA_EMBED_MODEL = os.environ.get("MOLLYGRAPH_OLLAMA_EMBED_MODEL", "nomic-embe
 EXTRACTOR_BACKEND = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "gliner2").strip().lower()
 EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
 EXTRACTOR_RELATION_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_MODEL", "Babelscape/rebel-large").strip()
+# Optional: force HF seq2seq relation extraction even when entity backend is
+# gliner2.  Set to "hf" or "rebel" to enable mixed-mode (gliner2 entities +
+# REBEL relations).  Leave empty to use the entity backend's native relation
+# extraction (default: gliner2 handles both).
+EXTRACTOR_RELATION_BACKEND = os.environ.get("MOLLYGRAPH_EXTRACTOR_RELATION_BACKEND", "").strip().lower()
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")

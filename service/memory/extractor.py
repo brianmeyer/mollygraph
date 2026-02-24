@@ -3,6 +3,13 @@
 Backends:
 - gliner2: entities + relations
 - hf_token_classification: entities + relations (with separate relation model)
+
+Environment variables (all via config.py):
+- MOLLYGRAPH_EXTRACTOR_BACKEND     : "gliner2" (default) or "hf_token_classification"
+- MOLLYGRAPH_EXTRACTOR_MODEL       : override entity model path/name
+- MOLLYGRAPH_EXTRACTOR_RELATION_MODEL : override relation model for HF backend
+- MOLLYGRAPH_EXTRACTOR_RELATION_BACKEND : "hf" or "rebel" to force HF relation
+  extraction even when the entity backend is gliner2 (mixed-mode)
 """
 from __future__ import annotations
 
@@ -17,7 +24,11 @@ from extractor_schema_registry import get_effective_extractor_schema
 log = logging.getLogger(__name__)
 
 _model: Any | None = None
-_relation_model: Any | None = None
+# For the HF relation backend we store (model, tokenizer) instead of a pipeline.
+# The pipeline("text-generation") approach loads REBEL as BartForCausalLM with
+# mismatched weights on transformers 5.x.  Using AutoModelForSeq2SeqLM directly
+# is the only reliable approach for seq2seq relation extraction models.
+_relation_model: tuple[Any, Any] | None = None  # (AutoModelForSeq2SeqLM, AutoTokenizer)
 _model_lock = threading.Lock()
 _model_backend: str = ""
 _model_ref: str = ""
@@ -63,6 +74,20 @@ def _active_relation_model_ref() -> str:
     return str(getattr(config, "EXTRACTOR_RELATION_MODEL", "") or "").strip()
 
 
+def _active_relation_backend() -> str:
+    """Return the relation extraction backend to use.
+
+    Normally this is the same as the entity backend.  When
+    MOLLYGRAPH_EXTRACTOR_RELATION_BACKEND is set to "hf" or "rebel" the
+    caller should use the HF seq2seq path for relations even if entities come
+    from gliner2 (mixed-mode).
+    """
+    override = str(getattr(config, "EXTRACTOR_RELATION_BACKEND", "") or "").strip().lower()
+    if override in {"hf", "rebel", "hf_token_classification"}:
+        return "hf_token_classification"
+    return _active_backend()
+
+
 def invalidate_model_cache() -> None:
     """Clear cached extractor model so runtime config changes take effect."""
     global _model, _relation_model, _model_backend, _model_ref, _model_mtime, _relation_model_backend, _relation_model_ref
@@ -77,6 +102,13 @@ def invalidate_model_cache() -> None:
 
 
 def _resolve_gliner_model_ref(selected_model: str) -> str:
+    """Resolve which GLiNER model to load.
+
+    Priority:
+    1. selected_model (from MOLLYGRAPH_EXTRACTOR_MODEL env var or API)
+    2. ~/.graph-memory/models/gliner_active (local fine-tuned, if present)
+    3. config.GLINER_BASE_MODEL (HuggingFace fallback)
+    """
     if selected_model:
         return selected_model
     active_dir = config.MODELS_DIR / "gliner_active"
@@ -85,21 +117,27 @@ def _resolve_gliner_model_ref(selected_model: str) -> str:
     return str(config.GLINER_BASE_MODEL)
 
 
-def _load_base_gliner_model() -> Any:
-    """Load the base GLiNER2 model from HuggingFace (or local cache)."""
+def _load_gliner_model(model_ref: str) -> Any:
+    """Load a GLiNER2 model from a local path or a HuggingFace model ID.
+
+    GLiNER2.from_pretrained() handles both cases natively — this is a thin
+    wrapper that gives us a consistent single entry point.
+    """
     from gliner2 import GLiNER2
 
-    log.info("Loading GLiNER2 base model (%s)...", config.GLINER_BASE_MODEL)
-    m = GLiNER2.from_pretrained(str(config.GLINER_BASE_MODEL))
-    log.info("GLiNER2 base model loaded.")
+    log.info("Loading GLiNER2 model (%s)...", model_ref)
+    m = GLiNER2.from_pretrained(model_ref)
+    log.info("GLiNER2 model loaded.")
     return m
 
 
-def _load_gliner_model_from_dir(model_dir: str) -> Any:
-    """Load a GLiNER2 model from a local directory path."""
-    from gliner2 import GLiNER2
+# Kept for backwards compat with callers that used these names.
+def _load_base_gliner_model() -> Any:
+    return _load_gliner_model(str(config.GLINER_BASE_MODEL))
 
-    return GLiNER2.from_pretrained(model_dir)
+
+def _load_gliner_model_from_dir(model_dir: str) -> Any:
+    return _load_gliner_model(model_dir)
 
 
 def _get_model() -> Any:
@@ -176,7 +214,7 @@ def _get_model() -> Any:
                     resolved_ref, current_mtime,
                 )
                 try:
-                    model = _load_gliner_model_from_dir(resolved_ref)
+                    model = _load_gliner_model(resolved_ref)
                 except Exception as exc:
                     log.error(
                         "Failed to hot-reload GLiNER2 model from %s: %s", resolved_ref, exc
@@ -187,9 +225,10 @@ def _get_model() -> Any:
                     resolved_ref = str(config.GLINER_BASE_MODEL)
                     current_mtime = None
             else:
-                log.info("Loading GLiNER2 model (%s)...", resolved_ref)
-                model = _load_gliner_model_from_dir(resolved_ref) if _os.path.isdir(resolved_ref) else _load_base_gliner_model()
-                log.info("GLiNER2 model loaded.")
+                # resolved_ref may be a local directory without a detectable mtime
+                # change, or a HuggingFace model ID.  Both cases are handled by
+                # _load_gliner_model() which calls GLiNER2.from_pretrained().
+                model = _load_gliner_model(resolved_ref)
 
             _model = model
             _model_backend = backend
@@ -223,50 +262,67 @@ def _get_model() -> Any:
         return _model
 
 
-def _get_relation_model_hf() -> Any | None:
-    """Load relation extraction model for HF backend."""
+def _should_use_hf_relation() -> bool:
+    """Return True when the relation extraction path should use HF seq2seq.
+
+    True when:
+    - entity backend is hf_token_classification (always uses HF relation model)
+    - OR MOLLYGRAPH_EXTRACTOR_RELATION_BACKEND is set to "hf"/"rebel" (mixed mode)
+    """
+    return _active_relation_backend() == "hf_token_classification"
+
+
+def _get_relation_model_hf() -> tuple[Any, Any] | None:
+    """Load relation extraction model (model, tokenizer) for HF/seq2seq path.
+
+    Returns a (AutoModelForSeq2SeqLM, AutoTokenizer) tuple, or None if no
+    relation model is configured.
+
+    Uses AutoModelForSeq2SeqLM directly instead of the pipeline() API because
+    transformers 5.x removed text2text-generation from the pipeline registry
+    and the text-generation pipeline loads BART/T5 models with the wrong
+    architecture class (BartForCausalLM instead of BartForConditionalGeneration),
+    producing garbage output and weight mismatch warnings.
+    """
     global _relation_model, _relation_model_backend, _relation_model_ref
 
-    backend = _active_backend()
-    if backend != "hf_token_classification":
+    if not _should_use_hf_relation():
         return None
 
     relation_ref = _active_relation_model_ref()
     if not relation_ref:
         return None
 
+    # Cache key uses the canonical relation backend string.
+    rel_backend_key = "hf_relation"
+
     if (
         _relation_model is not None
-        and _relation_model_backend == backend
+        and _relation_model_backend == rel_backend_key
         and _relation_model_ref == relation_ref
     ):
-        return _relation_model
+        return _relation_model  # type: ignore[return-value]
 
     with _model_lock:
         if (
             _relation_model is not None
-            and _relation_model_backend == backend
+            and _relation_model_backend == rel_backend_key
             and _relation_model_ref == relation_ref
         ):
-            return _relation_model
+            return _relation_model  # type: ignore[return-value]
 
-        from transformers import pipeline
-        from transformers.pipelines import PIPELINE_REGISTRY
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        log.info("Loading HF relation model (%s)...", relation_ref)
-        # transformers 5.x merged text2text-generation into text-generation
-        task = "text2text-generation" if "text2text-generation" in PIPELINE_REGISTRY.supported_tasks else "text-generation"
-        model = pipeline(
-            task,
-            model=relation_ref,
-            tokenizer=relation_ref,
-        )
-        log.info("HF relation model loaded.")
+        log.info("Loading HF seq2seq relation model (%s) via AutoModelForSeq2SeqLM...", relation_ref)
+        tokenizer = AutoTokenizer.from_pretrained(relation_ref)
+        model = AutoModelForSeq2SeqLM.from_pretrained(relation_ref)
+        log.info("HF seq2seq relation model loaded.")
 
-        _relation_model = model
-        _relation_model_backend = backend
+        pair: tuple[Any, Any] = (model, tokenizer)
+        _relation_model = pair  # type: ignore[assignment]
+        _relation_model_backend = rel_backend_key
         _relation_model_ref = relation_ref
-        return _relation_model
+        return pair
 
 
 def _build_schema():
@@ -285,7 +341,7 @@ def _normalize_hf_label(raw_label: Any) -> str:
     label = str(raw_label or "").strip().upper()
     for prefix in ("B-", "I-", "L-", "U-", "S-", "E-"):
         if label.startswith(prefix):
-            label = label[len(prefix) :]
+            label = label[len(prefix):]
             break
     if label.startswith("LABEL_"):
         label = label[6:]
@@ -407,61 +463,69 @@ def _extract_relations_hf(
     entities: list[dict[str, Any]],
     threshold: float = 0.4,
 ) -> list[dict[str, Any]]:
-    relation_model = _get_relation_model_hf()
-    if relation_model is None:
+    """Extract relations using a HF seq2seq model (e.g. REBEL).
+
+    Uses AutoModelForSeq2SeqLM + tokenizer directly — NOT the pipeline API —
+    because transformers 5.x removed text2text-generation from the pipeline
+    registry and the fallback text-generation pipeline loads seq2seq models
+    with the wrong architecture class.
+    """
+    result = _get_relation_model_hf()
+    if result is None:
         return []
 
+    rel_model, rel_tokenizer = result
+
     try:
-        generations = relation_model(
+        import torch
+        inputs = rel_tokenizer(
             text[:5000],
-            max_new_tokens=256,
-            do_sample=False,
+            return_tensors="pt",
+            max_length=512,
             truncation=True,
         )
+        with torch.no_grad():
+            generated_ids = rel_model.generate(
+                **inputs,
+                max_new_tokens=256,
+            )
+        raw_text = rel_tokenizer.decode(generated_ids[0], skip_special_tokens=False)
     except Exception as exc:
         if getattr(config, "STRICT_AI", False):
             raise RuntimeError("HF relation extraction failed in strict_ai mode.") from exc
         log.error("HF relation extraction failed", exc_info=True)
         return []
 
-    if not isinstance(generations, list):
-        return []
-
-    relations: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
     base_score = 0.6
     if base_score < threshold:
         return []
 
-    for item in generations:
-        if not isinstance(item, dict):
+    relations: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for triplet in _parse_rebel_triplets(raw_text):
+        head = _resolve_entity_name(str(triplet.get("head") or ""), entities)
+        tail = _resolve_entity_name(str(triplet.get("tail") or ""), entities)
+        label = " ".join(str(triplet.get("label") or "").split()).strip().lower()
+
+        if not head or not tail or not label:
             continue
-        raw_text = str(item.get("generated_text") or "").strip()
-        if not raw_text:
+        if head.lower() == tail.lower():
             continue
-        for triplet in _parse_rebel_triplets(raw_text):
-            head = _resolve_entity_name(str(triplet.get("head") or ""), entities)
-            tail = _resolve_entity_name(str(triplet.get("tail") or ""), entities)
-            label = " ".join(str(triplet.get("label") or "").split()).strip().lower()
 
-            if not head or not tail or not label:
-                continue
-            if head.lower() == tail.lower():
-                continue
+        key = (head.lower(), label, tail.lower())
+        if key in seen:
+            continue
+        seen.add(key)
 
-            key = (head.lower(), label, tail.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-
-            relations.append(
-                {
-                    "head": head,
-                    "tail": tail,
-                    "label": label,
-                    "score": base_score,
-                }
-            )
+        relations.append(
+            {
+                "head": head,
+                "tail": tail,
+                "label": label,
+                "score": base_score,
+            }
+        )
     return relations
 
 
@@ -507,16 +571,42 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
         return {"entities": [], "relations": [], "latency_ms": 0}
 
     backend = _active_backend()
-    log.info("extract() called with backend=%s (config.EXTRACTOR_BACKEND=%s)", backend, getattr(config, "EXTRACTOR_BACKEND", "?"))
+    relation_backend = _active_relation_backend()
+    log.info(
+        "extract() called with entity_backend=%s relation_backend=%s "
+        "(config.EXTRACTOR_BACKEND=%s EXTRACTOR_RELATION_BACKEND=%s)",
+        backend,
+        relation_backend,
+        getattr(config, "EXTRACTOR_BACKEND", "?"),
+        getattr(config, "EXTRACTOR_RELATION_BACKEND", ""),
+    )
     t0 = time.monotonic()
 
     if backend == "hf_token_classification":
-        log.warning("Using HF fallback path for extraction — this should NOT happen if gliner2 is configured")
+        # Pure HF path: token-classification entities + seq2seq relations
         entities = extract_entities(text, threshold=threshold)
         relations = _extract_relations_hf(text, entities=entities, threshold=threshold)
         latency_ms = int((time.monotonic() - t0) * 1000)
         return {"entities": entities, "relations": relations, "latency_ms": latency_ms}
 
+    # ── GLiNER2 entity backend ─────────────────────────────────────────────
+    if relation_backend == "hf_token_classification":
+        # Mixed mode: gliner2 entities + HF seq2seq relations
+        log.info(
+            "Mixed extraction mode: gliner2 entities + HF seq2seq relations "
+            "(EXTRACTOR_RELATION_BACKEND=%s)",
+            getattr(config, "EXTRACTOR_RELATION_BACKEND", ""),
+        )
+        entities = extract_entities(text, threshold=threshold)
+        relations = _extract_relations_hf(text, entities=entities, threshold=threshold)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        log.debug(
+            "Mixed-mode extracted %d entities, %d relations in %dms",
+            len(entities), len(relations), latency_ms,
+        )
+        return {"entities": entities, "relations": relations, "latency_ms": latency_ms}
+
+    # ── Default: GLiNER2 handles both entities and relations ───────────────
     try:
         model = _get_model()
         schema = _build_schema()
@@ -530,13 +620,13 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
     latency_ms = int((time.monotonic() - t0) * 1000)
 
     entity_dict = result.get("entities", {})
-    entities: list[dict[str, Any]] = []
+    entities_out: list[dict[str, Any]] = []
     for etype, items in entity_dict.items():
         if not isinstance(items, list):
             continue
         for item in items:
             if isinstance(item, dict):
-                entities.append(
+                entities_out.append(
                     {
                         "text": item.get("text", ""),
                         "label": etype,
@@ -545,7 +635,7 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
                 )
 
     rel_dict = result.get("relation_extraction", {})
-    relations: list[dict[str, Any]] = []
+    relations_out: list[dict[str, Any]] = []
     for rtype, items in rel_dict.items():
         if not isinstance(items, list):
             continue
@@ -560,7 +650,7 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
             tail_conf = tail.get("confidence", 0.5) if isinstance(tail, dict) else 0.5
 
             if head_text and tail_text:
-                relations.append(
+                relations_out.append(
                     {
                         "head": head_text,
                         "tail": tail_text,
@@ -571,10 +661,10 @@ def extract(text: str, threshold: float = 0.4) -> dict[str, Any]:
 
     log.debug(
         "Extracted %d entities, %d relations in %dms",
-        len(entities), len(relations), latency_ms,
+        len(entities_out), len(relations_out), latency_ms,
     )
 
-    return {"entities": entities, "relations": relations, "latency_ms": latency_ms}
+    return {"entities": entities_out, "relations": relations_out, "latency_ms": latency_ms}
 
 
 def prefetch_model(
@@ -600,9 +690,7 @@ def prefetch_model(
 
     if selected_backend == "gliner2":
         model_ref = _resolve_gliner_model_ref(selected_model)
-        from gliner2 import GLiNER2
-
-        GLiNER2.from_pretrained(model_ref)
+        _load_gliner_model(model_ref)
         return {"backend": selected_backend, "model": model_ref, "relation_model": "", "status": "ready"}
 
     model_ref = selected_model or _active_model_ref()
@@ -617,12 +705,13 @@ def prefetch_model(
             "No relation model provided for hf_token_classification prefetch. "
             "Set one via /extractors/config or pass relation_model explicitly."
         )
-    from transformers import pipeline
-    from transformers.pipelines import PIPELINE_REGISTRY
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 
     pipeline("token-classification", model=model_ref, tokenizer=model_ref, aggregation_strategy="simple")
-    rel_task = "text2text-generation" if "text2text-generation" in PIPELINE_REGISTRY.supported_tasks else "text-generation"
-    pipeline(rel_task, model=relation_ref, tokenizer=relation_ref)
+    # Use AutoModelForSeq2SeqLM for relation model — not the pipeline API
+    # (transformers 5.x removed text2text-generation from the pipeline registry)
+    AutoTokenizer.from_pretrained(relation_ref)
+    AutoModelForSeq2SeqLM.from_pretrained(relation_ref)
     return {
         "backend": selected_backend,
         "model": model_ref,
