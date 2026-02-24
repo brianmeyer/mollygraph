@@ -246,6 +246,48 @@ class ExtractionPipeline:
                 exc_info=True,
             )
 
+    def _finalize_episode(self, episode_id: str, entity_names: list[str]) -> None:
+        """Mark a pre-created episode as complete and populate entities_extracted.
+
+        Called after all entity and relationship writes succeed. Clears the
+        ``incomplete`` flag set by ``_mark_episode_incomplete()`` and wires
+        MENTIONS edges to the entities that were written this job.
+        """
+        try:
+            with self.graph.driver.session() as session:
+                session.run(
+                    """
+                    MATCH (ep:Episode {id: $episode_id})
+                    SET ep.incomplete = false,
+                        ep.incomplete_reason = null,
+                        ep.entities_extracted = $entity_names
+                    """,
+                    episode_id=episode_id,
+                    entity_names=entity_names,
+                )
+                if entity_names:
+                    session.run(
+                        """
+                        MATCH (ep:Episode {id: $episode_id})
+                        UNWIND $entities AS entity_name
+                        MATCH (e:Entity)
+                        WHERE toLower(e.name) = toLower(entity_name)
+                           OR any(alias IN coalesce(e.aliases, []) WHERE toLower(alias) = toLower(entity_name))
+                        MERGE (ep)-[:MENTIONS]->(e)
+                        SET e.last_seen = datetime(),
+                            e.last_mentioned = datetime()
+                        """,
+                        episode_id=episode_id,
+                        entities=entity_names,
+                    )
+            log.debug("Finalized episode %s (%d entities)", episode_id, len(entity_names))
+        except Exception:
+            log.warning(
+                "Failed to finalize episode %s — incomplete flag may persist",
+                episode_id,
+                exc_info=True,
+            )
+
     async def process_job(self, job: ExtractionJob) -> ExtractionJob:
         _t_start = time.perf_counter()
         embedding_time_ms = 0.0
@@ -281,6 +323,22 @@ class ExtractionPipeline:
                 gliner_entities=gliner_entities,
                 spacy_entities=spacy_entities,
             )
+
+            # ── Create episode with incomplete=True BEFORE any graph writes ─
+            # This ensures any crash during entity/relationship writes leaves
+            # a visible, reconcilable Episode node rather than silent partial data.
+            _episode_id = job.episode_id or str(uuid.uuid4())
+            _preliminary_episode = Episode(
+                id=_episode_id,
+                source=self._normalize_source(job.source),
+                content_preview=job.content[:500],
+                content_hash=self._hash_content(job.content),
+                occurred_at=job.reference_time,
+                entities_extracted=[],  # populated after entity writes in _finalize_episode()
+            )
+            self.graph.create_episode(_preliminary_episode)
+            episode_id_written = _episode_id
+            self._mark_episode_incomplete(_episode_id, reason="in-progress")
 
             entities = self._build_entities(raw_entities)
             canonical_names: dict[str, str] = {}
@@ -382,16 +440,10 @@ class ExtractionPipeline:
                 context=job.content,
             )
 
-            episode = Episode(
-                id=job.episode_id or str(uuid.uuid4()),
-                source=self._normalize_source(job.source),
-                content_preview=job.content[:500],
-                content_hash=self._hash_content(job.content),
-                occurred_at=job.reference_time,
-                entities_extracted=[entity.name for entity in stored_entities],
-            )
-            self.graph.create_episode(episode)
-            episode_id_written = episode.id  # track for failure reconciliation
+            # ── Finalize episode: mark complete + set entities_extracted ──────
+            # All entity writes succeeded. Clear the incomplete flag and wire
+            # MENTIONS edges to the entities extracted this job.
+            self._finalize_episode(_episode_id, [entity.name for entity in stored_entities])
 
             # Embed episode into vector store for semantic search
             try:
@@ -401,25 +453,25 @@ class ExtractionPipeline:
                     ep_embedding = self._text_embedding(job.content[:512])
                 finally:
                     embedding_time_ms += (time.perf_counter() - _episode_embed_start) * 1000
-                ep_slug = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"ep_{episode.id}")
+                ep_slug = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"ep_{_episode_id}")
                 _episode_store_start = time.perf_counter()
                 try:
                     self.vector_store.add_entity(
                         entity_id=ep_slug,
-                        name=f"Episode {episode.id[:8]}",
+                        name=f"Episode {_episode_id[:8]}",
                         entity_type="Episode",
                         dense_embedding=ep_embedding,
-                        content=episode.content_preview,
+                        content=job.content[:500],
                     )
                 finally:
                     vector_store_time_ms += (time.perf_counter() - _episode_store_start) * 1000
             except Exception:
-                log.debug("Vector index upsert failed for episode %s", episode.id, exc_info=True)
+                log.debug("Vector index upsert failed for episode %s", _episode_id, exc_info=True)
 
             rels_created = 0
             rels_skipped = 0
             for rel in relationships:
-                rel.episode_ids = [episode.id]
+                rel.episode_ids = [_episode_id]
                 result = self.graph.upsert_relationship(rel)
                 if result and result[0]:  # (id, status) — id is empty string if entity missing
                     rels_created += 1

@@ -827,14 +827,6 @@ async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[
 
 @app.get("/stats", response_model=StatsResponse)
 async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
-    queue_stats = {
-        "pending": await asyncio.to_thread(queue.get_pending_count) if queue else 0,
-        "processing": await asyncio.to_thread(queue.get_processing_count) if queue else 0,
-        "stuck": await asyncio.to_thread(queue.get_stuck_count) if queue else 0,
-        "dead": await asyncio.to_thread(queue.get_dead_count) if queue else 0,
-        "incomplete_episodes": incomplete_episodes,
-    }
-
     vector_stats = vector_store.get_stats() if vector_store else {}
     graph_summary = {
         "entity_count": 0,
@@ -844,8 +836,8 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
         "recent": [],
     }
     rel_distribution: dict[str, int] = {}
-
     incomplete_episodes = 0
+
     if not config.TEST_MODE and graph is not None:
         try:
             graph_summary = graph.get_graph_summary()
@@ -860,6 +852,13 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
         except Exception:
             log.debug("Incomplete episode count unavailable", exc_info=True)
 
+    queue_stats = {
+        "pending": await asyncio.to_thread(queue.get_pending_count) if queue else 0,
+        "processing": await asyncio.to_thread(queue.get_processing_count) if queue else 0,
+        "stuck": await asyncio.to_thread(queue.get_stuck_count) if queue else 0,
+        "dead": await asyncio.to_thread(queue.get_dead_count) if queue else 0,
+        "incomplete_episodes": incomplete_episodes,
+    }
     graph_summary = _json_safe(graph_summary)
     rel_distribution = {str(k): int(v) for k, v in _json_safe(rel_distribution).items()}
 
