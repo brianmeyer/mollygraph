@@ -62,6 +62,7 @@ from memory.graph_suggestions import build_suggestion_digest
 from memory.models import ExtractionJob
 from memory.vector_store import VectorStore
 from runtime_graph import set_graph_instance
+from runtime_pipeline import set_pipeline_instance
 from runtime_vector_store import set_vector_store_instance
 
 class _JsonFormatter(logging.Formatter):
@@ -402,6 +403,7 @@ async def lifespan(_app: FastAPI):
         vector_store = VectorStore(backend="auto")
     pipeline = ExtractionPipeline(graph=graph, vector_store=vector_store)
     set_vector_store_instance(vector_store)
+    set_pipeline_instance(pipeline)
     queue = ExtractionQueue()
 
     async def process_job(job: ExtractionJob) -> ExtractionJob:
@@ -424,6 +426,7 @@ async def lifespan(_app: FastAPI):
                 await _worker_task
             except asyncio.CancelledError:
                 pass
+        set_pipeline_instance(None)
         set_graph_instance(None)
         graph = None
 
@@ -543,7 +546,10 @@ async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[
             drift_pct_rel = ((num_rel_types - prev_rel) / prev_rel) * 100
         if prev_ent > 0:
             drift_pct_ent = ((num_entity_types - prev_ent) / prev_ent) * 100
-        alarm = drift_pct_rel > 5.0 or drift_pct_ent > 10.0
+        alarm = (
+            drift_pct_rel > config.SCHEMA_DRIFT_ALARM_REL_THRESHOLD
+            or drift_pct_ent > config.SCHEMA_DRIFT_ALARM_ENT_THRESHOLD
+        )
         prev_rel_set = set(yesterday_snap.get("rel_types", []))
         prev_ent_set = set(yesterday_snap.get("entity_types", []))
         new_rel_types = sorted(set(current_rel_types.keys()) - prev_rel_set)
@@ -573,7 +579,7 @@ async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[
         "drift_pct_rel_types": round(drift_pct_rel, 1),
         "drift_pct_entity_types": round(drift_pct_ent, 1),
         "alarm": alarm,
-        "alarm_threshold": "rel_types +5% or entity_types +10%",
+        "alarm_threshold": f"rel_types +{config.SCHEMA_DRIFT_ALARM_REL_THRESHOLD}% or entity_types +{config.SCHEMA_DRIFT_ALARM_ENT_THRESHOLD}%",
         "new_rel_types_today": new_rel_types,
         "new_entity_types_today": new_entity_types,
         "rel_type_distribution": {str(k): int(v) for k, v in current_rel_types.items()},
@@ -824,6 +830,32 @@ async def audit(req: AuditRequest, _api_key: str = Depends(verify_api_key)) -> d
         schedule=schedule,
         model_override=req.model,
     )
+
+
+@app.get("/audit/signals/stats", operation_id="get_audit_signals_stats")
+async def audit_signals_stats(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return counts of audit signals emitted since the last service restart.
+
+    Signal types tracked:
+    - ``relationship_reclassified``: rel type corrected to a valid type
+    - ``relationship_quarantined``: rel flagged as suspicious or uncertain
+    - ``relationship_removed``: rel deleted as wrong/spam
+    - ``relationship_verified``: rel confirmed as correct
+    - ``entity_reclassified``: entity type changed by audit
+    - ``entity_merged``: two entities merged into one
+    - ``entity_quarantined``: entity flagged for review
+    """
+    from audit.signals import get_signal_counts, SIGNAL_TYPES
+    counts = get_signal_counts()
+    # Ensure all known signal types appear in the response (even if zero)
+    full_counts = {st: counts.get(st, 0) for st in sorted(SIGNAL_TYPES)}
+    total = sum(full_counts.values())
+    return {
+        "signal_counts": full_counts,
+        "total_signals": total,
+        "note": "Counts reset on service restart",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 @app.get("/suggestions/digest", operation_id="get_suggestions_digest")
@@ -1116,6 +1148,99 @@ async def reconcile_vectors(
         ) from exc
 
 
+@app.post("/maintenance/refresh-embeddings")
+async def maintenance_refresh_embeddings(
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Re-compute stale embeddings for entities whose type was reclassified.
+
+    When the nightly audit reclassifies an entity (e.g. Person → Organization),
+    the vector embedding still reflects the old type.  This endpoint:
+    1. Queries Neo4j for all entities with ``embedding_stale=True``
+    2. Re-computes embeddings using current name + type + latest context
+    3. Updates the vector store
+    4. Clears the ``embedding_stale`` flag on each updated entity
+
+    Also invoked automatically during the nightly maintenance cycle (after audit,
+    before training).
+    """
+    require_runtime_ready()
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    try:
+        result = await pipeline.refresh_stale_embeddings()
+        return {
+            "status": "ok",
+            **result,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as exc:
+        log.error("refresh-embeddings endpoint failed", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"refresh_embeddings_error: {exc}"
+        ) from exc
+
+
+@app.post("/maintenance/quality-check")
+async def maintenance_quality_check(
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Run the golden-set graph quality evaluation and return results.
+
+    Loads ``tests/golden_set.json`` relative to the service directory, runs
+    each test input through the live extractor, and returns per-case and
+    aggregate precision/recall metrics.
+
+    Returns HTTP 503 if the extractor model is unavailable (e.g. ``gliner2``
+    not installed or the service is in TEST_MODE).
+    """
+    import importlib
+    import importlib.util
+    from pathlib import Path as _Path
+
+    # Reject in test mode — extractor returns empty results, metrics are meaningless.
+    if config.TEST_MODE:
+        raise HTTPException(
+            status_code=503,
+            detail="quality-check is unavailable in TEST_MODE (extractor disabled)",
+        )
+
+    # Ensure gliner2 is importable before attempting.
+    try:
+        importlib.import_module("gliner2")
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"quality-check requires gliner2 to be installed: {exc}",
+        ) from exc
+
+    # Load the quality check runner from the tests module.
+    tests_dir = _Path(__file__).parent / "tests"
+    if not (tests_dir / "golden_set.json").exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"golden_set.json not found at {tests_dir / 'golden_set.json'}",
+        )
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "test_graph_quality",
+            str(tests_dir / "test_graph_quality.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        results = await asyncio.to_thread(mod.run_quality_check)
+    except Exception as exc:
+        log.error("quality-check failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"quality_check_error: {exc}") from exc
+
+    return {
+        "status": "passed" if results.get("passed") else "failed",
+        "results": results,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
 @app.post("/maintenance/cleanup-training-data")
 async def cleanup_training_data(
     _api_key: str = Depends(verify_api_key),
@@ -1149,6 +1274,22 @@ async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[
         return model_health_monitor.check_health()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"model_health_error: {exc}") from exc
+
+
+@app.get("/model-health/status")
+async def model_health_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return full model health status including continuous degradation detection.
+
+    Returns rolling stats from both the short rollback-guard window and the
+    longer degradation-detection window, plus the ``degradation_detected`` flag.
+    The flag is set when the rolling RELATED_TO fallback rate exceeds
+    baseline + 15% across the last 100 extractions.  No auto-rollback is
+    triggered by this endpoint — it surfaces the signal for operator review.
+    """
+    try:
+        return model_health_monitor.get_status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"model_health_status_error: {exc}") from exc
 
 
 @app.get("/training/runs")

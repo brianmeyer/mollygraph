@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import config
+from audit.signals import get_signal_bus
 from evolution.audit_feedback import record_audit_feedback_batch
 from memory.graph import VALID_REL_TYPES
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
@@ -532,6 +533,12 @@ async def apply_verdicts(
                 "context": context,
                 "source": "verify",
             })
+            get_signal_bus().publish("relationship_verified", {
+                "head": rel["head"],
+                "tail": rel["tail"],
+                "rel_type": rel["rel_type"],
+                "dry_run": dry_run,
+            })
             continue
 
         if decision == "reclassify":
@@ -568,6 +575,13 @@ async def apply_verdicts(
                         rel.get("context_snippets") if isinstance(rel.get("context_snippets"), list) else [],
                         str(rel.get("first_mentioned") or "") or None,
                     )
+                get_signal_bus().publish("relationship_reclassified", {
+                    "head": rel["head"],
+                    "tail": rel["tail"],
+                    "old_type": rel["rel_type"],
+                    "new_type": suggested_type,
+                    "dry_run": dry_run,
+                })
             else:
                 quarantined += 1
                 _write_audit_signal({
@@ -581,6 +595,14 @@ async def apply_verdicts(
                 })
                 if not dry_run:
                     graph.set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "quarantined")
+                get_signal_bus().publish("relationship_quarantined", {
+                    "head": rel["head"],
+                    "tail": rel["tail"],
+                    "rel_type": rel["rel_type"],
+                    "reason": "reclassify_invalid_type",
+                    "suggested_type": suggested_type,
+                    "dry_run": dry_run,
+                })
             continue
 
         if decision == "quarantine":
@@ -596,6 +618,13 @@ async def apply_verdicts(
             })
             if not dry_run:
                 graph.set_relationship_audit_status(rel["head"], rel["tail"], rel["rel_type"], "quarantined")
+            get_signal_bus().publish("relationship_quarantined", {
+                "head": rel["head"],
+                "tail": rel["tail"],
+                "rel_type": rel["rel_type"],
+                "reason": "audit_quarantine",
+                "dry_run": dry_run,
+            })
             continue
 
         if decision == "delete":
@@ -611,6 +640,12 @@ async def apply_verdicts(
             })
             if not dry_run:
                 graph.delete_specific_relationship(rel["head"], rel["tail"], rel["rel_type"])
+            get_signal_bus().publish("relationship_removed", {
+                "head": rel["head"],
+                "tail": rel["tail"],
+                "rel_type": rel["rel_type"],
+                "dry_run": dry_run,
+            })
 
     return {
         "auto_fixed": auto_fixed,

@@ -1,0 +1,226 @@
+[
+  {
+    "id": "tc01",
+    "description": "Person + Organization + work relationship",
+    "input": "Brian Meyer works at Databricks as Deployment Strategist",
+    "expected_entities": [
+      {"name": "Brian Meyer", "type": "Person"},
+      {"name": "Databricks", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Brian Meyer",
+        "target": "Databricks",
+        "type_pattern": "WORKS_AT|WORKS_ON|EMPLOYED_BY|WORKS_FOR"
+      }
+    ]
+  },
+  {
+    "id": "tc02",
+    "description": "Person + Place + location relationship",
+    "input": "Elon Musk lives in Austin, Texas",
+    "expected_entities": [
+      {"name": "Elon Musk", "type": "Person"},
+      {"name": "Austin", "type": "Place"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Elon Musk",
+        "target": "Austin",
+        "type_pattern": "LIVES_IN|LOCATED_IN|RESIDES_IN|BASED_IN"
+      }
+    ]
+  },
+  {
+    "id": "tc03",
+    "description": "Organization + Place",
+    "input": "OpenAI is headquartered in San Francisco",
+    "expected_entities": [
+      {"name": "OpenAI", "type": "Organization"},
+      {"name": "San Francisco", "type": "Place"}
+    ],
+    "expected_relations": [
+      {
+        "source": "OpenAI",
+        "target": "San Francisco",
+        "type_pattern": "LOCATED_IN|HEADQUARTERED_IN|BASED_IN"
+      }
+    ]
+  },
+  {
+    "id": "tc04",
+    "description": "Person + Organization + founder relationship",
+    "input": "Sam Altman founded OpenAI in 2015",
+    "expected_entities": [
+      {"name": "Sam Altman", "type": "Person"},
+      {"name": "OpenAI", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Sam Altman",
+        "target": "OpenAI",
+        "type_pattern": "FOUNDED|FOUNDED_BY|CO_FOUNDED|CREATED"
+      }
+    ]
+  },
+  {
+    "id": "tc05",
+    "description": "Technology + Organization + usage relationship",
+    "input": "Databricks uses Apache Spark as its core processing engine",
+    "expected_entities": [
+      {"name": "Databricks", "type": "Organization"},
+      {"name": "Apache Spark", "type": "Technology"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Databricks",
+        "target": "Apache Spark",
+        "type_pattern": "USES|BUILT_ON|BASED_ON|USES_TECHNOLOGY"
+      }
+    ]
+  },
+  {
+    "id": "tc06",
+    "description": "Person + mentoring relationship",
+    "input": "Jensen Huang mentored a generation of AI chip engineers at NVIDIA",
+    "expected_entities": [
+      {"name": "Jensen Huang", "type": "Person"},
+      {"name": "NVIDIA", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Jensen Huang",
+        "target": "NVIDIA",
+        "type_pattern": "WORKS_AT|LEADS|CEO_OF|FOUNDED|EMPLOYED_BY"
+      }
+    ]
+  },
+  {
+    "id": "tc07",
+    "description": "Person + education relationship",
+    "input": "Mark Zuckerberg studied at Harvard University",
+    "expected_entities": [
+      {"name": "Mark Zuckerberg", "type": "Person"},
+      {"name": "Harvard University", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Mark Zuckerberg",
+        "target": "Harvard University",
+        "type_pattern": "STUDIED_AT|ATTENDED|GRADUATED_FROM|EDUCATED_AT"
+      }
+    ]
+  },
+  {
+    "id": "tc08",
+    "description": "Two people + collaboration relationship",
+    "input": "Satya Nadella and Brad Smith collaborate on Microsoft policy initiatives",
+    "expected_entities": [
+      {"name": "Satya Nadella", "type": "Person"},
+      {"name": "Microsoft", "type": "Organization"}
+    ],
+    "expected_relations": []
+  },
+  {
+    "id": "tc09",
+    "description": "Technology concept + framework",
+    "input": "PyTorch is a deep learning framework developed by Meta AI Research",
+    "expected_entities": [
+      {"name": "PyTorch", "type": "Technology"},
+      {"name": "Meta", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "PyTorch",
+        "target": "Meta",
+        "type_pattern": "CREATED_BY|DEVELOPED_BY|MAINTAINED_BY|OWNED_BY"
+      }
+    ]
+  },
+  {
+    "id": "tc10",
+    "description": "Person + role/title",
+    "input": "Sundar Pichai is the CEO of Google and Alphabet",
+    "expected_entities": [
+      {"name": "Sundar Pichai", "type": "Person"},
+      {"name": "Google", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Sundar Pichai",
+        "target": "Google",
+        "type_pattern": "CEO_OF|LEADS|HEADS|WORKS_AT|EMPLOYED_BY"
+      }
+    ]
+  },
+  {
+    "id": "tc11",
+    "description": "Person + language/skill",
+    "input": "Brian writes Python and uses Kubernetes for deployments",
+    "expected_entities": [
+      {"name": "Brian", "type": "Person"},
+      {"name": "Python", "type": "Technology"},
+      {"name": "Kubernetes", "type": "Technology"}
+    ],
+    "expected_relations": []
+  },
+  {
+    "id": "tc12",
+    "description": "Organization partnership",
+    "input": "Microsoft partnered with OpenAI to integrate GPT models into Azure",
+    "expected_entities": [
+      {"name": "Microsoft", "type": "Organization"},
+      {"name": "OpenAI", "type": "Organization"},
+      {"name": "Azure", "type": "Technology"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Microsoft",
+        "target": "OpenAI",
+        "type_pattern": "PARTNERED_WITH|INVESTED_IN|COLLABORATES_WITH|WORKS_WITH"
+      }
+    ]
+  },
+  {
+    "id": "tc13",
+    "description": "Place + geography",
+    "input": "Paris is the capital city of France and home to the Eiffel Tower",
+    "expected_entities": [
+      {"name": "Paris", "type": "Place"},
+      {"name": "France", "type": "Place"},
+      {"name": "Eiffel Tower", "type": "Place"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Paris",
+        "target": "France",
+        "type_pattern": "LOCATED_IN|PART_OF|CAPITAL_OF"
+      }
+    ]
+  },
+  {
+    "id": "tc14",
+    "description": "Person + product creation",
+    "input": "Linus Torvalds created the Linux kernel in 1991",
+    "expected_entities": [
+      {"name": "Linus Torvalds", "type": "Person"},
+      {"name": "Linux", "type": "Technology"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Linus Torvalds",
+        "target": "Linux",
+        "type_pattern": "CREATED|FOUNDED|DEVELOPED|AUTHORED"
+      }
+    ]
+  },
+  {
+    "id": "tc15",
+    "description": "Research + organization attribution",
+    "input": "The attention mechanism was introduced by researchers at Google Brain",
+    "expected_entities": [
+      {"name": "Google Brain", "type": "Organization"}
+    ],
+    "expected_relations": []
+  }
+]

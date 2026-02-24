@@ -98,6 +98,33 @@ GLINER_BENCHMARK_THRESHOLD         = 0.4
 GLINER_SHADOW_EPISODES             = int(os.environ.get("GLINER_SHADOW_EPISODES", "20"))
 GLINER_SHADOW_ENABLED              = os.environ.get("GLINER_SHADOW_ENABLED", "true").lower() == "true"
 
+# ── LoRA benchmark tolerance ──────────────────────────────────────────────────
+# Shadow benchmark: candidate model is rejected if fallback_rate > base_rate * TOLERANCE.
+# 1.20 means the candidate may be up to 20% worse than the baseline before it's rejected.
+LORA_BENCHMARK_TOLERANCE = float(os.environ.get("MOLLYGRAPH_LORA_BENCHMARK_TOLERANCE", "1.20"))
+
+# ── Schema drift alarm thresholds ─────────────────────────────────────────────
+# Percentage growth in 24 h that triggers the schema-drift alarm.
+# Defaults: +5 % for relation types, +10 % for entity types.
+SCHEMA_DRIFT_ALARM_REL_THRESHOLD = float(os.environ.get("MOLLYGRAPH_DRIFT_ALARM_REL", "5.0"))
+SCHEMA_DRIFT_ALARM_ENT_THRESHOLD = float(os.environ.get("MOLLYGRAPH_DRIFT_ALARM_ENT", "10.0"))
+
+# ── Maintenance lock timeout ───────────────────────────────────────────────────
+# Maximum age (seconds) before a maintenance lock is considered stale.
+MAINTENANCE_LOCK_TIMEOUT_SECONDS = int(os.environ.get("MOLLYGRAPH_LOCK_TIMEOUT", str(30 * 60)))
+
+# ── Schema auto-adoption caps ─────────────────────────────────────────────────
+# Maximum number of new relation/entity types that can be auto-adopted per nightly cycle.
+SCHEMA_MAX_NEW_RELATIONS = int(os.environ.get("MOLLYGRAPH_MAX_NEW_RELATIONS", "3"))
+SCHEMA_MAX_NEW_ENTITIES  = int(os.environ.get("MOLLYGRAPH_MAX_NEW_ENTITIES",  "2"))
+
+# ── Model degradation detection ───────────────────────────────────────────────
+# Rolling window size (number of extractions) used for continuous degradation monitoring.
+MODEL_DEGRADATION_WINDOW_SIZE = int(os.environ.get("MOLLYGRAPH_DEGRADATION_WINDOW", "100"))
+# Fallback-rate increase above baseline that triggers a degradation WARNING.
+# 0.15 = if the rolling fallback rate rises more than 15 percentage points above baseline.
+MODEL_DEGRADATION_THRESHOLD = float(os.environ.get("MOLLYGRAPH_DEGRADATION_THRESHOLD", "0.15"))
+
 # ── Ensure runtime dirs exist ────────────────────────────────────────────────
 for _d in (
     GRAPH_MEMORY_DIR,

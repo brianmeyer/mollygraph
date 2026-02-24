@@ -1,6 +1,8 @@
 """Model health monitoring for MollyGraph.
 
 Tracks extraction quality post-deploy and triggers rollback if quality degrades.
+Also provides continuous degradation detection between training runs via a
+separate rolling window (last MODEL_DEGRADATION_WINDOW_SIZE extractions).
 """
 from __future__ import annotations
 
@@ -13,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import config as _config
+
 log = logging.getLogger(__name__)
 
 ROLLBACKS_DIR = Path.home() / ".graph-memory" / "training" / "rollbacks"
@@ -20,25 +24,50 @@ TRAINING_CONFIG_PATH = Path.home() / ".graph-memory" / "gliner_finetune_config.j
 
 
 class ModelHealthMonitor:
-    """Tracks extraction quality post-deploy and triggers rollback if quality degrades."""
+    """Tracks extraction quality post-deploy and triggers rollback if quality degrades.
 
-    WINDOW_SIZE = 50        # rolling window of last N extractions
+    Two monitoring windows run in parallel:
+
+    * ``rolling_extractions`` (``WINDOW_SIZE=50``) — short-window spike detector
+      that can trigger an automatic rollback when the fallback rate is 2× baseline.
+
+    * ``degradation_window`` (``MODEL_DEGRADATION_WINDOW_SIZE`` from config,
+      default 100) — longer window for *continuous* monitoring between training
+      runs.  When the window is full (≥ 100 samples) and the rolling fallback rate
+      exceeds ``baseline + MODEL_DEGRADATION_THRESHOLD`` (default +0.15), a WARNING
+      is logged and ``degradation_detected`` is set to ``True``.  No automatic
+      action is taken; the flag is surfaced via ``GET /model-health/status``.
+    """
+
+    WINDOW_SIZE = 50        # rolling window of last N extractions (rollback guard)
     SPIKE_THRESHOLD = 2.0   # rollback if fallback rate > 2x baseline
 
     def __init__(self):
         self.baseline_fallback_rate: float | None = None  # set at deploy time
         self.rolling_extractions: deque[dict[str, Any]] = deque(maxlen=self.WINDOW_SIZE)
+        # ── Continuous degradation detection ─────────────────────────────────
+        self.degradation_window: deque[dict[str, Any]] = deque(
+            maxlen=_config.MODEL_DEGRADATION_WINDOW_SIZE
+        )
+        self.degradation_detected: bool = False
+        # ─────────────────────────────────────────────────────────────────────
         self.deployed_at: datetime | None = None
         self.model_ref: str | None = None
         self.rollback_triggered: bool = False
         self._extraction_counter: int = 0
 
     def set_baseline(self, fallback_rate: float, model_ref: str) -> None:
-        """Called after each deploy with the pre-deploy fallback rate."""
+        """Called after each training deploy with the benchmark fallback rate.
+
+        Resets both rolling windows and clears the degradation flag so that
+        fresh monitoring begins from a clean state after every training run.
+        """
         self.baseline_fallback_rate = fallback_rate
         self.deployed_at = datetime.now(timezone.utc)
         self.model_ref = model_ref
         self.rolling_extractions.clear()
+        self.degradation_window.clear()
+        self.degradation_detected = False
         self.rollback_triggered = False
         self._extraction_counter = 0
         log.info(
@@ -48,14 +77,19 @@ class ModelHealthMonitor:
         )
 
     def record_extraction(self, total_relations: int, fallback_count: int) -> None:
-        """Called after each extraction to track quality."""
-        self.rolling_extractions.append(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "total_relations": total_relations,
-                "fallback_count": fallback_count,
-            }
-        )
+        """Called after each extraction to track quality.
+
+        Updates both the short rollback-guard window and the longer degradation
+        detection window.  Rollback check runs every 10 extractions; degradation
+        check runs every 10 extractions once the degradation window is full.
+        """
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "total_relations": total_relations,
+            "fallback_count": fallback_count,
+        }
+        self.rolling_extractions.append(entry)
+        self.degradation_window.append(entry)
         self._extraction_counter += 1
 
         # Check every 10 extractions
@@ -63,6 +97,8 @@ class ModelHealthMonitor:
             health = self.check_health()
             if health.get("should_rollback") and not self.rollback_triggered:
                 self._trigger_rollback(health)
+            # Continuous degradation detection (separate from rollback guard)
+            self._check_degradation()
 
     def check_health(self) -> dict[str, Any]:
         """Check if current model is performing acceptably."""
@@ -92,6 +128,88 @@ class ModelHealthMonitor:
             "spike_ratio": round(spike_ratio, 2),
             "should_rollback": False,
             "samples": len(self.rolling_extractions),
+        }
+
+    def _check_degradation(self) -> None:
+        """Check the long degradation window for sustained quality decline.
+
+        If the window has accumulated at least MODEL_DEGRADATION_WINDOW_SIZE
+        samples and the rolling RELATED_TO fallback rate exceeds
+        ``baseline + MODEL_DEGRADATION_THRESHOLD``, a WARNING is logged and
+        ``degradation_detected`` is set to ``True``.  No automatic action is
+        taken — the flag is surfaced via ``GET /model-health/status``.
+        """
+        required = _config.MODEL_DEGRADATION_WINDOW_SIZE
+        if len(self.degradation_window) < required:
+            return  # not enough data yet
+        if self.baseline_fallback_rate is None:
+            return  # no baseline established
+
+        total_rels = sum(e["total_relations"] for e in self.degradation_window)
+        total_fallbacks = sum(e["fallback_count"] for e in self.degradation_window)
+        current_rate = total_fallbacks / max(total_rels, 1)
+
+        threshold = self.baseline_fallback_rate + _config.MODEL_DEGRADATION_THRESHOLD
+        if current_rate > threshold:
+            if not self.degradation_detected:
+                log.warning(
+                    "MODEL DEGRADATION DETECTED: rolling_fallback_rate=%.4f "
+                    "baseline=%.4f threshold=%.4f samples=%d",
+                    current_rate,
+                    self.baseline_fallback_rate,
+                    threshold,
+                    len(self.degradation_window),
+                )
+            self.degradation_detected = True
+        else:
+            # Rate has recovered — clear the flag
+            if self.degradation_detected:
+                log.info(
+                    "Model degradation flag cleared: rolling_fallback_rate=%.4f "
+                    "is back within threshold=%.4f",
+                    current_rate,
+                    threshold,
+                )
+            self.degradation_detected = False
+
+    def get_status(self) -> dict[str, Any]:
+        """Return rolling stats from both windows plus the degradation flag.
+
+        Used by ``GET /model-health/status`` to surface continuous monitoring
+        state without triggering a rollback check.
+        """
+        health = self.check_health()
+
+        # Degradation window stats
+        dw_samples = len(self.degradation_window)
+        dw_total_rels = sum(e["total_relations"] for e in self.degradation_window)
+        dw_total_fallbacks = sum(e["fallback_count"] for e in self.degradation_window)
+        dw_rate = dw_total_fallbacks / max(dw_total_rels, 1) if dw_samples else 0.0
+
+        return {
+            **health,
+            "degradation_detected": self.degradation_detected,
+            "degradation_window": {
+                "samples": dw_samples,
+                "window_size": _config.MODEL_DEGRADATION_WINDOW_SIZE,
+                "fallback_rate": round(dw_rate, 4),
+                "baseline_fallback_rate": (
+                    round(self.baseline_fallback_rate, 4)
+                    if self.baseline_fallback_rate is not None
+                    else None
+                ),
+                "threshold": (
+                    round(
+                        self.baseline_fallback_rate + _config.MODEL_DEGRADATION_THRESHOLD, 4
+                    )
+                    if self.baseline_fallback_rate is not None
+                    else None
+                ),
+                "full": dw_samples >= _config.MODEL_DEGRADATION_WINDOW_SIZE,
+            },
+            "model_ref": self.model_ref,
+            "deployed_at": self.deployed_at.isoformat() if self.deployed_at else None,
+            "rollback_triggered": self.rollback_triggered,
         }
 
     def _trigger_rollback(self, health: dict[str, Any]) -> None:

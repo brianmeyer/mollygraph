@@ -479,6 +479,56 @@ class ExtractionPipeline:
         except (TypeError, ValueError):
             return default
 
+    async def refresh_stale_embeddings(self) -> dict[str, Any]:
+        """Re-compute embeddings for all entities with embedding_stale=True.
+
+        Called by the nightly maintenance cycle (after audit, before training)
+        and exposed via ``POST /maintenance/refresh-embeddings``.
+
+        For each stale entity the new embedding is derived from:
+            ``{name} {entity_type} {latest context (summary/description)}``
+
+        Returns a summary dict with counts of refreshed and failed entities.
+        """
+        stale = await asyncio.to_thread(self.graph.get_stale_embedding_entities)
+        if not stale:
+            log.info("refresh_stale_embeddings: no stale entities found")
+            return {"refreshed": 0, "failed": 0, "total_stale": 0}
+
+        refreshed = 0
+        failed = 0
+        for entity_row in stale:
+            name = entity_row.get("name", "")
+            entity_type = entity_row.get("entity_type", "Concept")
+            content = entity_row.get("content", "")
+            entity_id = entity_row.get("entity_id", "")
+            confidence = float(entity_row.get("confidence") or 1.0)
+
+            embed_text = f"{name} {entity_type} {content[:200]}".strip()
+            try:
+                embedding = await asyncio.to_thread(self._text_embedding, embed_text)
+                self.vector_store.add_entity(
+                    entity_id=entity_id,
+                    name=name,
+                    entity_type=entity_type,
+                    dense_embedding=embedding,
+                    content=content[:500],
+                    confidence=confidence,
+                )
+                await asyncio.to_thread(self.graph.clear_embedding_stale_flag, name)
+                refreshed += 1
+            except Exception:
+                log.warning(
+                    "refresh_stale_embeddings: failed for entity %r", name, exc_info=True
+                )
+                failed += 1
+
+        log.info(
+            "refresh_stale_embeddings complete: refreshed=%d failed=%d total_stale=%d",
+            refreshed, failed, len(stale),
+        )
+        return {"refreshed": refreshed, "failed": failed, "total_stale": len(stale)}
+
     # ── Embedding model (lazy singleton) ─────────────────────────────────
     _embedding_model = None
 

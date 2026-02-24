@@ -13,6 +13,7 @@ from evolution.gliner_training import (
 from maintenance.lock import maintenance_lock
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
+from runtime_pipeline import get_pipeline_instance
 from runtime_vector_store import get_vector_store_instance
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,26 @@ async def _run_maintenance_cycle_inner() -> dict[str, Any]:
         log.warning("Suggestion digest build failed", exc_info=True)
         suggestion_digest = ""
 
+    # Refresh stale embeddings AFTER audit (entity reclassification may have
+    # set embedding_stale=True) and BEFORE training (so training sees fresh vectors).
+    refresh_embeddings_result: dict[str, Any]
+    try:
+        pl = get_pipeline_instance()
+        if pl is not None:
+            refresh_embeddings_result = await pl.refresh_stale_embeddings()
+            log.info(
+                "Stale embedding refresh: refreshed=%d failed=%d total_stale=%d",
+                refresh_embeddings_result.get("refreshed", 0),
+                refresh_embeddings_result.get("failed", 0),
+                refresh_embeddings_result.get("total_stale", 0),
+            )
+        else:
+            log.warning("Skipping stale embedding refresh: pipeline not available")
+            refresh_embeddings_result = {"skipped": True, "reason": "pipeline_not_available"}
+    except Exception as exc:
+        log.warning("Stale embedding refresh failed", exc_info=True)
+        refresh_embeddings_result = {"status": "error", "error": str(exc)}
+
     # Stale example cleanup runs BEFORE accumulation so that quarantined
     # relations from the LLM audit above are removed before new examples
     # are built on top of them.
@@ -102,6 +123,7 @@ async def _run_maintenance_cycle_inner() -> dict[str, Any]:
         "completed_at": completed_at,
         "cleanup": cleanup,
         "audit": audit_result,
+        "refresh_embeddings": refresh_embeddings_result,
         "suggestions": {
             "digest": suggestion_digest,
             "auto_adoption": adoption_summary,

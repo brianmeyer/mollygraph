@@ -232,7 +232,8 @@ class EntityMixin:
                         mention_count: $mention_count,
                         strength: $strength,
                         created_from_episode: $created_from_episode,
-                        verified: $verified
+                        verified: $verified,
+                        embedding_stale: false
                     })
                     """,
                     **entity.model_dump(),
@@ -307,7 +308,8 @@ class EntityMixin:
                     strength: 1.0,
                     confidence: $confidence,
                     aliases: [],
-                    summary: ''
+                    summary: '',
+                    embedding_stale: false
                 })
                 """,
                 id=str(uuid.uuid4()),
@@ -369,6 +371,97 @@ class EntityMixin:
         deleted = int(record["deleted"]) if record else 0
         log.info("Deleted %d blocklisted entities", deleted)
         return deleted
+
+    def reclassify_entity_type(self, name: str, new_type: str) -> bool:
+        """Update an entity's type and mark its embedding as stale.
+
+        Called by the nightly audit (or any operator action) when an entity is
+        reclassified (e.g. Person → Organization).  Sets ``embedding_stale=True``
+        so that the next ``/maintenance/refresh-embeddings`` run will re-compute
+        the vector with the corrected type string.
+
+        Returns ``True`` if the entity was found and updated, ``False`` otherwise.
+        """
+        if not name or not new_type:
+            return False
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) = toLower($name)
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = toLower($name))
+                SET e.entity_type = $new_type,
+                    e.embedding_stale = true
+                RETURN count(e) AS updated
+                """,
+                name=name.strip(),
+                new_type=new_type.strip(),
+            ).single()
+        updated = int(record["updated"]) if record else 0
+        if updated:
+            log.info(
+                "Entity reclassified: name=%r new_type=%r embedding_stale=True",
+                name, new_type,
+            )
+        return updated > 0
+
+    def get_stale_embedding_entities(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Return entities whose embeddings need to be re-computed.
+
+        An entity has ``embedding_stale=True`` when its type (or other
+        identity-defining property) has changed since the embedding was last
+        computed.  Used by the ``refresh_stale_embeddings`` pipeline step.
+        """
+        safe_limit = max(1, int(limit))
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE e.embedding_stale = true
+                RETURN coalesce(e.id, toLower(e.name)) AS entity_id,
+                       e.name AS name,
+                       coalesce(e.entity_type, 'Concept') AS entity_type,
+                       coalesce(e.summary, e.description, '') AS content,
+                       coalesce(e.confidence, 1.0) AS confidence
+                ORDER BY coalesce(e.mention_count, 0) DESC, e.name ASC
+                LIMIT $limit
+                """,
+                limit=safe_limit,
+            )
+            rows: List[Dict[str, Any]] = []
+            for record in result:
+                name_val = str(record.get("name") or "").strip()
+                if not name_val:
+                    continue
+                rows.append(
+                    {
+                        "entity_id": _sanitize_doc_id(
+                            str(record.get("entity_id") or name_val.lower())
+                        ),
+                        "name": name_val,
+                        "entity_type": str(record.get("entity_type") or "Concept"),
+                        "content": str(record.get("content") or ""),
+                        "confidence": float(record.get("confidence") or 1.0),
+                    }
+                )
+        return rows
+
+    def clear_embedding_stale_flag(self, name: str) -> bool:
+        """Mark an entity's embedding as fresh after successful re-embedding."""
+        if not name:
+            return False
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) = toLower($name)
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = toLower($name))
+                SET e.embedding_stale = false
+                RETURN count(e) AS updated
+                """,
+                name=name.strip(),
+            ).single()
+        return bool(record and int(record["updated"]) > 0)
 
     def list_entities_for_embedding(self, limit: int = 5000) -> List[Dict[str, Any]]:
         """Return entity rows suitable for vector reindexing."""

@@ -27,8 +27,9 @@ _ADOPTION_HISTORY_PATH = SUGGESTIONS_DIR / "adoption_history.json"
 _MIN_DAYS = 3
 _MIN_OCCURRENCES = 5
 _MIN_FREQUENCY = 0.4
-MAX_NEW_RELATIONS_PER_CYCLE = 3
-MAX_NEW_ENTITIES_PER_CYCLE = 2
+# Adoption caps sourced from config so they can be tuned via environment variable.
+MAX_NEW_RELATIONS_PER_CYCLE = config.SCHEMA_MAX_NEW_RELATIONS  # default 3
+MAX_NEW_ENTITIES_PER_CYCLE  = config.SCHEMA_MAX_NEW_ENTITIES   # default 2
 MAX_TOTAL_ADOPTED_TYPES = 20
 SCHEMA_BLOCKLIST = {"single_char", "numeric_only", "len_lt_3"}
 _ADOPTED_SCHEMA_PATH = Path.home() / ".graph-memory" / "adopted_schema.json"

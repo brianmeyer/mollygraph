@@ -22,7 +22,8 @@ import config
 log = logging.getLogger(__name__)
 
 _LOCK_PATH = config.GRAPH_MEMORY_DIR / "maintenance.lock"
-_MAX_LOCK_AGE_SECONDS = 30 * 60  # 30 minutes
+# Stale-lock timeout sourced from config so it can be tuned via environment variable.
+_MAX_LOCK_AGE_SECONDS = config.MAINTENANCE_LOCK_TIMEOUT_SECONDS  # default 30 min
 
 
 def _pid_alive(pid: int) -> bool:

@@ -2417,8 +2417,9 @@ class GLiNERTrainingService:
         base_rate = _fallback_rate(base_results)
         cand_rate = _fallback_rate(cand_results)
 
-        # Candidate fails if fallback rate is >20% worse than base
-        TOLERANCE = 1.20
+        # Candidate fails if fallback rate is >LORA_BENCHMARK_TOLERANCE worse than base
+        # (sourced from config; default 1.20 = 20% worse allowed)
+        TOLERANCE = config.LORA_BENCHMARK_TOLERANCE
         passed = cand_rate <= base_rate * TOLERANCE
 
         failure_reason: str | None = None
