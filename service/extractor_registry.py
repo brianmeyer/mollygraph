@@ -224,12 +224,10 @@ def _apply_runtime_config(registry: dict[str, Any]) -> None:
         relation_model = ""
         registry["active_relation_model"] = ""
 
-    # Only apply registry backend if no explicit env override is set.
-    env_backend = os.environ.get("MOLLYGRAPH_EXTRACTOR_BACKEND", "").strip().lower()
-    if env_backend:
-        log.info("Registry: env MOLLYGRAPH_EXTRACTOR_BACKEND=%s takes precedence over registry backend=%s", env_backend, backend)
-    else:
-        config.EXTRACTOR_BACKEND = backend
+    # NEVER override config.EXTRACTOR_BACKEND from the registry.
+    # The registry file was the source of persistent hf_token_classification bugs.
+    # config.py sets the canonical backend from env var / default.
+    log.debug("Registry backend=%s (not applied — config.EXTRACTOR_BACKEND=%s is canonical)", backend, getattr(config, "EXTRACTOR_BACKEND", "?"))
     config.EXTRACTOR_MODEL = entity_model
     config.EXTRACTOR_RELATION_MODEL = relation_model
 
