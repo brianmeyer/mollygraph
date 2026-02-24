@@ -626,7 +626,11 @@ class ExtractionPipeline:
             )
             try:
                 from sentence_transformers import SentenceTransformer
-                cls._embedding_model = SentenceTransformer(model_name, trust_remote_code=True)
+                cls._embedding_model = SentenceTransformer(
+                    model_name,
+                    trust_remote_code=True,
+                    model_kwargs={"default_task": "retrieval"},
+                )
                 cls._embedding_active_tier = tier
                 log.info("Embedding tier '%s' loaded: %s", tier, model_name)
                 return True
