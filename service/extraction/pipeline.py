@@ -264,16 +264,23 @@ class ExtractionPipeline:
             job.started_at = datetime.now(UTC)
 
             extracted = await asyncio.to_thread(gliner_extractor.extract, job.content, 0.4)
-            raw_entities = extracted.get("entities", []) if isinstance(extracted, dict) else []
-            raw_relations = extracted.get("relations", []) if isinstance(extracted, dict) else []
+            gliner_entities_raw = extracted.get("entities", []) if isinstance(extracted, dict) else []
+            raw_relations_raw = extracted.get("relations", []) if isinstance(extracted, dict) else []
+            gliner_entities = gliner_entities_raw if isinstance(gliner_entities_raw, list) else []
+            raw_relations = raw_relations_raw if isinstance(raw_relations_raw, list) else []
 
+            spacy_entities: list[dict[str, Any]] = []
             if service_config.SPACY_ENRICHMENT:
-                raw_entities.extend(
-                    self._spacy_enrich_entities(
-                        content=job.content,
-                        gliner_entity_count=len(raw_entities),
-                    )
+                spacy_entities = self._spacy_enrich_entities(
+                    content=job.content,
+                    gliner_entity_count=len(gliner_entities),
                 )
+
+            raw_entities = self._merge_entity_sources_for_glirel(
+                content=job.content,
+                gliner_entities=gliner_entities,
+                spacy_entities=spacy_entities,
+            )
 
             entities = self._build_entities(raw_entities)
             canonical_names: dict[str, str] = {}
@@ -734,6 +741,70 @@ class ExtractionPipeline:
         if enriched:
             log.debug("spaCy enrichment added %d entities", len(enriched))
         return enriched
+
+    def _merge_entity_sources_for_glirel(
+        self,
+        *,
+        content: str,
+        gliner_entities: list[dict[str, Any]],
+        spacy_entities: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge GLiNER + spaCy entities for GLiREL while deduplicating overlaps."""
+        merged: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        seen_spans: list[tuple[tuple[int, int], str]] = []
+
+        sources: list[list[dict[str, Any]]] = []
+        if isinstance(gliner_entities, list):
+            sources.append(gliner_entities)
+        if isinstance(spacy_entities, list):
+            sources.append(spacy_entities)
+
+        for source_entities in sources:
+            for entity in source_entities:
+                if not isinstance(entity, dict):
+                    continue
+
+                raw_text = str(entity.get("text") or entity.get("name") or "").strip()
+                if len(raw_text) < 2:
+                    continue
+
+                normalized_text = self._normalize(raw_text)
+                if normalized_text in seen_names:
+                    continue
+
+                span = self._first_span(content, raw_text)
+                overlaps_existing = False
+                if span is not None:
+                    for existing_span, existing_text in seen_spans:
+                        if not self._spans_overlap(span, existing_span):
+                            continue
+                        if normalized_text in existing_text or existing_text in normalized_text:
+                            overlaps_existing = True
+                            break
+
+                if overlaps_existing:
+                    continue
+
+                merged.append(entity)
+                seen_names.add(normalized_text)
+                if span is not None:
+                    seen_spans.append((span, normalized_text))
+
+        return merged
+
+    @staticmethod
+    def _first_span(content: str, value: str) -> tuple[int, int] | None:
+        if not content or not value:
+            return None
+        match = re.search(re.escape(value), content, flags=re.IGNORECASE)
+        if not match:
+            return None
+        return match.start(), match.end()
+
+    @staticmethod
+    def _spans_overlap(span_a: tuple[int, int], span_b: tuple[int, int]) -> bool:
+        return span_a[0] < span_b[1] and span_b[0] < span_a[1]
 
     def _get_spacy_nlp(self):
         if self._spacy_attempted:

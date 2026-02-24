@@ -129,7 +129,7 @@ RERANKER_MODEL = os.environ.get("MOLLYGRAPH_RERANKER_MODEL", "jinaai/jina-rerank
 GLIREL_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_ENABLED", "false").lower() == "true"
 GLIREL_MODEL = os.environ.get("MOLLYGRAPH_GLIREL_MODEL", "jackboyla/glirel-large-v0")
 GLIREL_CONFIDENCE_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_CONFIDENCE", "0.15"))  # GLiREL scores rarely exceed 0.3; 0.15 is a reasonable threshold
-GLIREL_TRAINING_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_TRAINING_THRESHOLD", "0.8"))
+GLIREL_TRAINING_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_TRAINING_THRESHOLD", "0.4"))
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")

@@ -17,6 +17,45 @@ log = logging.getLogger(__name__)
 # Token regex matching GLiREL's internal tokenizer
 _GLIREL_TOKEN_RE = re.compile(r'\w+(?:[-_]\w+)*|\S')
 
+# Canonical relation -> natural-language phrasings for GLiREL calibration.
+_RELATION_SYNONYM_GROUPS: dict[str, tuple[str, ...]] = {
+    "works at": ("works at", "employed by", "works for"),
+    "founded": ("founded", "founder of", "co-founded"),
+    "lives in": ("lives in", "resides in", "located in"),
+    "parent of": ("parent of", "father of", "mother of"),
+    "child of": ("child of", "son of", "daughter of"),
+    "member of": ("member of", "belongs to", "part of"),
+    "located in": ("located in", "based in", "headquartered in"),
+}
+
+# When an ideal canonical label is not configured, map to the closest relation.
+_RELATION_CANONICAL_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "lives in": ("located in",),
+    "located in": ("lives in",),
+}
+
+# Relation type constraints in coarse type space: person / organization / location.
+_RELATION_TYPE_CONSTRAINTS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "works at": (frozenset({"person"}), frozenset({"organization"})),
+    "founded": (frozenset({"person"}), frozenset({"organization"})),
+    "lives in": (frozenset({"person", "organization"}), frozenset({"location"})),
+    "parent of": (frozenset({"person"}), frozenset({"person"})),
+    "child of": (frozenset({"person"}), frozenset({"person"})),
+    "located in": (frozenset({"organization"}), frozenset({"location"})),
+}
+
+_ENTITY_TYPE_ALIASES: dict[str, str] = {
+    "person": "person",
+    "organization": "organization",
+    "org": "organization",
+    "company": "organization",
+    "institution": "organization",
+    "location": "location",
+    "place": "location",
+    "gpe": "location",
+    "loc": "location",
+}
+
 
 class GLiRELEnrichment:
     """Second-pass relation extraction + silver-label generation."""
@@ -142,12 +181,17 @@ class GLiRELEnrichment:
         if not getattr(config, "GLIREL_ENABLED", False):
             return []
 
+        configured_relations = self._configured_relations()
+        if not configured_relations:
+            log.debug("GLiREL: no relation labels configured, skipping.")
+            return []
+
         tokens, ner_spans = self._build_entity_spans(text, entities)
         if len(ner_spans) < 2:
             log.debug("GLiREL: fewer than 2 entity spans found, skipping. spans=%s", ner_spans)
             return []
 
-        labels = self._relation_labels()
+        labels = self._relation_labels(configured_relations=configured_relations)
         if not labels:
             log.debug("GLiREL: no relation labels configured, skipping.")
             return []
@@ -162,7 +206,12 @@ class GLiRELEnrichment:
             ner=ner_spans,
             top_k=-1,
         )
-        return self._normalize_relations(raw)
+        entity_types_by_name = self._build_entity_type_index(entities)
+        return self._normalize_relations(
+            raw,
+            entity_types_by_name=entity_types_by_name,
+            configured_relations=configured_relations,
+        )
 
     def generate_training_examples(
         self,
@@ -173,7 +222,7 @@ class GLiRELEnrichment:
         if not text:
             return []
 
-        min_conf = float(getattr(config, "GLIREL_TRAINING_THRESHOLD", 0.8))
+        min_conf = float(getattr(config, "GLIREL_TRAINING_THRESHOLD", 0.4))
         selected = [
             rel for rel in glirel_relations
             if self._safe_float(rel.get("confidence"), 0.0) >= min_conf
@@ -295,6 +344,9 @@ class GLiRELEnrichment:
     def _normalize_relations(
         self,
         payload: Any,
+        *,
+        entity_types_by_name: dict[str, set[str]] | None = None,
+        configured_relations: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Normalize GLiREL output to our standard relation format.
 
@@ -302,8 +354,10 @@ class GLiRELEnrichment:
           {'head_text': [tokens...], 'tail_text': [tokens...], 'label': str, 'score': float, ...}
         """
         rows = payload if isinstance(payload, list) else []
+        entity_types_by_name = entity_types_by_name or {}
+        configured_relations = configured_relations or self._configured_relations()
 
-        out: dict[tuple[str, str, str], dict[str, Any]] = {}
+        directional_best: dict[tuple[str, str, str], dict[str, Any]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -314,9 +368,14 @@ class GLiRELEnrichment:
             head = " ".join(head_raw) if isinstance(head_raw, list) else str(head_raw or "").strip()
             tail = " ".join(tail_raw) if isinstance(tail_raw, list) else str(tail_raw or "").strip()
 
-            rel_type = str(
+            raw_label = str(
                 row.get("label") or row.get("rel_type") or row.get("relation") or ""
-            ).strip().upper().replace(" ", "_")
+            ).strip()
+            canonical_label = self._canonical_relation_label(
+                raw_label,
+                configured_relations=configured_relations,
+            )
+            rel_type = canonical_label.replace(" ", "_")
 
             if not head or not tail or not rel_type:
                 continue
@@ -333,35 +392,178 @@ class GLiRELEnrichment:
                     ),
                 ),
             )
+            if not self._passes_type_constraints(
+                relation_label=canonical_label,
+                head=head,
+                tail=tail,
+                entity_types_by_name=entity_types_by_name,
+            ):
+                continue
+
             key = (self._normalize(head), rel_type, self._normalize(tail))
-            prev = out.get(key)
+            prev = directional_best.get(key)
             if prev is None or confidence > float(prev.get("confidence") or 0.0):
-                out[key] = {
+                directional_best[key] = {
                     "head": head,
                     "tail": tail,
                     "rel_type": rel_type,
                     "confidence": confidence,
                 }
 
-        return sorted(out.values(), key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+        bidirectional_best: dict[tuple[tuple[str, str], str], dict[str, Any]] = {}
+        for relation in directional_best.values():
+            pair = tuple(
+                sorted(
+                    (
+                        self._normalize(str(relation.get("head") or "")),
+                        self._normalize(str(relation.get("tail") or "")),
+                    )
+                )
+            )
+            label_group = str(relation.get("rel_type") or "")
+            key = (pair, label_group)
+            prev = bidirectional_best.get(key)
+            if prev is None or float(relation.get("confidence") or 0.0) > float(prev.get("confidence") or 0.0):
+                bidirectional_best[key] = relation
 
-    @staticmethod
-    def _relation_labels() -> list[str]:
+        return sorted(
+            bidirectional_best.values(),
+            key=lambda item: float(item.get("confidence", 0.0)),
+            reverse=True,
+        )
+
+    @classmethod
+    def _relation_labels(cls, configured_relations: set[str] | None = None) -> list[str]:
+        configured = configured_relations or cls._configured_relations()
+        if not configured:
+            return []
+
+        labels: set[str] = set()
+        for relation_name in configured:
+            normalized = cls._normalize_relation_label(relation_name)
+            if not normalized:
+                continue
+            labels.add(normalized)
+            for candidate in cls._synonym_candidates(normalized):
+                variants = _RELATION_SYNONYM_GROUPS.get(candidate)
+                if not variants:
+                    continue
+                for label in variants:
+                    normalized_label = cls._normalize_relation_label(label)
+                    if normalized_label:
+                        labels.add(normalized_label)
+        # GLiREL labels should be unique, stable-ordered.
+        return sorted(labels)
+
+    @classmethod
+    def _configured_relations(cls) -> set[str]:
         try:
             from extractor_schema_registry import get_effective_extractor_schema
 
             schema = get_effective_extractor_schema()
             relation_map = schema.get("relations", {}) if isinstance(schema, dict) else {}
-            labels = [
-                str(name).strip().lower().replace("_", " ")
+            labels = {
+                cls._normalize_relation_label(str(name))
                 for name in relation_map.keys()
                 if str(name).strip()
-            ]
-            # GLiREL labels should be unique, stable-ordered.
-            return sorted(set(labels))
+            }
+            return {label for label in labels if label}
         except Exception:
             log.debug("Unable to load extractor relation labels for GLiREL", exc_info=True)
+            return set()
+
+    @classmethod
+    def _canonical_relation_label(
+        cls,
+        label: str,
+        *,
+        configured_relations: set[str],
+    ) -> str:
+        normalized_label = cls._normalize_relation_label(label)
+        if not normalized_label:
+            return ""
+
+        if normalized_label in configured_relations:
+            return normalized_label
+
+        candidates = cls._synonym_candidates(normalized_label)
+        for candidate in candidates:
+            if candidate in configured_relations:
+                return candidate
+        for candidate in candidates:
+            for fallback in _RELATION_CANONICAL_FALLBACKS.get(candidate, ()):
+                if fallback in configured_relations:
+                    return fallback
+        return candidates[0] if candidates else normalized_label
+
+    @classmethod
+    def _synonym_candidates(cls, label: str) -> list[str]:
+        normalized = cls._normalize_relation_label(label)
+        if not normalized:
             return []
+
+        candidates: list[str] = []
+        for canonical, variants in _RELATION_SYNONYM_GROUPS.items():
+            if normalized == canonical or normalized in variants:
+                candidates.append(canonical)
+
+        if not candidates:
+            candidates.append(normalized)
+        # Stable-ordered dedupe.
+        return list(dict.fromkeys(candidates))
+
+    @classmethod
+    def _build_entity_type_index(cls, entities: list[dict[str, Any]]) -> dict[str, set[str]]:
+        by_name: dict[str, set[str]] = {}
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+
+            entity_name = str(entity.get("text") or entity.get("name") or "").strip()
+            if not entity_name:
+                continue
+
+            raw_type = str(entity.get("label") or entity.get("entity_type") or "").strip()
+            normalized_type = cls._normalize_entity_type(raw_type)
+            if not normalized_type:
+                continue
+
+            key = cls._normalize(entity_name)
+            by_name.setdefault(key, set()).add(normalized_type)
+        return by_name
+
+    @classmethod
+    def _normalize_entity_type(cls, value: str) -> str:
+        normalized = cls._normalize(value).replace(" ", "_")
+        if not normalized:
+            return ""
+        return _ENTITY_TYPE_ALIASES.get(normalized, _ENTITY_TYPE_ALIASES.get(normalized.replace("_", " "), ""))
+
+    def _passes_type_constraints(
+        self,
+        *,
+        relation_label: str,
+        head: str,
+        tail: str,
+        entity_types_by_name: dict[str, set[str]],
+    ) -> bool:
+        constraints = _RELATION_TYPE_CONSTRAINTS.get(relation_label)
+        if constraints is None:
+            return True
+
+        head_types = entity_types_by_name.get(self._normalize(head), set())
+        tail_types = entity_types_by_name.get(self._normalize(tail), set())
+
+        # No reliable types → don't filter this relation.
+        if not head_types or not tail_types:
+            return True
+
+        allowed_head, allowed_tail = constraints
+        return bool(head_types.intersection(allowed_head)) and bool(tail_types.intersection(allowed_tail))
+
+    @classmethod
+    def _normalize_relation_label(cls, value: str) -> str:
+        return cls._normalize(str(value).replace("_", " "))
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
