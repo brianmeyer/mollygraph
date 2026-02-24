@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .constants import build_relationship_half_life_case, log
 
@@ -140,8 +140,25 @@ class MaintenanceMixin:
         log.info("Temporal backfill summary: %s", summary)
         return summary
 
-    def delete_orphan_entities_sync(self) -> int:
+    def delete_orphan_entities_sync(self, vector_store: Optional[Any] = None) -> int:
+        """Delete orphan entities (no relationships) from Neo4j.
+
+        If *vector_store* is provided, also removes the corresponding vectors
+        so the vector index stays consistent with the graph.
+        """
         with self.driver.session() as session:
+            # Collect orphan entity IDs before deletion so we can clean vectors.
+            if vector_store is not None:
+                orphan_rows: list[dict] = session.run(
+                    """
+                    MATCH (e:Entity)
+                    WHERE NOT (e)--()
+                    RETURN e.id AS entity_id
+                    """
+                ).data()
+            else:
+                orphan_rows = []
+
             record = session.run(
                 """
                 MATCH (e:Entity)
@@ -150,8 +167,25 @@ class MaintenanceMixin:
                 RETURN count(e) AS deleted
                 """
             ).single()
+
         deleted = int(record["deleted"]) if record else 0
         log.info("Deleted %d orphan entities", deleted)
+
+        if vector_store is not None and orphan_rows:
+            removed_vectors = 0
+            for row in orphan_rows:
+                entity_id = row.get("entity_id")
+                if entity_id and isinstance(entity_id, str) and entity_id.strip():
+                    try:
+                        if vector_store.remove_entity(entity_id.strip()):
+                            removed_vectors += 1
+                    except Exception:
+                        log.debug(
+                            "Failed to remove vector for orphan entity_id=%s",
+                            entity_id, exc_info=True,
+                        )
+            log.info("Removed %d orphan entity vectors", removed_vectors)
+
         return deleted
 
     def rebuild_graph_from_audit(self, actions: List[Dict[str, Any]], dry_run: bool = False) -> Dict[str, int]:

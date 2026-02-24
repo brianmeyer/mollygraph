@@ -62,6 +62,7 @@ from memory.graph_suggestions import build_suggestion_digest
 from memory.models import ExtractionJob
 from memory.vector_store import VectorStore
 from runtime_graph import set_graph_instance
+from runtime_vector_store import set_vector_store_instance
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -396,6 +397,7 @@ async def lifespan(_app: FastAPI):
         )
         vector_store = VectorStore(backend="auto")
     pipeline = ExtractionPipeline(graph=graph, vector_store=vector_store)
+    set_vector_store_instance(vector_store)
     queue = ExtractionQueue()
 
     async def process_job(job: ExtractionJob) -> ExtractionJob:
@@ -1026,6 +1028,88 @@ async def backfill_temporal_properties(
         "summary": _json_safe(summary),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+@app.post("/maintenance/reconcile-vectors")
+async def reconcile_vectors(
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Remove vector store entries that no longer have a matching Neo4j entity.
+
+    Algorithm
+    ---------
+    1. Fetch all entity_ids from Neo4j via ``list_entities_for_embedding``.
+    2. Fetch all entity_ids stored in the vector store.
+    3. For each vector id that has no Neo4j counterpart, remove it.
+    4. Return counts: vectors_checked, orphans_removed.
+
+    Note: ZvecBackend does not support listing all stored entity_ids; if the
+    active backend returns ``None`` from ``list_all_entity_ids()``, the endpoint
+    returns a partial result explaining the limitation.
+    """
+    require_runtime_ready()
+    if graph is None or vector_store is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    try:
+        # Step 1 – all Neo4j entity_ids (up to 500 000 rows).
+        neo4j_rows = await asyncio.to_thread(
+            graph.list_entities_for_embedding, 500_000
+        )
+        neo4j_ids: set[str] = {row["entity_id"] for row in neo4j_rows}
+
+        # Step 2 – all vector store entity_ids.
+        all_vec_ids: list[str] | None = await asyncio.to_thread(
+            vector_store.list_all_entity_ids
+        )
+
+        if all_vec_ids is None:
+            return {
+                "status": "partial",
+                "message": (
+                    "Active vector backend does not support listing all entity ids "
+                    "(ZvecBackend). Reconciliation skipped. "
+                    "Consider switching to sqlite-vec for full reconciliation support."
+                ),
+                "neo4j_entities": len(neo4j_ids),
+                "orphans_removed": 0,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+        # Step 3 – find orphan vectors (in vector store but not in Neo4j).
+        orphan_ids = [vid for vid in all_vec_ids if vid not in neo4j_ids]
+
+        # Step 4 – remove each orphan.
+        removed = 0
+        for eid in orphan_ids:
+            try:
+                if await asyncio.to_thread(vector_store.remove_entity, eid):
+                    removed += 1
+            except Exception:
+                log.debug("reconcile-vectors: failed to remove %s", eid, exc_info=True)
+
+        log.info(
+            "reconcile-vectors: checked=%d neo4j_entities=%d orphans_found=%d orphans_removed=%d",
+            len(all_vec_ids),
+            len(neo4j_ids),
+            len(orphan_ids),
+            removed,
+        )
+
+        return {
+            "status": "ok",
+            "vectors_checked": len(all_vec_ids),
+            "neo4j_entities": len(neo4j_ids),
+            "orphans_found": len(orphan_ids),
+            "orphans_removed": removed,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    except Exception as exc:
+        log.error("reconcile-vectors endpoint failed", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"reconcile_vectors_error: {exc}"
+        ) from exc
 
 
 @app.post("/maintenance/cleanup-training-data")

@@ -35,6 +35,23 @@ class VectorStoreBackend(ABC):
         pass
     
     @abstractmethod
+    def remove_entity(self, entity_id: str) -> bool:
+        """Delete a vector by entity_id. Returns True if deleted, False if not found."""
+        pass
+
+    @abstractmethod
+    def update_entity(self, entity_id: str, name: str, entity_type: str,
+                      dense_embedding: List[float], content: str,
+                      confidence: float = 1.0) -> None:
+        """Upsert/replace a vector for an existing entity."""
+        pass
+
+    @abstractmethod
+    def list_all_entity_ids(self) -> Optional[List[str]]:
+        """Return all stored entity_ids, or None if not supported by this backend."""
+        pass
+
+    @abstractmethod
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
         pass
@@ -176,6 +193,27 @@ class SqliteVecBackend(VectorStoreBackend):
         
         return sorted(combined.values(), key=lambda x: x["score"], reverse=True)[:top_k]
     
+    def remove_entity(self, entity_id: str) -> bool:
+        """Delete vectors and metadata for entity_id. Returns True if a row was deleted."""
+        cursor = self.db.execute(
+            "DELETE FROM entity_meta WHERE entity_id = ?", (entity_id,)
+        )
+        self.db.execute("DELETE FROM dense_vectors WHERE entity_id = ?", (entity_id,))
+        self.db.execute("DELETE FROM sparse_vectors WHERE entity_id = ?", (entity_id,))
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def update_entity(self, entity_id: str, name: str, entity_type: str,
+                      dense_embedding: List[float], content: str,
+                      confidence: float = 1.0) -> None:
+        """Upsert/replace via add_entity (which uses INSERT OR REPLACE)."""
+        self.add_entity(entity_id, name, entity_type, dense_embedding, content, confidence)
+
+    def list_all_entity_ids(self) -> List[str]:
+        """Return every entity_id currently stored in the metadata table."""
+        cursor = self.db.execute("SELECT entity_id FROM entity_meta")
+        return [row[0] for row in cursor.fetchall()]
+
     def get_stats(self) -> Dict:
         cursor = self.db.execute("SELECT COUNT(*) FROM dense_vectors")
         dense_count = cursor.fetchone()[0]
@@ -319,6 +357,33 @@ class ZvecBackend(VectorStoreBackend):
         # Zvec doesn't have built-in hybrid search, use dense only
         return self.similarity_search(query_embedding, top_k=top_k)
     
+    def remove_entity(self, entity_id: str) -> bool:
+        """Delete a vector by entity_id using zvec collection.delete()."""
+        try:
+            result = self.collection.delete(ids=entity_id)
+            # result is a Status-like object; code=0 means success
+            if isinstance(result, dict):
+                return result.get("code", -1) == 0
+            code = getattr(result, "code", None)
+            return code == 0 if code is not None else True
+        except Exception:
+            log.debug("ZvecBackend remove_entity failed for %s", entity_id, exc_info=True)
+            return False
+
+    def update_entity(self, entity_id: str, name: str, entity_type: str,
+                      dense_embedding: List[float], content: str,
+                      confidence: float = 1.0) -> None:
+        """Upsert/replace via add_entity (which already calls collection.upsert)."""
+        self.add_entity(entity_id, name, entity_type, dense_embedding, content, confidence)
+
+    def list_all_entity_ids(self) -> Optional[List[str]]:
+        """Zvec has no native scan/list API — returns None to signal unsupported."""
+        log.debug(
+            "ZvecBackend.list_all_entity_ids(): native listing not supported; "
+            "returning None — reconciliation will be partial."
+        )
+        return None
+
     def get_stats(self) -> Dict:
         """Get collection stats."""
         stats = self.collection.stats
@@ -362,9 +427,37 @@ class VectorStore:
     
     def add_entity(self, entity_id: str, name: str, entity_type: str,
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
-        return self.backend.add_entity(entity_id, name, entity_type, 
+        return self.backend.add_entity(entity_id, name, entity_type,
                                        dense_embedding, content, confidence)
-    
+
+    def remove_entity(self, entity_id: str) -> bool:
+        """Delete a vector by entity_id. Returns True if deleted."""
+        try:
+            return self.backend.remove_entity(entity_id)
+        except Exception:
+            log.debug("VectorStore remove_entity failed for %s", entity_id, exc_info=True)
+            return False
+
+    def update_entity(self, entity_id: str, name: str, entity_type: str,
+                      dense_embedding: List[float], content: str,
+                      confidence: float = 1.0) -> None:
+        """Upsert/replace a vector for an existing entity."""
+        try:
+            self.backend.update_entity(entity_id, name, entity_type,
+                                       dense_embedding, content, confidence)
+        except Exception:
+            log.debug("VectorStore update_entity failed for %s", entity_id, exc_info=True)
+
+    def list_all_entity_ids(self) -> Optional[List[str]]:
+        """Return all stored entity_ids, or None if not supported by the backend."""
+        try:
+            return self.backend.list_all_entity_ids()
+        except NotImplementedError:
+            return None
+        except Exception:
+            log.debug("VectorStore list_all_entity_ids failed", exc_info=True)
+            return None
+
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
         start = time.perf_counter()

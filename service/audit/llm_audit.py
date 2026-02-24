@@ -17,6 +17,7 @@ from evolution.audit_feedback import record_audit_feedback_batch
 from memory.graph import VALID_REL_TYPES
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
+from runtime_vector_store import get_vector_store_instance
 
 log = logging.getLogger(__name__)
 
@@ -673,7 +674,9 @@ async def run_llm_audit(
     graph = require_graph_instance()
 
     self_refs_deleted = graph.delete_self_referencing_rels()
-    orphans_deleted = graph.delete_orphan_entities_sync()
+    orphans_deleted = graph.delete_orphan_entities_sync(
+        vector_store=get_vector_store_instance()
+    )
     strength_decay_updated = graph.run_strength_decay_sync()
 
     rels = graph.get_relationships_for_audit(limit=max(1, int(limit)))

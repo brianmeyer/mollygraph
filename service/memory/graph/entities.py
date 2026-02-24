@@ -20,6 +20,10 @@ def _sanitize_doc_id(raw: str) -> str:
 
 
 class EntityMixin:
+    # Optional reference to the active VectorStore; set by ExtractionPipeline.__init__
+    # so that merge operations can keep vectors in sync without a circular import.
+    _vector_store = None  # type: ignore[assignment]  # VectorStore | None
+
     @staticmethod
     def _normalize_name(name: str) -> str:
         return name.strip().lower()
@@ -94,6 +98,37 @@ class EntityMixin:
                 )
             return best_match
 
+    def update_episode_entity_references(self, old_name: str, new_name: str) -> int:
+        """Rewrite stale entity names inside Episode.entities_extracted arrays.
+
+        When *old_name* is merged into *new_name* (canonical), every Episode
+        that still references *old_name* in its ``entities_extracted`` list is
+        updated in-place.  Returns the number of Episodes updated.
+        """
+        if not old_name or not new_name or old_name.lower() == new_name.lower():
+            return 0
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (ep:Episode)
+                WHERE $old_name IN ep.entities_extracted
+                SET ep.entities_extracted = [
+                    x IN ep.entities_extracted |
+                    CASE WHEN x = $old_name THEN $new_name ELSE x END
+                ]
+                RETURN count(ep) AS updated
+                """,
+                old_name=old_name,
+                new_name=new_name,
+            ).single()
+        updated = int(record["updated"]) if record else 0
+        if updated:
+            log.debug(
+                "Updated %d episode(s): entity reference '%s' → '%s'",
+                updated, old_name, new_name,
+            )
+        return updated
+
     def upsert_entity(
         self,
         entity: Entity | str,
@@ -161,6 +196,22 @@ class EntityMixin:
                         confidence=entity.confidence,
                         new_alias=alias_to_add,
                     )
+
+                    # ── Vector store + Episode reference sync (merge path) ─────
+                    if alias_to_add:
+                        # alias_to_add is only set when incoming name ≠ canonical.
+                        # Remove any ghost vector that was stored under the alias name.
+                        _vs = self._vector_store
+                        if _vs is not None:
+                            old_vec_id = _sanitize_doc_id(alias)
+                            if _vs.remove_entity(old_vec_id):
+                                log.debug(
+                                    "Removed ghost vector for merged alias '%s' → '%s'",
+                                    alias, canonical_name,
+                                )
+                        # Keep Episode.entities_extracted arrays consistent.
+                        self.update_episode_entity_references(alias, canonical_name)
+
                     return str(existing["id"]), False
 
                 session.run(
@@ -226,6 +277,19 @@ class EntityMixin:
                     confidence=conf,
                     alias=name,
                 )
+
+                # ── Vector store + Episode reference sync (legacy merge path) ──
+                if name.lower() != matched.lower():
+                    _vs = self._vector_store
+                    if _vs is not None:
+                        old_vec_id = _sanitize_doc_id(name)
+                        if _vs.remove_entity(old_vec_id):
+                            log.debug(
+                                "Removed ghost vector for legacy merged alias '%s' → '%s'",
+                                name, matched,
+                            )
+                    self.update_episode_entity_references(name, matched)
+
                 return matched
 
             session.run(

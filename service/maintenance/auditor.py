@@ -12,6 +12,7 @@ from evolution.gliner_training import (
 )
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
+from runtime_vector_store import get_vector_store_instance
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ async def run_maintenance_cycle() -> dict[str, Any]:
         log.warning("Strength decay failed", exc_info=True)
 
     try:
-        cleanup["orphans_deleted"] = graph.delete_orphan_entities_sync()
+        vs = get_vector_store_instance()
+        cleanup["orphans_deleted"] = graph.delete_orphan_entities_sync(vector_store=vs)
     except Exception:
         log.warning("Orphan cleanup failed", exc_info=True)
 

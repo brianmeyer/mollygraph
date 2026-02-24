@@ -126,6 +126,9 @@ class ExtractionPipeline:
         self.vector_store = vector_store
         self._spacy_nlp: Any | None = None
         self._spacy_attempted = False
+        # Give the graph access to the vector store so entity merge/delete
+        # operations can keep vectors in sync with Neo4j.
+        self.graph._vector_store = vector_store
 
     def vector_search(self, query: str, top_k: int = 10):
         """Proxy to vector store search."""
