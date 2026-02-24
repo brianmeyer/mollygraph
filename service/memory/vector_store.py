@@ -85,8 +85,9 @@ class SqliteVecBackend(VectorStoreBackend):
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.np = np
+        self._lock = threading.Lock()
         
-        self.db = sqlite3.connect(str(self.db_path))
+        self.db = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.db.enable_load_extension(True)
         sqlite_vec.load(self.db)
         self.db.enable_load_extension(False)
@@ -94,73 +95,76 @@ class SqliteVecBackend(VectorStoreBackend):
         self._init_tables()
     
     def _init_tables(self):
-        self.db.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS dense_vectors USING vec0(
-                entity_id TEXT PRIMARY KEY,
-                embedding FLOAT[768]
-            )
-        """)
-        self.db.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS sparse_vectors USING fts5(
-                entity_id, content, tokenize='porter'
-            )
-        """)
-        self.db.execute("""
-            CREATE TABLE IF NOT EXISTS entity_meta (
-                entity_id TEXT PRIMARY KEY,
-                name TEXT, entity_type TEXT, confidence REAL, last_updated TEXT
-            )
-        """)
-        self.db.commit()
+        with self._lock:
+            self.db.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS dense_vectors USING vec0(
+                    entity_id TEXT PRIMARY KEY,
+                    embedding FLOAT[768]
+                )
+            """)
+            self.db.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS sparse_vectors USING fts5(
+                    entity_id, content, tokenize='porter'
+                )
+            """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS entity_meta (
+                    entity_id TEXT PRIMARY KEY,
+                    name TEXT, entity_type TEXT, confidence REAL, last_updated TEXT
+                )
+            """)
+            self.db.commit()
     
     def add_entity(self, entity_id: str, name: str, entity_type: str,
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
         from datetime import datetime, UTC
         
-        self.db.execute(
-            "INSERT OR REPLACE INTO dense_vectors (entity_id, embedding) VALUES (?, ?)",
-            (entity_id, self.np.array(dense_embedding, dtype=self.np.float32))
-        )
-        self.db.execute(
-            "INSERT OR REPLACE INTO sparse_vectors (entity_id, content) VALUES (?, ?)",
-            (entity_id, content)
-        )
-        self.db.execute(
-            """INSERT OR REPLACE INTO entity_meta 
-               (entity_id, name, entity_type, confidence, last_updated)
-               VALUES (?, ?, ?, ?, ?)""",
-            (entity_id, name, entity_type, confidence, datetime.now(UTC).isoformat())
-        )
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO dense_vectors (entity_id, embedding) VALUES (?, ?)",
+                (entity_id, self.np.array(dense_embedding, dtype=self.np.float32))
+            )
+            self.db.execute(
+                "INSERT OR REPLACE INTO sparse_vectors (entity_id, content) VALUES (?, ?)",
+                (entity_id, content)
+            )
+            self.db.execute(
+                """INSERT OR REPLACE INTO entity_meta 
+                   (entity_id, name, entity_type, confidence, last_updated)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (entity_id, name, entity_type, confidence, datetime.now(UTC).isoformat())
+            )
+            self.db.commit()
     
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
         query_vec = self.np.array(query_embedding, dtype=self.np.float32)
         
         # sqlite-vec requires k = ? constraint for KNN
-        if entity_type:
-            sql = """
-                SELECT v.entity_id, m.name, m.entity_type, v.distance
-                FROM dense_vectors v
-                JOIN entity_meta m ON v.entity_id = m.entity_id
-                WHERE v.embedding MATCH ? AND k = ? AND m.entity_type = ?
-            """
-            cursor = self.db.execute(sql, (query_vec, top_k, entity_type))
-        else:
-            sql = """
-                SELECT v.entity_id, m.name, m.entity_type, v.distance
-                FROM dense_vectors v
-                JOIN entity_meta m ON v.entity_id = m.entity_id
-                WHERE v.embedding MATCH ? AND k = ?
-            """
-            cursor = self.db.execute(sql, (query_vec, top_k))
-        
-        # Convert distance to similarity score (0-1)
-        results = []
-        for r in cursor.fetchall():
-            distance = r[3]
-            score = math.exp(-max(0, distance))
-            results.append({"entity_id": r[0], "name": r[1], "entity_type": r[2], "score": score})
+        with self._lock:
+            if entity_type:
+                sql = """
+                    SELECT v.entity_id, m.name, m.entity_type, v.distance
+                    FROM dense_vectors v
+                    JOIN entity_meta m ON v.entity_id = m.entity_id
+                    WHERE v.embedding MATCH ? AND k = ? AND m.entity_type = ?
+                """
+                cursor = self.db.execute(sql, (query_vec, top_k, entity_type))
+            else:
+                sql = """
+                    SELECT v.entity_id, m.name, m.entity_type, v.distance
+                    FROM dense_vectors v
+                    JOIN entity_meta m ON v.entity_id = m.entity_id
+                    WHERE v.embedding MATCH ? AND k = ?
+                """
+                cursor = self.db.execute(sql, (query_vec, top_k))
+            
+            # Convert distance to similarity score (0-1)
+            results = []
+            for r in cursor.fetchall():
+                distance = r[3]
+                score = math.exp(-max(0, distance))
+                results.append({"entity_id": r[0], "name": r[1], "entity_type": r[2], "score": score})
         return results
     
     def keyword_search(self, query: str, top_k: int = 10) -> List[Dict]:
@@ -170,9 +174,10 @@ class SqliteVecBackend(VectorStoreBackend):
             JOIN entity_meta m ON s.entity_id = m.entity_id
             WHERE sparse_vectors MATCH ? ORDER BY rank LIMIT ?
         """
-        cursor = self.db.execute(sql, (query, top_k))
-        return [{"entity_id": r[0], "name": r[1], "entity_type": r[2],
-                 "score": 1.0 / (1.0 + abs(r[3]))} for r in cursor.fetchall()]
+        with self._lock:
+            cursor = self.db.execute(sql, (query, top_k))
+            return [{"entity_id": r[0], "name": r[1], "entity_type": r[2],
+                     "score": 1.0 / (1.0 + abs(r[3]))} for r in cursor.fetchall()]
     
     def hybrid_search(self, query_embedding: List[float], query_text: str,
                       top_k: int = 10, dense_weight: float = 0.7) -> List[Dict]:
@@ -195,13 +200,14 @@ class SqliteVecBackend(VectorStoreBackend):
     
     def remove_entity(self, entity_id: str) -> bool:
         """Delete vectors and metadata for entity_id. Returns True if a row was deleted."""
-        cursor = self.db.execute(
-            "DELETE FROM entity_meta WHERE entity_id = ?", (entity_id,)
-        )
-        self.db.execute("DELETE FROM dense_vectors WHERE entity_id = ?", (entity_id,))
-        self.db.execute("DELETE FROM sparse_vectors WHERE entity_id = ?", (entity_id,))
-        self.db.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            cursor = self.db.execute(
+                "DELETE FROM entity_meta WHERE entity_id = ?", (entity_id,)
+            )
+            self.db.execute("DELETE FROM dense_vectors WHERE entity_id = ?", (entity_id,))
+            self.db.execute("DELETE FROM sparse_vectors WHERE entity_id = ?", (entity_id,))
+            self.db.commit()
+            return cursor.rowcount > 0
 
     def update_entity(self, entity_id: str, name: str, entity_type: str,
                       dense_embedding: List[float], content: str,
@@ -211,14 +217,16 @@ class SqliteVecBackend(VectorStoreBackend):
 
     def list_all_entity_ids(self) -> List[str]:
         """Return every entity_id currently stored in the metadata table."""
-        cursor = self.db.execute("SELECT entity_id FROM entity_meta")
-        return [row[0] for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self.db.execute("SELECT entity_id FROM entity_meta")
+            return [row[0] for row in cursor.fetchall()]
 
     def get_stats(self) -> Dict:
-        cursor = self.db.execute("SELECT COUNT(*) FROM dense_vectors")
-        dense_count = cursor.fetchone()[0]
-        cursor = self.db.execute("SELECT COUNT(*) FROM sparse_vectors")
-        sparse_count = cursor.fetchone()[0]
+        with self._lock:
+            cursor = self.db.execute("SELECT COUNT(*) FROM dense_vectors")
+            dense_count = cursor.fetchone()[0]
+            cursor = self.db.execute("SELECT COUNT(*) FROM sparse_vectors")
+            sparse_count = cursor.fetchone()[0]
         return {"dense_vectors": dense_count, "sparse_vectors": sparse_count,
                 "db_size_mb": self.db_path.stat().st_size / (1024 * 1024)}
 
@@ -323,7 +331,7 @@ class ZvecBackend(VectorStoreBackend):
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
         """Insert entity into Zvec collection."""
         if self.collection is None:
-            log.debug("Zvec degraded — skipping add_entity(%s)", entity_id)
+            log.error("Zvec degraded — add_entity(%s) is a no-op; vector store is unavailable", entity_id)
             return
         doc = zvec.Doc(
             id=entity_id,
@@ -357,7 +365,7 @@ class ZvecBackend(VectorStoreBackend):
                           entity_type: Optional[str] = None) -> List[Dict]:
         """Search similar vectors using cosine similarity."""
         if self.collection is None:
-            log.debug("Zvec degraded — returning empty results for similarity_search")
+            log.error("Zvec degraded — similarity_search returning empty; vector store is unavailable")
             return []
         # Build filter if entity_type specified
         filter_expr = None
@@ -541,6 +549,12 @@ class VectorStore:
     def hybrid_search(self, query_embedding: List[float], query_text: str,
                       top_k: int = 10, dense_weight: float = 0.7) -> List[Dict]:
         return self.backend.hybrid_search(query_embedding, query_text, top_k, dense_weight)
+
+    def is_degraded(self) -> bool:
+        """Return True if the backend is in degraded mode (e.g. Zvec collection failed to open)."""
+        if isinstance(self.backend, ZvecBackend):
+            return self.backend.collection is None
+        return False
 
     def flush(self):
         """Flush backend WAL to disk. Call after bulk operations (reindex, etc.)."""
