@@ -43,26 +43,29 @@ ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 MOONSHOT_API_KEY    = os.environ.get("MOONSHOT_API_KEY", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
+TOGETHER_API_KEY    = os.environ.get("TOGETHER_API_KEY", "")
+FIREWORKS_API_KEY   = os.environ.get("FIREWORKS_API_KEY", "")
 
 # ── Audit models ──────────────────────────────────────────────────────────────
 # Local-first defaults: LLM audit is optional and disabled by default.
-AUDIT_LLM_ENABLED = os.environ.get("AUDIT_LLM_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-AUDIT_MODEL_NIGHTLY = os.environ.get("AUDIT_MODEL_NIGHTLY", "llama3.1:8b")
-AUDIT_MODEL_PRETRAIN = os.environ.get("AUDIT_MODEL_PRETRAIN", "llama3.1:8b")
-AUDIT_MODEL_WEEKLY = os.environ.get("AUDIT_MODEL_WEEKLY", "llama3.1:8b")
-AUDIT_MODEL_LOCAL = os.environ.get("AUDIT_MODEL_LOCAL", "llama3.1:8b")
-
-# Provider/model chain used by audit fallback registry.
-AUDIT_MODEL_PRIMARY = os.environ.get("AUDIT_MODEL_PRIMARY", AUDIT_MODEL_NIGHTLY)
-AUDIT_MODEL_SECONDARY = os.environ.get("AUDIT_MODEL_SECONDARY", "llama3.1:8b")
-AUDIT_MODEL_TERTIARY = os.environ.get("AUDIT_MODEL_TERTIARY", "gpt-oss-120b")
+AUDIT_LLM_ENABLED    = os.environ.get("AUDIT_LLM_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUDIT_MODEL_NIGHTLY  = os.environ.get("AUDIT_MODEL_NIGHTLY", "llama3.1:8b")
+AUDIT_MODEL_WEEKLY   = os.environ.get("AUDIT_MODEL_WEEKLY", "llama3.1:8b")
+AUDIT_MODEL_PRETRAIN = os.environ.get("AUDIT_MODEL_PRETRAIN", "llama3.1:8b")  # used by gliner pre-training validation
 AUDIT_PROVIDER_ORDER = os.environ.get("AUDIT_PROVIDER_ORDER", "none")
 
+# ── LLM provider base URLs ────────────────────────────────────────────────────
 GEMINI_BASE_URL    = "https://generativelanguage.googleapis.com/v1beta/openai"
 MOONSHOT_BASE_URL  = os.environ.get("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
 GROQ_BASE_URL      = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OLLAMA_BASE_URL    = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_CHAT_BASE_URL = os.environ.get("OLLAMA_CHAT_BASE_URL", f"{OLLAMA_BASE_URL}/v1")
+OPENAI_BASE_URL      = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENROUTER_BASE_URL  = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+TOGETHER_BASE_URL    = os.environ.get("TOGETHER_BASE_URL", "https://api.together.xyz/v1")
+FIREWORKS_BASE_URL   = os.environ.get("FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1")
 
 # ── Service ───────────────────────────────────────────────────────────────────
 HOST = os.environ.get("GRAPH_MEMORY_HOST", "127.0.0.1")

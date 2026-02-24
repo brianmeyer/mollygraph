@@ -315,6 +315,54 @@ async def _invoke_ollama(prompt: str, model: str) -> tuple[str, int]:
     )
 
 
+async def _invoke_openai(prompt: str, model: str) -> tuple[str, int]:
+    return await _invoke_openai_compatible(
+        provider="openai",
+        prompt=prompt,
+        model=model,
+        base_url=config.OPENAI_BASE_URL,
+        api_key=config.OPENAI_API_KEY,
+        require_api_key=True,
+        max_tokens=4096,
+    )
+
+
+async def _invoke_openrouter(prompt: str, model: str) -> tuple[str, int]:
+    return await _invoke_openai_compatible(
+        provider="openrouter",
+        prompt=prompt,
+        model=model,
+        base_url=config.OPENROUTER_BASE_URL,
+        api_key=config.OPENROUTER_API_KEY,
+        require_api_key=True,
+        max_tokens=4096,
+    )
+
+
+async def _invoke_together(prompt: str, model: str) -> tuple[str, int]:
+    return await _invoke_openai_compatible(
+        provider="together",
+        prompt=prompt,
+        model=model,
+        base_url=config.TOGETHER_BASE_URL,
+        api_key=config.TOGETHER_API_KEY,
+        require_api_key=True,
+        max_tokens=4096,
+    )
+
+
+async def _invoke_fireworks(prompt: str, model: str) -> tuple[str, int]:
+    return await _invoke_openai_compatible(
+        provider="fireworks",
+        prompt=prompt,
+        model=model,
+        base_url=config.FIREWORKS_BASE_URL,
+        api_key=config.FIREWORKS_API_KEY,
+        require_api_key=True,
+        max_tokens=4096,
+    )
+
+
 async def _invoke_anthropic(prompt: str, model: str) -> tuple[str, int]:
     import httpx
 
@@ -378,18 +426,22 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
 
     def _default_model_for(provider: str) -> str:
         default_model = config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_NIGHTLY
-        gemini_model = (config.AUDIT_MODEL_WEEKLY if normalized == "weekly" else config.AUDIT_MODEL_PRIMARY) or default_model
-        provider_to_model = {
-            "gemini": gemini_model,
-            "moonshot": config.AUDIT_MODEL_SECONDARY or "kimi-k2.5",
-            "kimi": config.AUDIT_MODEL_SECONDARY or "kimi-k2.5",
-            "groq": config.AUDIT_MODEL_TERTIARY or "gpt-oss-120b",
-            "anthropic": config.AUDIT_MODEL_WEEKLY or "claude-3-5-sonnet-latest",
-            "opus": config.AUDIT_MODEL_WEEKLY or "claude-3-opus-latest",
-            "ollama": config.AUDIT_MODEL_LOCAL or default_model,
-            "local": config.AUDIT_MODEL_LOCAL or default_model,
+        # Per-provider hard-coded fallbacks used when the schedule model is empty.
+        provider_fallbacks: dict[str, str] = {
+            "gemini": "gemini-2.0-flash",
+            "moonshot": "kimi-k2.5",
+            "kimi": "kimi-k2.5",
+            "groq": "llama-3.3-70b-versatile",
+            "anthropic": "claude-3-5-sonnet-latest",
+            "opus": "claude-opus-4-5",
+            "ollama": "llama3.1:8b",
+            "local": "llama3.1:8b",
+            "openai": "gpt-4o-mini",
+            "openrouter": "meta-llama/llama-3.1-70b-instruct",
+            "together": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            "fireworks": "accounts/fireworks/models/llama-v3p1-70b-instruct",
         }
-        return str(provider_to_model.get(provider) or default_model).strip()
+        return str(default_model or provider_fallbacks.get(provider, "llama3.1:8b")).strip()
 
     async def _run_provider(provider: str, model: str) -> tuple[str, int, str]:
         if provider in {"gemini"}:
@@ -407,6 +459,18 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
         if provider in {"ollama", "local"}:
             content, latency_ms = await _invoke_ollama(prompt, model)
             return content, latency_ms, "ollama"
+        if provider in {"openai"}:
+            content, latency_ms = await _invoke_openai(prompt, model)
+            return content, latency_ms, "openai"
+        if provider in {"openrouter"}:
+            content, latency_ms = await _invoke_openrouter(prompt, model)
+            return content, latency_ms, "openrouter"
+        if provider in {"together"}:
+            content, latency_ms = await _invoke_together(prompt, model)
+            return content, latency_ms, "together"
+        if provider in {"fireworks"}:
+            content, latency_ms = await _invoke_fireworks(prompt, model)
+            return content, latency_ms, "fireworks"
         raise RuntimeError(f"Unsupported audit provider: {provider}")
 
     if not config.AUDIT_LLM_ENABLED and not model_override:
@@ -426,7 +490,7 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
         model = raw_override
         if "/" in raw_override:
             maybe_provider, maybe_model = raw_override.split("/", 1)
-            if maybe_provider.strip().lower() in {"gemini", "moonshot", "kimi", "groq", "anthropic", "opus", "ollama", "local"}:
+            if maybe_provider.strip().lower() in {"gemini", "moonshot", "kimi", "groq", "anthropic", "opus", "ollama", "local", "openai", "openrouter", "together", "fireworks"}:
                 provider = maybe_provider.strip().lower()
                 model = maybe_model.strip()
 
@@ -441,6 +505,14 @@ async def call_audit_model(prompt: str, schedule: str, model_override: str | Non
                 provider = "anthropic"
             elif "gemini" in lowered:
                 provider = "gemini"
+            elif "gpt" in lowered or "openai" in lowered:
+                provider = "openai"
+            elif "openrouter" in lowered:
+                provider = "openrouter"
+            elif "together" in lowered:
+                provider = "together"
+            elif "fireworks" in lowered:
+                provider = "fireworks"
             else:
                 provider = next((p for p in order if p not in {"none", "disabled"}), "ollama")
 
@@ -799,7 +871,7 @@ async def run_llm_audit(
         "self_refs_deleted": self_refs_deleted,
         "orphans_deleted": orphans_deleted,
         "strength_decay_updated": strength_decay_updated,
-        "audit_model_model": chosen_model or (model_override or (config.AUDIT_MODEL_LOCAL if llm_enabled else "")),
+        "audit_model_model": chosen_model or (model_override or (config.AUDIT_MODEL_NIGHTLY if llm_enabled else "")),
         "audit_provider": chosen_provider or ("disabled" if not llm_enabled else "unknown"),
         "audit_model_latency_ms": total_latency_ms,
         "batches": batches,
