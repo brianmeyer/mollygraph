@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -49,8 +51,18 @@ def _load_audit_state() -> dict[str, Any]:
 def _save_audit_state(state: dict[str, Any]) -> None:
     path = _audit_state_path()
     try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, default=str)
+        # Atomic write: temp file + os.replace() prevents corruption on crash mid-write.
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2, default=str)
+            os.replace(tmp_name, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     except Exception:
         log.debug("Failed to write audit_state.json", exc_info=True)
 

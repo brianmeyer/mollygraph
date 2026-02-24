@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -310,7 +312,18 @@ def _save_adoption_history(history: dict[str, dict[str, Any]]) -> None:
         }
 
     payload = {"version": 1, "items": serializable_items}
-    _ADOPTION_HISTORY_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    # Atomic write: temp file + os.replace() prevents corruption on crash mid-write.
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=SUGGESTIONS_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+        os.replace(tmp_name, str(_ADOPTION_HISTORY_PATH))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _days_inclusive(start_iso: str, end_iso: str) -> int:
@@ -534,10 +547,19 @@ def _save_adopted_schema(adopted: dict[str, dict[str, dict[str, str]]]) -> None:
         "entities": adopted.get("entities", {}),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _ADOPTED_SCHEMA_PATH.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
-        encoding="utf-8",
-    )
+    # Atomic write: temp file + os.replace() prevents corruption on crash mid-write.
+    parent = _ADOPTED_SCHEMA_PATH.parent
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+        os.replace(tmp_name, str(_ADOPTED_SCHEMA_PATH))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _record_adopted_types(adopted_rel_types: list[str], adopted_entity_types: list[str]) -> int:
