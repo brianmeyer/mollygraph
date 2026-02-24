@@ -171,15 +171,15 @@ class GLiNERTrainingService:
         ).strip().lower()
         if last_strategy not in {"lora", "full"}:
             last_strategy = "lora"
-        cooldown_days = GLINER_LORA_COOLDOWN_DAYS if last_strategy == "lora" else GLINER_FINETUNE_COOLDOWN_DAYS
+        cooldown_hours = GLINER_LORA_COOLDOWN_DAYS * 24 if last_strategy == "lora" else GLINER_FINETUNE_COOLDOWN_DAYS * 24
 
-        if not force and last_run and (now_utc - last_run) < timedelta(days=cooldown_days):
+        if not force and last_run and (now_utc - last_run) < timedelta(hours=cooldown_hours):
             elapsed = now_utc - last_run
-            remaining = timedelta(days=cooldown_days) - elapsed
+            remaining = timedelta(hours=cooldown_hours) - elapsed
             hours_remaining = max(0, int(remaining.total_seconds() // 3600))
             cooldown_line = (
                 f"GLiNER fine-tune skipped: last {last_strategy} run {last_run.date().isoformat()} "
-                f"({hours_remaining}h cooldown, {cooldown_days}d for {last_strategy})."
+                f"({hours_remaining}h cooldown, {cooldown_hours}h for {last_strategy})."
             )
             self.state["gliner_last_result"] = cooldown_line
             self.state["gliner_last_cycle_status"] = "cooldown_active"
