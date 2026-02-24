@@ -721,6 +721,8 @@ async def apply_verdicts(
                         rel.get("context_snippets") if isinstance(rel.get("context_snippets"), list) else [],
                         str(rel.get("first_mentioned") or "") or None,
                     )
+                    # Mark the new relationship as verified + stamp last_audited_at
+                    graph.set_relationship_audit_status(rel["head"], rel["tail"], suggested_type, "verified")
                 get_signal_bus().publish("relationship_reclassified", {
                     "head": rel["head"],
                     "tail": rel["tail"],
@@ -860,7 +862,7 @@ async def run_llm_audit(
     )
     strength_decay_updated = graph.run_strength_decay_sync()
 
-    rels = graph.get_relationships_for_audit(limit=max(1, int(limit)))
+    rels = graph.get_relationships_for_audit(limit=max(1, int(limit)), schedule=schedule)
 
     auto_fixed = 0
     quarantined = 0
