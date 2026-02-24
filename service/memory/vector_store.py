@@ -245,46 +245,41 @@ class ZvecBackend(VectorStoreBackend):
         collection_exists = self.db_path.exists()
         
         if collection_exists:
-            # Clear ALL stale lock files to prevent "Can't open lock file" on restart.
-            # These are RocksDB-style lock files that persist after unclean shutdown.
+            # RocksDB LOCK files are advisory locks. After unclean shutdown they
+            # may be stale. The fix is NOT to delete them — Zvec/RocksDB needs
+            # them to exist (empty). We truncate them to release any stale flock,
+            # then ensure they exist as empty files so zvec.open() succeeds.
             for lock_file in self.db_path.rglob("LOCK"):
                 try:
-                    lock_file.unlink()
-                    log.info("Cleared stale Zvec LOCK file: %s", lock_file)
+                    # Truncate to release stale advisory lock, keep file present
+                    lock_file.write_bytes(b"")
+                    log.info("Reset stale Zvec LOCK file: %s", lock_file)
                 except OSError:
                     pass
 
-            # Retry open after lock cleanup — RocksDB sometimes needs a moment
-            import time
-            last_exc = None
-            for attempt in range(3):
-                try:
-                    self.collection = zvec.open(str(self.db_path))
-                    log.info("Opened existing Zvec collection: %s (attempt %d)", self.db_path, attempt + 1)
-                    break
-                except RuntimeError as exc:
-                    last_exc = exc
-                    if attempt < 2:
-                        # Clear locks again and retry
-                        for lock_file in self.db_path.rglob("LOCK"):
-                            try:
-                                lock_file.unlink()
-                            except OSError:
-                                pass
-                        time.sleep(0.5 * (attempt + 1))
-                        log.warning("Zvec open attempt %d failed (%s), retrying...", attempt + 1, exc)
-            else:
-                # All retries failed — but DON'T destroy the data.
-                # Fall back to SQLite vec backend instead of wiping.
+            # Also ensure LOCK files exist at known paths (in case they were
+            # deleted by a prior version of this code)
+            for lock_path in [self.db_path / "LOCK", self.db_path / "idmap.0" / "LOCK"]:
+                if not lock_path.exists():
+                    try:
+                        lock_path.touch()
+                        log.info("Recreated missing Zvec LOCK file: %s", lock_path)
+                    except OSError:
+                        pass
+
+            try:
+                self.collection = zvec.open(str(self.db_path))
+                log.info("Opened existing Zvec collection: %s", self.db_path)
+            except RuntimeError as exc:
+                # Don't destroy the data — run degraded instead
                 log.error(
-                    "Failed to open Zvec collection after 3 attempts (%s). "
-                    "NOT wiping data. Falling back to in-memory mode. "
-                    "Vector search will be degraded until next successful restart.",
-                    last_exc,
+                    "Failed to open Zvec collection (%s). "
+                    "NOT wiping data. Vector search will be degraded until "
+                    "next successful restart.",
+                    exc,
                 )
-                # Create a minimal in-memory stub so the service can still start
                 self.collection = None
-                return  # skip creation, run degraded
+                return
         if not collection_exists:
             # Create new collection with schema
             # Vector schema with HNSW index for cosine similarity
