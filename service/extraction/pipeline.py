@@ -311,8 +311,31 @@ class ExtractionPipeline:
             job.started_at = datetime.now(UTC)
             ingest_source = self._normalize_source(job.source)
             speaker = (job.speaker or "").strip() or None
+
+            # ── Contact preprocessing: reformat structured text for GLiREL ──────
+            # Contacts arrive as "Name is a contact of Owner. Email: ... Employer: ..."
+            # which gives GLiREL little to work with (label noise, no verb phrases).
+            # We rewrite into natural language BEFORE extraction so GLiREL can find
+            # relational phrases like "works at", "is based in", etc.
+            # The original structured text is preserved in content_preview for auditing.
+            _contact_extraction_text = job.content
+            if ingest_source == "contacts_json":
+                try:
+                    from evolution.contact_training import reformat_contact_text as _reformat_contact
+                    _reformatted = _reformat_contact(job.content)
+                    if _reformatted:
+                        log.info(
+                            "contact_preprocessing: reformatted contact text (%d→%d chars): %s",
+                            len(job.content), len(_reformatted), _reformatted,
+                        )
+                        _contact_extraction_text = _reformatted
+                    else:
+                        log.debug("contact_preprocessing: reformatter returned None, using original text")
+                except Exception:
+                    log.debug("contact_preprocessing: reformatting failed, using original text", exc_info=True)
+
             content_for_extraction = (
-                f"Statement by {speaker}: {job.content}" if speaker else job.content
+                f"Statement by {speaker}: {_contact_extraction_text}" if speaker else _contact_extraction_text
             )
             threshold = getattr(service_config, "EXTRACTION_CONFIDENCE", {}).get(
                 ingest_source,
@@ -482,6 +505,29 @@ class ExtractionPipeline:
             # All entity writes succeeded. Clear the incomplete flag and wire
             # MENTIONS edges to the entities extracted this job.
             self._finalize_episode(_episode_id, [entity.name for entity in stored_entities])
+
+            # ── Contact NER training examples (100% clean labels from structured data) ──
+            # For contacts_json source, generate span-labeled training examples directly
+            # from the structured fields without depending on GLiREL for relation extraction.
+            if ingest_source == "contacts_json":
+                try:
+                    from evolution.contact_training import (
+                        generate_contact_ner_examples as _gen_contact_ner,
+                        persist_contact_ner_examples as _persist_contact_ner,
+                    )
+                    _contact_ner_examples = await asyncio.to_thread(
+                        _gen_contact_ner, job.content
+                    )
+                    if _contact_ner_examples:
+                        await asyncio.to_thread(_persist_contact_ner, _contact_ner_examples)
+                        log.info(
+                            "contact_ner_training: generated %d clean NER examples from contact fields",
+                            len(_contact_ner_examples),
+                        )
+                    else:
+                        log.debug("contact_ner_training: no NER examples generated (insufficient parsed fields)")
+                except Exception:
+                    log.warning("contact_ner_training: failed to generate/persist NER examples", exc_info=True)
 
             # Embed episode into vector store for semantic search
             try:
