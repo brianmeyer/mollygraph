@@ -37,6 +37,11 @@ try:
 except Exception:  # pragma: no cover
     _model_health_monitor = None  # type: ignore
 
+try:
+    from metrics.source_yield import record_yield as _record_yield
+except Exception:  # pragma: no cover
+    _record_yield = None  # type: ignore
+
 
 def _get_gliner_model():
     """Return the active GLiNER2 model (hot-reload aware).
@@ -345,6 +350,7 @@ class ExtractionPipeline:
             stored_entities: list[Entity] = []
             new_entity_count = 0
             existing_entity_count = 0
+            ingest_source = self._normalize_source(job.source)
 
             for entity in entities:
                 entity_id, is_new = self.graph.upsert_entity(entity)
@@ -353,6 +359,22 @@ class ExtractionPipeline:
                 written_entity_names.append(entity.name)  # track for failure reconciliation
                 if is_new:
                     new_entity_count += 1
+                    # Tag new entity nodes with first_seen metadata (non-destructive)
+                    try:
+                        with self.graph.driver.session() as _s:
+                            _s.run(
+                                """
+                                MATCH (e:Entity {id: $entity_id})
+                                SET e.first_seen_source = coalesce(e.first_seen_source, $source),
+                                    e.first_seen_at = coalesce(e.first_seen_at, datetime())
+                                """,
+                                entity_id=entity_id,
+                                source=ingest_source,
+                            )
+                    except Exception:
+                        log.debug(
+                            "first_seen tagging failed for entity %s", entity.name, exc_info=True
+                        )
                 else:
                     existing_entity_count += 1
 
@@ -561,6 +583,19 @@ class ExtractionPipeline:
                 )
             except Exception:
                 log.debug("ingestion_counters update failed", exc_info=True)
+
+            # ── Per-source yield tracking (Part B) ──────────────────────────
+            if _record_yield is not None:
+                try:
+                    _record_yield(
+                        source=ingest_source,
+                        entity_count=len(stored_entities),
+                        relationship_count=len(relationships),
+                        new_entity_count=new_entity_count,
+                        total_entity_count=max(len(stored_entities), 1),
+                    )
+                except Exception:
+                    log.debug("source_yield record_yield failed", exc_info=True)
 
             return job
 
