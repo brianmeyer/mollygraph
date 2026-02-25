@@ -191,7 +191,7 @@ AUDIT_AUTO_DELETE = os.environ.get("MOLLYGRAPH_AUDIT_AUTO_DELETE", "false").lowe
 # AUDIT_AUTO_DELETE=true.  Once the cap is hit, further delete verdicts are
 # logged as warnings and skipped for the rest of the run.  Set to 0 to disable
 # auto-delete entirely regardless of AUDIT_AUTO_DELETE.
-AUDIT_MAX_AUTO_DELETES = int(os.environ.get("MOLLYGRAPH_AUDIT_MAX_AUTO_DELETES", "25"))
+AUDIT_MAX_AUTO_DELETES = int(os.environ.get("MOLLYGRAPH_AUDIT_MAX_AUTO_DELETES", "5"))
 
 # ── Ensure runtime dirs exist ────────────────────────────────────────────────
 for _d in (
