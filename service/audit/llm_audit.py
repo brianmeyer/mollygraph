@@ -24,7 +24,7 @@ from runtime_vector_store import get_vector_store_instance
 
 log = logging.getLogger(__name__)
 
-_BATCH_SIZE = 500
+_BATCH_SIZE = 25  # Small batches prevent JSON truncation in LLM responses
 
 # ---------------------------------------------------------------------------
 # Audit state helpers  (coverage metrics + last_full_sweep)
@@ -940,6 +940,7 @@ async def run_llm_audit(
     quarantined = 0
     deleted = 0
     verified = 0
+    relationships_reviewed = 0  # total that received an LLM verdict
     batches = 0
     parse_failures = 0
     total_latency_ms = 0
@@ -969,6 +970,8 @@ async def run_llm_audit(
                 if not verdicts:
                     parse_failures += 1
                     continue
+
+                relationships_reviewed += len(verdicts)
 
                 # Determine delete cap: use config value, honour dry_run (no cap in dry runs).
                 max_deletes_cap: int | None = None
@@ -1051,6 +1054,10 @@ async def run_llm_audit(
         "status": status,
         "summary": summary,
         "relationships_scanned": len(rels),
+        "relationships_reviewed": relationships_reviewed,
+        "relationships_approved": verified,
+        "relationships_flagged": quarantined,
+        "relationships_reclassified": auto_fixed,
         "auto_fixed": auto_fixed,
         "quarantined": quarantined,
         "deleted": deleted,

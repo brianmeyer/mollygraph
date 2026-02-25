@@ -12,7 +12,9 @@ from pydantic import BaseModel, Field
 
 import config
 from extraction.pipeline import ExtractionPipeline
+from metrics.retrieval_quality import compute_retrieval_quality
 from metrics.stats_logger import log_retrieval
+from query.graph_reranker import graph_rerank
 from runtime_graph import get_graph_instance
 from runtime_vector_store import get_vector_store_instance
 
@@ -171,6 +173,27 @@ async def _run_query(q: str, result_limit: int = 5) -> QueryResponse:
     else:
         retrieval_source = "none"
 
+    # ── Optional graph-aware reranker (graph_reranker.py) ─────────────────────
+    graph_reranked = False
+    graph_rerank_ms = 0.0
+    if getattr(config, "GRAPH_RERANK_ENABLED", False) and len(results) > 1:
+        _gr_start = time.perf_counter()
+        try:
+            reranked_results = await asyncio.to_thread(
+                graph_rerank,
+                results,
+                q,
+                entities,
+                graph.driver,
+            )
+            if reranked_results:
+                results = reranked_results[:result_limit]
+                graph_reranked = True
+        except Exception as _gr_exc:
+            log.debug("graph_rerank failed: %s", _gr_exc)
+        graph_rerank_ms = (time.perf_counter() - _gr_start) * 1000
+        log.debug("graph_rerank: %.1fms graph_reranked=%s", graph_rerank_ms, graph_reranked)
+
     # ── Optional reranker ─────────────────────────────────────────────────────
     reranked = False
     if getattr(config, "RERANKER_ENABLED", False) and len(results) > 1:
@@ -186,6 +209,13 @@ async def _run_query(q: str, result_limit: int = 5) -> QueryResponse:
         except Exception as exc:
             log.debug("Reranker step failed: %s", exc)
         reranker_ms = (time.perf_counter() - _rerank_start) * 1000
+
+    # ── Retrieval quality metrics ──────────────────────────────────────────────
+    quality_metrics: dict[str, Any] = {}
+    try:
+        quality_metrics = compute_retrieval_quality(results)
+    except Exception as _qm_exc:
+        log.debug("compute_retrieval_quality failed: %s", _qm_exc)
 
     total_latency_ms = (time.perf_counter() - query_start) * 1000
     try:
@@ -216,6 +246,19 @@ async def _run_query(q: str, result_limit: int = 5) -> QueryResponse:
         result_count=len(results),
         timestamp=datetime.now(UTC).isoformat(),
         reranked=reranked,
+        graph_reranked=graph_reranked,
+        quality_metrics=quality_metrics,
+        retrieval_metadata={
+            "total_latency_ms": round(total_latency_ms, 2),
+            "entity_extraction_ms": round(entity_extraction_ms, 2),
+            "embedding_ms": round(embedding_ms, 2),
+            "vector_search_ms": round(vector_search_ms, 2),
+            "graph_exact_lookup_ms": round(graph_exact_lookup_ms, 2),
+            "graph_fuzzy_lookup_ms": round(graph_fuzzy_lookup_ms, 2),
+            "reranker_ms": round(reranker_ms, 2),
+            "graph_rerank_ms": round(graph_rerank_ms, 2),
+            "retrieval_source": retrieval_source,
+        },
     )
 
 

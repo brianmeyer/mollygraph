@@ -43,6 +43,8 @@ from maintenance.auditor import run_maintenance_cycle
 from memory import extractor as memory_extractor
 from memory.graph_suggestions import build_suggestion_digest
 from metrics.model_health import model_health_monitor
+from metrics.retrieval_quality import compute_retrieval_quality
+from metrics.source_yield import get_daily_source_breakdown, get_source_stats
 from metrics.stats_logger import (
     get_recent_retrieval_queries,
     get_retrieval_summary,
@@ -259,13 +261,103 @@ async def metrics_nightly(_api_key: str = Depends(verify_api_key)) -> dict[str, 
     """Return nightly pipeline run history (success/failure per run)."""
     results = get_nightly_results()
     last = results[-1] if results else None
+
+    # Aggregate review counts across all nightly runs
+    total_reviewed = sum(r.get("relationships_reviewed", 0) for r in results)
+    total_approved = sum(r.get("relationships_approved", 0) for r in results)
+    total_flagged = sum(r.get("relationships_flagged", 0) for r in results)
+    total_reclassified = sum(r.get("relationships_reclassified", 0) for r in results)
+
     return {
         "runs": results,
         "run_count": len(results),
         "last_run": last,
         "last_status": last.get("status") if last else None,
         "last_timestamp": last.get("timestamp") if last else None,
+        "audit_totals": {
+            "relationships_reviewed": total_reviewed,
+            "relationships_approved": total_approved,
+            "relationships_flagged": total_flagged,
+            "relationships_reclassified": total_reclassified,
+        },
         "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/metrics/sources")
+async def metrics_sources(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return per-source ingestion yield statistics."""
+    stats = await asyncio.to_thread(get_source_stats)
+    today_breakdown = await asyncio.to_thread(get_daily_source_breakdown)
+    return {
+        **stats,
+        "today": today_breakdown,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/metrics/retrieval/trend")
+async def metrics_retrieval_trend(
+    weeks: int = 4,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Return weekly retrieval quality trend (diversity, graph coverage).
+
+    Reads retrieval log from stats_logger and buckets by ISO week.
+    """
+    from datetime import timedelta
+    from metrics.stats_logger import get_recent_retrieval_queries
+
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(weeks=weeks)
+
+    try:
+        recent = get_recent_retrieval_queries(limit=10000)
+    except Exception:
+        recent = []
+
+    # Group by ISO week
+    weekly: dict[str, list[dict[str, Any]]] = {}
+    for q_record in recent:
+        ts_str = q_record.get("timestamp") or ""
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        week_key = ts.strftime("%G-W%V")
+        weekly.setdefault(week_key, []).append(q_record)
+
+    trend: list[dict[str, Any]] = []
+    for week_key in sorted(weekly.keys()):
+        week_queries = weekly[week_key]
+        # Build pseudo-results for quality computation from logged data
+        pseudo_results = [
+            {"entity": r.get("query", ""), "facts": [{}] if r.get("result_count", 0) > 0 else []}
+            for r in week_queries
+        ]
+        quality = compute_retrieval_quality(pseudo_results)
+        avg_latency = (
+            sum(float(r.get("latency_ms", 0)) for r in week_queries) / len(week_queries)
+            if week_queries else 0.0
+        )
+        avg_results = (
+            sum(int(r.get("result_count", 0)) for r in week_queries) / len(week_queries)
+            if week_queries else 0.0
+        )
+        trend.append({
+            "week": week_key,
+            "query_count": len(week_queries),
+            "avg_latency_ms": round(avg_latency, 2),
+            "avg_result_count": round(avg_results, 2),
+            **quality,
+        })
+
+    return {
+        "weeks_requested": weeks,
+        "trend": trend,
+        "timestamp": now.isoformat(),
     }
 
 
@@ -321,6 +413,13 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
     except Exception:
         model_health = {"status": "unavailable"}
 
+    # Aggregate nightly LLM review counts
+    nightly_results = get_nightly_results()
+    nightly_reviewed = sum(r.get("relationships_reviewed", 0) for r in nightly_results)
+    nightly_approved = sum(r.get("relationships_approved", 0) for r in nightly_results)
+    nightly_flagged = sum(r.get("relationships_flagged", 0) for r in nightly_results)
+    nightly_reclassified = sum(r.get("relationships_reclassified", 0) for r in nightly_results)
+
     return {
         "graph": {
             "entities": entity_count,
@@ -365,6 +464,11 @@ async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str
             "approval_rate": round(
                 approved / (approved + rejected + reclassified), 4
             ) if (approved + rejected + reclassified) > 0 else 0.0,
+            # Nightly LLM review counts (relationships that received verdicts)
+            "llm_reviewed": nightly_reviewed,
+            "llm_approved": nightly_approved,
+            "llm_flagged": nightly_flagged,
+            "llm_reclassified": nightly_reclassified,
         },
         "model_health": model_health,
         "embedding": {
@@ -901,10 +1005,12 @@ async def trigger_nightly_maintenance(
         audit_status_str: str | None = None
         lora_status_str: str | None = None
         error_str: str | None = None
+        _audit_result: dict[str, Any] = {}
 
         try:
             # Step 1: LLM audit
-            audit_result = await run_llm_audit(limit=200, dry_run=False, schedule="nightly")
+            _audit_result = await run_llm_audit(limit=200, dry_run=False, schedule="nightly")
+            audit_result = _audit_result
             audit_status_str = str(audit_result.get("status", "unknown"))
             log.info("Nightly audit complete: %s", audit_status_str)
 
@@ -974,6 +1080,10 @@ async def trigger_nightly_maintenance(
             audit_status=audit_status_str,
             lora_status=lora_status_str,
             error=error_str,
+            relationships_reviewed=int(_audit_result.get("relationships_reviewed", 0)),
+            relationships_approved=int(_audit_result.get("relationships_approved", 0)),
+            relationships_flagged=int(_audit_result.get("relationships_flagged", 0)),
+            relationships_reclassified=int(_audit_result.get("relationships_reclassified", 0)),
         )
         log.info("Nightly maintenance pipeline complete: %s", overall)
 

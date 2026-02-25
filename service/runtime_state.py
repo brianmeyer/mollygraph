@@ -30,6 +30,10 @@ def record_nightly_result(
     audit_status: str | None = None,
     lora_status: str | None = None,
     error: str | None = None,
+    relationships_reviewed: int = 0,
+    relationships_approved: int = 0,
+    relationships_flagged: int = 0,
+    relationships_reclassified: int = 0,
 ) -> None:
     """Record a nightly pipeline run result (success or failure)."""
     global _NIGHTLY_RESULTS
@@ -39,6 +43,10 @@ def record_nightly_result(
         "audit_status": audit_status,
         "lora_status": lora_status,
         "error": error,
+        "relationships_reviewed": relationships_reviewed,
+        "relationships_approved": relationships_approved,
+        "relationships_flagged": relationships_flagged,
+        "relationships_reclassified": relationships_reclassified,
     }
     with _LOCK:
         _NIGHTLY_RESULTS.append(entry)

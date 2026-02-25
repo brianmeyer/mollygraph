@@ -133,6 +133,11 @@ EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
 RERANKER_ENABLED = os.environ.get("MOLLYGRAPH_RERANKER_ENABLED", "false").lower() == "true"
 RERANKER_MODEL = os.environ.get("MOLLYGRAPH_RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual")
 
+# ── Graph-aware reranker (graph_reranker.py) ───────────────────────────────────
+# When enabled, query results are re-scored using graph signals (neighborhood,
+# path distance, relationship type relevance) via query/graph_reranker.py.
+GRAPH_RERANK_ENABLED = os.environ.get("MOLLYGRAPH_GRAPH_RERANK_ENABLED", "false").lower() == "true"
+
 # ── Graph-aware reranking ──────────────────────────────────────────────────────
 # When enabled, query results are re-scored using graph neighborhood and path
 # signals instead of raw vector similarity alone.

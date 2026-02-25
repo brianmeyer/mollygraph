@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, UTC
 from typing import Any
 
@@ -10,6 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
+from memory.graph import VALID_REL_TYPES
 from memory.models import ExtractionJob
 from runtime_graph import get_graph_instance
 from runtime_queue import get_queue_instance
@@ -23,6 +25,9 @@ from api.deps import (
     require_runtime_ready,
     verify_api_key,
 )
+
+# Cypher-safe relationship type: uppercase letters, digits, underscores only
+_REL_TYPE_SAFE_RE = re.compile(r'^[A-Z][A-Z0-9_]{0,63}$')
 
 log = logging.getLogger("mollygraph")
 router = APIRouter()
@@ -134,15 +139,28 @@ async def delete_relationship_endpoint(
     source = req.source.strip()
     target = req.target.strip()
     rel_type = req.rel_type.strip() if req.rel_type else None
+    rel_type_validated: str | None = None  # set after validation
 
     if not source or not target:
         raise HTTPException(status_code=422, detail="source and target are required")
 
     if rel_type:
+        # Cypher injection guard: validate rel_type against the known-safe allow-list
+        # and the safe-character pattern before interpolating into the query.
+        _rel_upper = rel_type.upper().replace(" ", "_")
+        if _rel_upper not in VALID_REL_TYPES or not _REL_TYPE_SAFE_RE.match(_rel_upper):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid rel_type '{rel_type}'. Must be one of the valid relationship types: "
+                    + ", ".join(sorted(VALID_REL_TYPES))
+                ),
+            )
+        rel_type_validated = _rel_upper
         with graph.driver.session() as _session:
             rec = _session.run(
                 f"""
-                MATCH (h:Entity {{name: $source}})-[r:`{rel_type}`]-(t:Entity {{name: $target}})
+                MATCH (h:Entity {{name: $source}})-[r:`{rel_type_validated}`]-(t:Entity {{name: $target}})
                 DELETE r
                 RETURN count(r) AS deleted
                 """,
@@ -165,13 +183,13 @@ async def delete_relationship_endpoint(
 
     log.info(
         "delete_relationship: source=%s target=%s rel_type=%s deleted=%d",
-        source, target, rel_type, deleted_count,
+        source, target, rel_type_validated, deleted_count,
     )
     return {
         "deleted": deleted_count,
         "source": source,
         "target": target,
-        "rel_type": rel_type,
+        "rel_type": rel_type_validated,
     }
 
 

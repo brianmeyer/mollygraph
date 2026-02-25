@@ -54,6 +54,9 @@ class QueryResponse(BaseModel):
     result_count: int
     timestamp: str
     reranked: bool = False
+    graph_reranked: bool = False
+    quality_metrics: dict[str, Any] = Field(default_factory=dict)
+    retrieval_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AuditRequest(BaseModel):
