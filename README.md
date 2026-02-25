@@ -140,10 +140,13 @@ MOLLYGRAPH_EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-nano
 
 - [ ] Quarantine review system — LLM generates yes/no questions for human review of ambiguous relationships
 - [ ] Local-first audit — get ollama models producing reliable structured JSON for zero-cost audits
-- [ ] Graph-aware reranking — score results by neighborhood density and path distance
 - [ ] Decision traces — reasoning chains as first-class graph nodes
 - [ ] Multi-agent memory isolation
 - [ ] Web UI for graph exploration
+
+**Implemented (behind feature flags):**
+- Graph-aware reranking (`GRAPH_RERANK_ENABLED` — activate at scale)
+- Jina reranker v2 (`MOLLYGRAPH_RERANKER_ENABLED` — activate at 5K+ entities)
 
 ---
 
