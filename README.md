@@ -325,29 +325,16 @@ MOLLYGRAPH_STATE_DIR=~/.graph-memory
 
 ## 🗺️ Roadmap
 
-### Enrichment Pipeline
-- [ ] **Specialized GLiNER passes** — domain-specific models as additive passes: biomedical (`gliner-biomed`), PII detection (`nvidia/gliner-PII`), multilingual (`gliner_multi-v2.1`)
-- [ ] **Graph-aware reranking** — score results by graph neighborhood density, path distance, and relationship relevance (not just cosine similarity)
-- [ ] **Per-source quality metrics** — track entity yield, unique rate, and quality score per ingestion source
+### Next Up
+- [ ] **Graph-aware reranking** — score results by graph neighborhood density, path distance, and relationship relevance (queued for overnight build)
+- [ ] **Per-source quality metrics** — entity yield, unique rate, and quality score per ingestion source (queued for overnight build)
 - [ ] **Decision traces** — capture reasoning chains as first-class graph nodes for audit trails and precedent search
 
-### Model Infrastructure
-- [ ] **Model hot-swap with unload** — config change → unload old model → load new one, no restart
-- [ ] **GGUF support** — quantized models via llama-cpp-python for lower memory
-- [ ] **Model download management** — pre-download, disk usage tracking, cleanup
-
-### Known Engineering Gaps
-- [ ] Partial graph writes — no rollback on entity+relationship step failures
-- [ ] Duplicate edges under concurrency — relationship upsert is read-then-write
-- [ ] Queue worker silent death — health says "healthy" even if worker crashed
-- [ ] Training cursor skips at timestamp boundaries
-- [ ] Deployment fallback can delete active model before copy succeeds
-
 ### Future
+- [ ] Specialized GLiNER passes — domain-specific models (biomedical, PII, multilingual) as additive extraction layers
 - [ ] Multi-agent memory isolation
 - [ ] Web UI for graph exploration
 - [ ] Plugin system for custom extractors
-- [ ] MLX embeddings (Apple Silicon)
 
 ### Done ✅
 - [x] Self-evolving GLiNER2 extraction with LoRA fine-tuning
