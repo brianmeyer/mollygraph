@@ -67,6 +67,7 @@ from memory.vector_store import VectorStore
 from runtime_graph import set_graph_instance
 from runtime_pipeline import set_pipeline_instance
 from runtime_vector_store import set_vector_store_instance
+from query.graph_reranker import graph_rerank, get_ab_metrics
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -658,7 +659,8 @@ async def health() -> dict[str, Any]:
         except Exception as meta_exc:
             worker_error = f"could not retrieve exception: {meta_exc}"
 
-        worker_status = "degraded"
+        # Always surface the death first — even if we attempt a restart below.
+        worker_status = "dead"
         log.error("Worker task is no longer running: %s", worker_error)
 
         # Auto-restart once per death event.  Once a new task is running the
@@ -672,10 +674,10 @@ async def health() -> dict[str, Any]:
                 log.info("Worker restarted successfully")
             except Exception as restart_exc:
                 log.error("Worker auto-restart failed: %s", restart_exc, exc_info=True)
-                worker_status = "degraded"
+                worker_status = "dead"
         else:
             log.error(
-                "Worker is degraded and restart limit reached (%d); manual intervention required",
+                "Worker is dead and restart limit reached (%d); manual intervention required",
                 _worker_restart_count,
             )
     else:
@@ -689,9 +691,26 @@ async def health() -> dict[str, Any]:
             "writes are no-ops and searches return empty results"
         )
 
+    # Zvec segment health — surfaces index_completeness so operators can see
+    # whether un-indexed segments are causing the benign
+    #   [ERROR] segment.cc:711 vector indexer not found for field embedding
+    # message.  A value < 1.0 means some segments are not yet indexed.
+    # Searches still return correct results (brute-force fallback).
+    # Call POST /admin/zvec/optimize to rebuild indexes immediately.
+    segment_health: dict = {}
+    vector_index_completeness: float = 1.0
+    if vector_store is not None:
+        try:
+            segment_health = vector_store.get_segment_health()
+            vector_index_completeness = float(
+                segment_health.get("embedding_completeness", 1.0)
+            )
+        except Exception:
+            pass
+
     overall_status = (
         "degraded"
-        if worker_status == "degraded" or vector_degraded
+        if worker_status in ("dead", "degraded", "restarting") or vector_degraded
         else "healthy"
     )
 
@@ -706,6 +725,8 @@ async def health() -> dict[str, Any]:
         "queue_dead": queue_dead,
         "vector_stats": vector_store.get_stats() if vector_store else {},
         "vector_degraded": vector_degraded,
+        "vector_index_completeness": round(vector_index_completeness, 4),
+        "vector_segment_health": segment_health,
         "worker_status": worker_status,
         "worker_error": worker_error,
         "worker_restart_count": _worker_restart_count,
@@ -1305,9 +1326,25 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
     else:
         retrieval_source = "none"
 
-    # ── Optional reranker ─────────────────────────────────────────────────────
+    # ── Graph-aware reranking ─────────────────────────────────────────────────
     reranked = False
-    if getattr(config, "RERANKER_ENABLED", False) and len(results) > 1:
+    if getattr(config, "MOLLYGRAPH_RERANK_ENABLED", True) and len(results) > 0 and graph is not None:
+        _rerank_start = time.perf_counter()
+        try:
+            results = await asyncio.to_thread(
+                graph_rerank,
+                results,
+                q,
+                entities,
+                graph.driver,
+            )
+            reranked = True
+        except Exception as exc:
+            log.debug("graph_rerank failed: %s", exc)
+        reranker_ms = (time.perf_counter() - _rerank_start) * 1000
+
+    # ── Optional cross-encoder reranker ──────────────────────────────────────
+    if not reranked and getattr(config, "RERANKER_ENABLED", False) and len(results) > 1:
         _rerank_start = time.perf_counter()
         try:
             reranker = await asyncio.to_thread(ExtractionPipeline._get_reranker_model)
@@ -1320,6 +1357,34 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
         except Exception as exc:
             log.debug("Reranker step failed: %s", exc)
         reranker_ms = (time.perf_counter() - _rerank_start) * 1000
+
+    # ── Retrieval quality metrics (Part C) ───────────────────────────────────
+    try:
+        _entity_types: set[str] = set()
+        _graph_connected = 0
+        for _r in results:
+            _facts = _r.get("facts") or []
+            if _facts:
+                _graph_connected += 1
+            for _f in _facts:
+                _tt = str(_f.get("target_type") or "").strip()
+                if _tt:
+                    _entity_types.add(_tt)
+        _n_results = max(len(results), 1)
+        _result_diversity = round(len(_entity_types) / _n_results, 4)
+        _graph_connected_pct = round(_graph_connected / _n_results, 4)
+    except Exception:
+        _result_diversity = 0.0
+        _graph_connected_pct = 0.0
+
+    # ── A/B reranking metrics ─────────────────────────────────────────────────
+    try:
+        _ab = get_ab_metrics()
+        _rank_improvement_avg = _ab["rank_improvement_avg"]
+        _rerank_lift_pct = _ab["rerank_lift_pct"]
+    except Exception:
+        _rank_improvement_avg = 0.0
+        _rerank_lift_pct = 0.0
 
     total_latency_ms = (time.perf_counter() - query_start) * 1000
     try:
@@ -1339,6 +1404,11 @@ async def query(q: str, _api_key: str = Depends(verify_api_key)) -> QueryRespons
             vector_result_count=len(vector_results),
             graph_entity_names=[r["entity"] for r in graph_results],
             vector_entity_names=[r["entity"] for r in vector_results],
+            graph_reranked=reranked,
+            rank_improvement_avg=_rank_improvement_avg,
+            rerank_lift_pct=_rerank_lift_pct,
+            result_diversity=_result_diversity,
+            graph_connected_pct=_graph_connected_pct,
         )
     except Exception:
         log.debug("metrics log_retrieval failed", exc_info=True)
@@ -1568,6 +1638,41 @@ async def prefetch_extractor_model(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/admin/zvec/optimize")
+async def admin_zvec_optimize(
+    concurrency: int = 0,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Trigger Zvec segment compaction and HNSW index rebuild.
+
+    Merges all WAL/small segments and builds HNSW indexes on each merged
+    segment.  After this call ``vector_index_completeness`` in ``/health``
+    should be ``1.0`` and the benign log message:
+
+        [ERROR] segment.cc:711 vector indexer not found for field embedding
+
+    will stop appearing (until new un-flushed writes accumulate again).
+
+    This is a **synchronous** operation and may take several seconds on large
+    collections.  Run it after bulk ingestion or reindexing, or when
+    ``vector_index_completeness < 1.0`` in the ``/health`` response.
+
+    Args (query params):
+        concurrency: threads for optimization (0 = auto-detect, default 0).
+    """
+    if vector_store is None:
+        raise HTTPException(status_code=503, detail="Vector store not initialized")
+    try:
+        result = await asyncio.to_thread(vector_store.zvec_optimize, concurrency)
+        return {
+            **result,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+    except Exception as exc:
+        log.error("admin_zvec_optimize endpoint failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"zvec_optimize_error: {exc}") from exc
 
 
 @app.post("/maintenance/run")
