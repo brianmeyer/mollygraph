@@ -447,6 +447,19 @@ def initialize_extractor_schema_registry() -> dict[str, Any]:
         return copy.deepcopy(_REGISTRY_CACHE)
 
 
+def invalidate_registry_cache() -> None:
+    """Force the next schema read to reload from disk.
+
+    Call this whenever a new relationship type is adopted via ``_adopt_rel_type()``
+    so that callers see the updated schema immediately instead of serving a
+    now-stale cached copy.
+    """
+    global _REGISTRY_CACHE
+    with _REGISTRY_LOCK:
+        _REGISTRY_CACHE = None
+    log.debug("extractor_schema_registry: cache invalidated")
+
+
 def get_extractor_schema_presets(include_schema: bool = False) -> dict[str, Any]:
     presets = [
         _serialize_preset_entry(key, value, include_schema=include_schema)

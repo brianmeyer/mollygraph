@@ -425,6 +425,14 @@ def _adopt_rel_type(rel_type: str) -> bool:
 
         log.info("Auto-adopted relationship type: %s", normalized)
 
+        # Invalidate the extractor schema registry cache so the next schema
+        # read sees the newly-adopted type instead of a stale cached copy.
+        try:
+            from extractor_schema_registry import invalidate_registry_cache
+            invalidate_registry_cache()
+        except Exception:
+            log.debug("Failed to invalidate extractor schema registry cache", exc_info=True)
+
         # Generate and persist GLiREL synonym phrasings for the new type so
         # the enrichment layer can use them at next inference without restart.
         _persist_glirel_synonyms_for_relation(relation_name)
