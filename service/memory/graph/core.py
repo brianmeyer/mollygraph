@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from neo4j import GraphDatabase
 
+from .constants import VALID_REL_TYPES, RELATION_TIERS
 from .entities import EntityMixin
 from .episodes import EpisodeMixin
 from .maintenance import MaintenanceMixin
 from .queries import QueryMixin
 from .relationships import RelationshipMixin
+
+# All relationship types that should have an audit_status index.
+# Union of VALID_REL_TYPES (user-visible types) and RELATION_TIERS keys
+# (all typed relationships that appear in the graph including IS_A, PART_OF etc.).
+_ALL_INDEXED_REL_TYPES: frozenset[str] = frozenset(VALID_REL_TYPES) | frozenset(RELATION_TIERS.keys())
 
 
 class BiTemporalGraph(EntityMixin, RelationshipMixin, EpisodeMixin, QueryMixin, MaintenanceMixin):
@@ -23,16 +29,19 @@ class BiTemporalGraph(EntityMixin, RelationshipMixin, EpisodeMixin, QueryMixin, 
             session.run("CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)")
             session.run("CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)")
             session.run("CREATE INDEX entity_strength IF NOT EXISTS FOR (e:Entity) ON (e.strength)")
-            
-            # Episode indexes  
+
+            # Episode indexes
             session.run("CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)")
             session.run("CREATE INDEX episode_occurred IF NOT EXISTS FOR (ep:Episode) ON (ep.occurred_at)")
             session.run("CREATE INDEX episode_ingested IF NOT EXISTS FOR (ep:Episode) ON (ep.ingested_at)")
-            
-            # Relationship indexes (on properties, not types)
-            # Note: Neo4j relationship index syntax requires -() at the end: FOR ()-[r:TYPE]-() ON (r.property)
-            for rel_type in ["WORKS_AT", "KNOWS", "USES", "MENTIONS", "DISCUSSED_WITH", "IS_A", "PART_OF"]:
-                session.run(f"CREATE INDEX rel_audit_status_{rel_type} IF NOT EXISTS FOR ()-[r:{rel_type}]-() ON (r.audit_status)")
+
+            # audit_status indexes for every known relationship type.
+            # Neo4j syntax: FOR ()-[r:TYPE]-() ON (r.property)
+            for rel_type in sorted(_ALL_INDEXED_REL_TYPES):
+                session.run(
+                    f"CREATE INDEX rel_audit_status_{rel_type} IF NOT EXISTS "
+                    f"FOR ()-[r:{rel_type}]-() ON (r.audit_status)"
+                )
 
     def close(self):
         self.driver.close()
