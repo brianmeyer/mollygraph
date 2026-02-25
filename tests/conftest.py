@@ -114,6 +114,12 @@ def client(monkeypatch):
     main.vector_store = FakeVectorStore()
     main.pipeline = object()
 
+    # Patch admin module functions where routes actually call them
+    from api import admin as admin_module
+    from maintenance import auditor as auditor_module
+    from memory import graph_suggestions as suggestions_module
+    from evolution import gliner_training as training_module
+
     async def fake_audit(**kwargs):
         return {
             "status": "ok",
@@ -125,18 +131,20 @@ def client(monkeypatch):
     async def fake_train(force: bool = False):
         return {"status": "finetune_triggered", "force": force}
 
-    async def fake_maintenance():
+    def fake_maintenance():
         return None
 
-    monkeypatch.setattr(main, "run_llm_audit", fake_audit)
-    monkeypatch.setattr(main, "run_gliner_finetune_pipeline", fake_train)
-    monkeypatch.setattr(main, "run_maintenance_cycle", fake_maintenance)
-    monkeypatch.setattr(
-        main,
-        "get_gliner_stats",
-        lambda: {"examples_accumulated": 10, "last_cycle_status": "accumulated"},
-    )
-    monkeypatch.setattr(main, "build_suggestion_digest", lambda: "1 suggestion")
+    def fake_gliner_stats():
+        return {"examples_accumulated": 10, "last_cycle_status": "accumulated"}
+
+    def fake_suggestion_digest():
+        return "1 suggestion"
+
+    monkeypatch.setattr(admin_module, "run_llm_audit", fake_audit)
+    monkeypatch.setattr(admin_module, "run_gliner_finetune_pipeline", fake_train)
+    monkeypatch.setattr(auditor_module, "run_maintenance_cycle", fake_maintenance)
+    monkeypatch.setattr(training_module, "get_gliner_stats", fake_gliner_stats)
+    monkeypatch.setattr(suggestions_module, "build_suggestion_digest", fake_suggestion_digest)
 
     from fastapi.testclient import TestClient
 

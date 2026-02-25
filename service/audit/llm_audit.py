@@ -274,13 +274,16 @@ async def _invoke_openai_compatible(
     if require_api_key and not api_key:
         raise RuntimeError(f"{provider} API key is not set")
 
+    # Kimi k2.5 is a thinking model that only accepts temperature=1.0
+    temp = 1.0 if provider in ("moonshot", "kimi") else 0.1
+
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.1,
+        "temperature": temp,
         "max_tokens": max_tokens,
     }
 
