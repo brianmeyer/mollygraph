@@ -28,6 +28,16 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# Module-level ThreadPoolExecutor singleton shared by all _llm_enrich_synonyms
+# calls.  Creating a new executor per call is wasteful (thread creation overhead)
+# and can exhaust OS thread limits under concurrent synonym generation.
+# max_workers=1 is intentional: LLM calls are I/O-bound and we want at most one
+# outstanding synonym request at a time to avoid hammering the audit LLM.
+_LLM_SYNONYM_EXECUTOR: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="glirel-synonyms",
+)
+
 _SYNONYMS_PATH = Path.home() / ".graph-memory" / "glirel_synonyms.json"
 
 # ---------------------------------------------------------------------------
@@ -315,10 +325,10 @@ def _llm_enrich_synonyms(label: str) -> list[str]:
         return await call_audit_model(prompt, schedule="nightly")
 
     try:
-        # ThreadPoolExecutor gives us a fresh thread with a fresh event loop,
-        # which is safe whether or not an outer async loop is already running.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            result: dict = pool.submit(asyncio.run, _call()).result(timeout=30)
+        # Reuse the module-level executor so we don't create a new thread per call.
+        # Submitting asyncio.run() to a dedicated thread is safe whether or not an
+        # outer async event loop is already running (they run in separate threads).
+        result: dict = _LLM_SYNONYM_EXECUTOR.submit(asyncio.run, _call()).result(timeout=30)
     except Exception:
         log.debug("LLM synonym enrichment call failed (non-fatal).", exc_info=True)
         return []
