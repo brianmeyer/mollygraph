@@ -973,7 +973,9 @@ async def run_llm_audit(
                 # Determine delete cap: use config value, honour dry_run (no cap in dry runs).
                 max_deletes_cap: int | None = None
                 if not dry_run:
-                    max_deletes_cap = config.AUDIT_MAX_AUTO_DELETES
+                    # Percentage-based cap: 5% of reviewed, clamped to [min, max]
+                    pct_cap = int(len(rels) * config.AUDIT_AUTO_DELETE_PCT) if rels else config.AUDIT_AUTO_DELETE_MIN
+                    max_deletes_cap = max(config.AUDIT_AUTO_DELETE_MIN, min(pct_cap, config.AUDIT_AUTO_DELETE_MAX))
 
                 # Check if we have already hit the cap before applying this batch.
                 if max_deletes_cap is not None and deleted >= max_deletes_cap:
