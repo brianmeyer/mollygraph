@@ -20,6 +20,23 @@ try:
     import zvec
     HAVE_ZVEC = True
     log.info("Zvec available")
+    # Initialize Zvec's C++ runtime once at import time.
+    # log_level=WARN means the C++ logger emits WARN, ERROR, and FATAL messages.
+    # Notably, the benign "[ERROR] segment.cc:711 vector indexer not found for
+    # field embedding" will still appear at ERROR level — this is Zvec's own
+    # logger writing directly to stdout/stderr and cannot be suppressed from
+    # Python.  The root cause (un-indexed WAL segments) is fixed at startup by
+    # calling collection.optimize() in _init_collection().  See ZvecBackend
+    # class docstring for the full explanation.
+    try:
+        from zvec.typing.enum import LogLevel as _ZvecLogLevel
+        zvec.init(log_level=_ZvecLogLevel.WARN)
+        log.info("Zvec runtime initialized (log_level=WARN)")
+    except RuntimeError:
+        # init() raises RuntimeError if called more than once (e.g. test reload)
+        log.debug("Zvec already initialized — skipping zvec.init()")
+    except Exception as _e:
+        log.warning("zvec.init() failed (non-fatal): %s", _e)
 except ImportError:
     HAVE_ZVEC = False
     zvec = None
@@ -232,11 +249,49 @@ class SqliteVecBackend(VectorStoreBackend):
 
 
 class ZvecBackend(VectorStoreBackend):
-    """Zvec implementation using proper API."""
-    
+    """Zvec-backed vector store for MollyGraph graph entities.
+
+    ## Segment health and the ``segment.cc:711`` error
+    -------------------------------------------------------
+    Zvec uses a log-structured segment model backed by RocksDB.  Each ``upsert``
+    call appends to a WAL (write-ahead log) segment.  A background thread
+    (governed by ``optimize_threads``) later merges small segments and builds
+    HNSW indexes on each merged segment.
+
+    Until a segment is merged + indexed it exists as a *raw* (un-indexed)
+    segment.  When a query touches such a segment Zvec's C++ core logs:
+
+        [ERROR] segment.cc:711 vector indexer not found for field embedding
+
+    at ``ERROR`` level to stdout/stderr via its **own** logger (not Python's
+    logging system), so it cannot be silenced from Python.
+
+    **This is expected and benign.**  Zvec automatically falls back to brute-
+    force cosine scan for un-indexed segments, so search results are still
+    correct — just slightly slower.  The message disappears after the background
+    optimizer has caught up (typically within seconds of a flush).
+
+    To accelerate indexing call ``collection.optimize(OptimizeOption())``
+    which synchronously merges all segments and builds HNSW indexes.  This is
+    exposed via the ``/admin/zvec/optimize`` HTTP endpoint and is called
+    automatically at startup when ``index_completeness["embedding"] < 1.0``.
+
+    ``CollectionStats.index_completeness`` (``dict[str, float]``) maps each
+    vector field to the fraction of segments that are fully indexed (0.0–1.0).
+    A value of ``1.0`` means all segments are indexed and the error will not
+    appear.  This metric is surfaced in ``/health`` as
+    ``vector_index_completeness``.
+
+    ## Degraded mode
+    -----------------
+    If the collection cannot be opened (e.g. another process holds the RocksDB
+    LOCK), ``self.collection`` is set to ``None`` and all operations become
+    no-ops / return empty results.  ``VectorStore.is_degraded()`` reflects this.
+    """
+
     def __init__(self, db_path: str | Path | None = None):
         import numpy as np
-        
+
         self.db_path = (
             Path(db_path).expanduser()
             if db_path is not None
@@ -244,7 +299,7 @@ class ZvecBackend(VectorStoreBackend):
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.np = np
-        
+
         # Create or open collection
         self._init_collection()
     
@@ -278,6 +333,39 @@ class ZvecBackend(VectorStoreBackend):
             try:
                 self.collection = zvec.open(str(self.db_path))
                 log.info("Opened existing Zvec collection: %s", self.db_path)
+                # Trigger optimize() if any vector field is not fully indexed.
+                # This resolves stale WAL segments that cause:
+                #   [ERROR] segment.cc:711 vector indexer not found for field embedding
+                # The error is benign (searches fall back to brute-force) but
+                # calling optimize() here ensures the HNSW index is built
+                # synchronously so the error stops appearing in normal operation.
+                try:
+                    stats = self.collection.stats
+                    completeness: dict = getattr(stats, "index_completeness", {}) or {}
+                    embedding_completeness = float(completeness.get("embedding", 1.0))
+                    if embedding_completeness < 1.0:
+                        log.warning(
+                            "Zvec embedding index completeness=%.2f — stale segments detected "
+                            "(this causes benign [ERROR] segment.cc:711 messages). "
+                            "Running optimize() to rebuild indexes synchronously...",
+                            embedding_completeness,
+                        )
+                        self.collection.optimize(zvec.OptimizeOption())
+                        log.info("Zvec optimize() complete — stale segment indexes rebuilt")
+                    else:
+                        log.info(
+                            "Zvec index completeness OK (embedding=%.2f) — "
+                            "no stale segments to rebuild",
+                            embedding_completeness,
+                        )
+                except Exception as opt_exc:
+                    # Non-fatal: optimize failure does not block serving
+                    log.warning(
+                        "Zvec startup optimize() failed (non-fatal): %s. "
+                        "The [ERROR] segment.cc:711 messages may continue to appear "
+                        "but search results will still be correct.",
+                        opt_exc,
+                    )
             except RuntimeError as exc:
                 # Don't destroy the data — run degraded instead
                 log.error(
@@ -435,17 +523,89 @@ class ZvecBackend(VectorStoreBackend):
         )
         return None
 
+    def optimize(self, concurrency: int = 0) -> dict:
+        """Trigger Zvec segment compaction and HNSW index rebuild.
+
+        Merges all WAL/small segments and ensures every segment has a fully
+        built vector index.  After this call ``index_completeness["embedding"]``
+        should be 1.0 and the ``[ERROR] segment.cc:711`` messages will stop.
+
+        Args:
+            concurrency: number of threads to use (0 = auto-detect).
+
+        Returns:
+            dict with ``status`` and ``index_completeness_after``.
+        """
+        if self.collection is None:
+            return {"status": "degraded", "message": "collection not open"}
+        try:
+            from zvec import OptimizeOption
+            opt = OptimizeOption(concurrency=concurrency)
+            self.collection.optimize(opt)
+            # Re-read stats to report new completeness
+            stats_after = self.collection.stats
+            completeness = getattr(stats_after, "index_completeness", {}) or {}
+            return {
+                "status": "ok",
+                "index_completeness_after": {str(k): float(v) for k, v in completeness.items()},
+            }
+        except Exception as exc:
+            log.error("ZvecBackend.optimize() failed: %s", exc, exc_info=True)
+            return {"status": "error", "message": str(exc)}
+
+    def get_segment_health(self) -> dict:
+        """Return Zvec index completeness metrics for the /health endpoint.
+
+        ``index_completeness`` maps each vector field name to a float in
+        [0.0, 1.0].  A value < 1.0 means some segments are un-indexed and
+        Zvec will log ``[ERROR] segment.cc:711`` for queries that touch them.
+        Searches still return correct results via brute-force fallback.
+
+        Returns:
+            dict with ``index_completeness`` and ``embedding_indexed`` bool.
+        """
+        if self.collection is None:
+            return {
+                "index_completeness": {},
+                "embedding_indexed": False,
+                "degraded": True,
+            }
+        try:
+            stats = self.collection.stats
+            completeness: dict = getattr(stats, "index_completeness", {}) or {}
+            completeness_safe = {str(k): float(v) for k, v in completeness.items()}
+            embedding_complete = float(completeness_safe.get("embedding", 1.0))
+            return {
+                "index_completeness": completeness_safe,
+                "embedding_indexed": embedding_complete >= 1.0,
+                "embedding_completeness": embedding_complete,
+            }
+        except Exception as exc:
+            log.debug("ZvecBackend.get_segment_health() failed: %s", exc)
+            return {"index_completeness": {}, "embedding_indexed": False, "error": str(exc)}
+
     def get_stats(self) -> Dict:
-        """Get collection stats."""
+        """Get collection stats including segment health metrics.
+
+        The returned ``index_completeness`` dict maps each vector field to the
+        fraction of segments that are fully indexed (0.0–1.0).  When
+        ``index_completeness["embedding"] < 1.0``, Zvec logs the benign
+        ``[ERROR] segment.cc:711 vector indexer not found for field embedding``
+        for queries that touch un-indexed segments.  Call ``optimize()`` to
+        resolve this immediately.
+        """
         if self.collection is None:
             return {"entities": 0, "backend": "zvec", "degraded": True}
         stats = self.collection.stats
         entities = getattr(stats, "num_entities", None)
         if entities is None:
             entities = getattr(stats, "doc_count", 0)
+        completeness: dict = getattr(stats, "index_completeness", {}) or {}
+        completeness_safe = {str(k): float(v) for k, v in completeness.items()}
         return {
             "entities": int(entities or 0),
-            "backend": "zvec"
+            "backend": "zvec",
+            "index_completeness": completeness_safe,
         }
 
 
@@ -555,6 +715,33 @@ class VectorStore:
         if isinstance(self.backend, ZvecBackend):
             return self.backend.collection is None
         return False
+
+    def zvec_optimize(self, concurrency: int = 0) -> dict:
+        """Trigger Zvec segment compaction and HNSW index rebuild (no-op for non-Zvec backends).
+
+        After this call all WAL segments are merged and fully indexed, so the
+        ``[ERROR] segment.cc:711 vector indexer not found for field embedding``
+        messages will stop appearing.
+
+        Args:
+            concurrency: threads to use for optimization (0 = auto).
+
+        Returns:
+            dict with ``status`` and ``index_completeness_after``.
+        """
+        if isinstance(self.backend, ZvecBackend):
+            return self.backend.optimize(concurrency=concurrency)
+        return {"status": "not_applicable", "backend": self.backend.__class__.__name__}
+
+    def get_segment_health(self) -> dict:
+        """Return Zvec segment index completeness metrics (empty dict for non-Zvec backends).
+
+        ``index_completeness["embedding"]`` < 1.0 indicates un-indexed segments
+        that produce the benign ``[ERROR] segment.cc:711`` log line.
+        """
+        if isinstance(self.backend, ZvecBackend):
+            return self.backend.get_segment_health()
+        return {}
 
     def flush(self):
         """Flush backend WAL to disk. Call after bulk operations (reindex, etc.)."""
