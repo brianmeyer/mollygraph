@@ -135,6 +135,13 @@ def log_retrieval(
     vector_result_count: int = -1,   # -1 = not provided (legacy caller)
     graph_entity_names: list[str] | None = None,   # entities graph found
     vector_entity_names: list[str] | None = None,  # entities vector found
+    # ── Graph-aware reranking metrics ─────────────────────────────────────
+    graph_reranked: bool = False,
+    rank_improvement_avg: float = 0.0,
+    rerank_lift_pct: float = 0.0,
+    # ── Retrieval quality metrics (Part C) ────────────────────────────────
+    result_diversity: float = 0.0,    # entity type diversity score
+    graph_connected_pct: float = 0.0, # % of results with >0 graph relationships
 ) -> None:
     """Append a line to the retrieval JSONL log and update in-memory hit counters."""
     source = retrieval_source if retrieval_source in {
@@ -198,6 +205,11 @@ def log_retrieval(
         "reranker_ms": round(reranker_ms, 2),
         "graph_result_count": graph_result_count,
         "vector_result_count": vector_result_count,
+        "graph_reranked": graph_reranked,
+        "rank_improvement_avg": round(rank_improvement_avg, 4),
+        "rerank_lift_pct": round(rerank_lift_pct, 2),
+        "result_diversity": round(result_diversity, 4),
+        "graph_connected_pct": round(graph_connected_pct, 4),
     }
     try:
         with RETRIEVAL_LOG.open("a", encoding="utf-8") as f:

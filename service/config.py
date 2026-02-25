@@ -133,6 +133,14 @@ EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
 RERANKER_ENABLED = os.environ.get("MOLLYGRAPH_RERANKER_ENABLED", "false").lower() == "true"
 RERANKER_MODEL = os.environ.get("MOLLYGRAPH_RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual")
 
+# ── Graph-aware reranking ──────────────────────────────────────────────────────
+# When enabled, query results are re-scored using graph neighborhood and path
+# signals instead of raw vector similarity alone.
+MOLLYGRAPH_RERANK_ENABLED = os.environ.get("MOLLYGRAPH_RERANK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+MOLLYGRAPH_RERANK_NEIGHBOR_WEIGHT = float(os.environ.get("MOLLYGRAPH_RERANK_NEIGHBOR_WEIGHT", "0.1"))
+MOLLYGRAPH_RERANK_STRENGTH_WEIGHT = float(os.environ.get("MOLLYGRAPH_RERANK_STRENGTH_WEIGHT", "0.2"))
+MOLLYGRAPH_RERANK_PATH_BONUS = float(os.environ.get("MOLLYGRAPH_RERANK_PATH_BONUS", "0.15"))
+
 # ── GLiREL enrichment (second-pass relation extraction) ──────────────────────
 GLIREL_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_ENABLED", "false").lower() == "true"
 GLIREL_MODEL = os.environ.get("MOLLYGRAPH_GLIREL_MODEL", "jackboyla/glirel-large-v0")
@@ -154,6 +162,9 @@ GLINER_BENCHMARK_EVAL_RATIO        = 0.2
 GLINER_BENCHMARK_THRESHOLD         = 0.4
 GLINER_SHADOW_EPISODES             = int(os.environ.get("GLINER_SHADOW_EPISODES", "20"))
 GLINER_SHADOW_ENABLED              = os.environ.get("GLINER_SHADOW_ENABLED", "true").lower() == "true"
+GLINER_MIN_NEW_EXAMPLES            = int(os.environ.get("GLINER_MIN_NEW_EXAMPLES", "500"))
+GLINER_MAX_TRAINING_EXAMPLES       = int(os.environ.get("GLINER_MAX_TRAINING_EXAMPLES", "10000"))
+GLINER_ARCHIVE_DAYS                = int(os.environ.get("GLINER_ARCHIVE_DAYS", "90"))
 
 # ── LoRA benchmark tolerance ──────────────────────────────────────────────────
 # Shadow benchmark: candidate model is rejected if fallback_rate > base_rate * TOLERANCE.

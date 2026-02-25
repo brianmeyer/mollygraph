@@ -68,6 +68,7 @@ from runtime_graph import set_graph_instance
 from runtime_pipeline import set_pipeline_instance
 from runtime_vector_store import set_vector_store_instance
 from query.graph_reranker import graph_rerank, get_ab_metrics
+from metrics.source_yield import get_source_stats, get_daily_source_breakdown
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -844,6 +845,142 @@ async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[
         "history_days": len(history),
         "timestamp": now.isoformat(),
     }
+
+
+@app.get("/metrics/sources")
+async def metrics_sources(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return per-source entity yield stats.
+
+    Shows avg entity yield, unique entity rate, relationship yield, and
+    quality score per ingestion source.  Quality score formula:
+      quality = (unique_entities / total_entities) * (1 + relationship_count * 0.1)
+    Top/bottom 10 sources by quality are highlighted.
+    """
+    try:
+        stats_data = await asyncio.to_thread(get_source_stats)
+        today_breakdown = await asyncio.to_thread(get_daily_source_breakdown)
+
+        # Compute first_seen_source stats from Neo4j if available
+        neo4j_source_stats: list[dict[str, Any]] = []
+        if graph is not None:
+            try:
+                with graph.driver.session() as _session:
+                    rows = _session.run(
+                        """
+                        MATCH (e:Entity)
+                        WHERE e.first_seen_source IS NOT NULL
+                        RETURN e.first_seen_source AS source,
+                               count(e) AS new_entity_count
+                        ORDER BY new_entity_count DESC
+                        LIMIT 20
+                        """
+                    ).data()
+                neo4j_source_stats = [
+                    {"source": r["source"], "new_entities_introduced": int(r["new_entity_count"])}
+                    for r in rows
+                ]
+            except Exception:
+                log.debug("metrics_sources: neo4j first_seen query failed", exc_info=True)
+
+        return {
+            "per_source": stats_data["sources"],
+            "top_10_by_quality": stats_data["top_10_by_quality"],
+            "bottom_10_by_quality": stats_data["bottom_10_by_quality"],
+            "today_breakdown": today_breakdown,
+            "new_knowledge_by_source": neo4j_source_stats,
+            "total_yield_records": stats_data["total_records"],
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"metrics_sources_error: {exc}") from exc
+
+
+@app.get("/metrics/retrieval/trend")
+async def metrics_retrieval_trend(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return daily aggregates for the last 7 days of retrieval activity.
+
+    Each day includes:
+    - queries_per_day
+    - avg_result_count
+    - avg_graph_connected_pct  — avg % of results with ≥1 graph relationship
+    - avg_result_diversity     — avg entity type diversity score
+    - avg_rank_improvement     — avg reranking rank improvement (if reranking enabled)
+    - source_breakdown         — query-source label counts (graph_exact/vector/combined/…)
+    """
+    from datetime import timedelta
+    from metrics.stats_logger import _read_jsonl_today, RETRIEVAL_LOG
+
+    now_utc = datetime.now(tz=timezone.utc)
+    days: list[dict[str, Any]] = []
+
+    for delta in range(6, -1, -1):  # 6 days ago → today
+        day = now_utc - timedelta(days=delta)
+        date_str = day.strftime("%Y-%m-%d")
+        recs = await asyncio.to_thread(_read_jsonl_today, RETRIEVAL_LOG, date_str)
+
+        n = len(recs)
+        if n == 0:
+            days.append({
+                "date": date_str,
+                "queries": 0,
+                "avg_result_count": 0.0,
+                "avg_graph_connected_pct": 0.0,
+                "avg_result_diversity": 0.0,
+                "avg_rank_improvement": 0.0,
+                "source_breakdown": {},
+            })
+            continue
+
+        avg_result_count = round(sum(int(r.get("result_count") or 0) for r in recs) / n, 2)
+        avg_graph_connected_pct = round(
+            sum(float(r.get("graph_connected_pct") or 0.0) for r in recs) / n, 4
+        )
+        avg_result_diversity = round(
+            sum(float(r.get("result_diversity") or 0.0) for r in recs) / n, 4
+        )
+        reranked_recs = [r for r in recs if r.get("graph_reranked")]
+        avg_rank_improvement = (
+            round(sum(float(r.get("rank_improvement_avg") or 0.0) for r in reranked_recs) / len(reranked_recs), 4)
+            if reranked_recs else 0.0
+        )
+
+        source_breakdown: dict[str, int] = {}
+        for r in recs:
+            src = str(r.get("retrieval_source") or "none")
+            source_breakdown[src] = source_breakdown.get(src, 0) + 1
+
+        days.append({
+            "date": date_str,
+            "queries": n,
+            "avg_result_count": avg_result_count,
+            "avg_graph_connected_pct": avg_graph_connected_pct,
+            "avg_result_diversity": avg_result_diversity,
+            "avg_rank_improvement": avg_rank_improvement,
+            "source_breakdown": source_breakdown,
+        })
+
+    return {
+        "days": days,
+        "window_days": 7,
+        "timestamp": now_utc.isoformat(),
+    }
+
+
+@app.get("/metrics/reranking")
+async def metrics_reranking(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    """Return A/B reranking metrics: rank_improvement_avg and rerank_lift_pct."""
+    try:
+        ab = get_ab_metrics()
+        return {
+            **ab,
+            "rerank_enabled": getattr(config, "MOLLYGRAPH_RERANK_ENABLED", True),
+            "neighbor_weight": getattr(config, "MOLLYGRAPH_RERANK_NEIGHBOR_WEIGHT", 0.1),
+            "strength_weight": getattr(config, "MOLLYGRAPH_RERANK_STRENGTH_WEIGHT", 0.2),
+            "path_bonus": getattr(config, "MOLLYGRAPH_RERANK_PATH_BONUS", 0.15),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"metrics_reranking_error: {exc}") from exc
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -2279,7 +2416,12 @@ async def metrics_dashboard(_api_key: str = Depends(verify_api_key)) -> dict[str
             "unique_entity_rate": ing["unique_entity_rate"],
             "related_to_fallback_rate": ing["related_to_fallback_rate"] or related_to_rate,
             "jobs_today": ing["jobs_processed"],
+            # Ingestion quality score: (unique_rate) * (1 + avg_rel_yield * 0.1)
+            "quality_score": round(
+                ing["unique_entity_rate"] * (1.0 + disk_avg_rel * 0.1), 4
+            ) if ing["unique_entity_rate"] > 0 else 0.0,
         },
+        "graph_reranking": get_ab_metrics(),
         "training": {
             "total_examples": total_examples,
             "runs": len(runs),
