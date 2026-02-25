@@ -62,10 +62,12 @@ _REL_INTENT_KEYWORDS: dict[str, list[str]] = {
 _REL_RELEVANCE_BOOST = 0.05
 _REL_RELEVANCE_MAX = 0.10
 
-# Direct name-match boost: multiplier applied when the entity name appears
-# verbatim in the query.  A value of 0.5 means the score is increased by 50%
-# for an exact match, ensuring direct hits outrank high-degree hub entities.
-_NAME_MATCH_BOOST = 0.50
+# Direct name-match boost: flat additive bonus applied when the entity name
+# appears verbatim in the query.  Additive (not multiplicative) so that a
+# direct name match always outranks hub entities regardless of neighbor count.
+# Value of 1.5 is large enough to float a matched entity above any realistic
+# neighborhood-boosted score (~0.8–1.3 range).
+_NAME_MATCH_BOOST = 1.5
 
 
 def _extract_query_verbs(query: str) -> list[str]:
@@ -289,7 +291,9 @@ def graph_rerank(
             # "Tell me about Anisa Smith")
             name_parts = name_lower.split()
             name_match = any(part in query_lower for part in name_parts if len(part) > 2)
-        name_match_multiplier = (1.0 + _NAME_MATCH_BOOST) if name_match else 1.0
+        # Additive name-match bonus applied after all graph signals so that
+        # a direct hit always floats above hub entities with high neighbor counts.
+        name_match_additive = _NAME_MATCH_BOOST if name_match else 0.0
 
         # 2b. Neighborhood score
         neighbor_count, avg_strength = _get_neighborhood_stats(driver, entity_name)
@@ -297,7 +301,7 @@ def graph_rerank(
             math.log(1 + neighbor_count) * neighbor_weight
             + avg_strength * strength_weight
         )
-        graph_score = base_score * name_match_multiplier * (1.0 + neighborhood_boost)
+        graph_score = base_score * (1.0 + neighborhood_boost)
 
         # 2c. Path distance bonus
         max_path_boost = 0.0
@@ -314,6 +318,9 @@ def graph_rerank(
         # 2d. Relationship type relevance
         relevance = _rel_relevance_boost(facts, query_verbs)
         graph_score += relevance
+
+        # 2e. Direct name-match additive bonus (applied last so it always wins)
+        graph_score += name_match_additive
 
         item["graph_score"] = round(graph_score, 6)
         item["graph_neighbor_count"] = neighbor_count
