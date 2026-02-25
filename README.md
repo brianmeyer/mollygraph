@@ -79,7 +79,7 @@ Delete entities. Delete relationships. Bulk prune with orphan detection. Strengt
 `GET /metrics/dashboard` — graph health, retrieval stats (hit rate, lift %, latency percentiles), embedding config, extraction yields, training status, uptime. One endpoint, full picture.
 
 ### 🤖 MCP Tools (9 tools)
-`search_facts` · `search_nodes` · `get_entity_context` · `add_episode` · `delete_entity` · `prune_entities` · `run_audit` · `get_training_status` · `get_queue_status`
+`add_episode` · `search_facts` · `search_nodes` · `get_entity_context` · `delete_entity` · `prune_entities` · `run_audit` · `get_training_status` · `get_queue_status`
 
 ---
 
@@ -168,20 +168,6 @@ pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk[m
 mollygraph-mcp --base-url http://localhost:7422 --api-key YOUR_KEY
 ```
 
-**9 tools, zero config:**
-
-| Tool | What It Does |
-|------|-------------|
-| `add_episode` | Ingest text → entities + relations extracted automatically |
-| `search_facts` | Parallel graph+vector search across the knowledge graph |
-| `search_nodes` | Find entities by name or type |
-| `get_entity_context` | Full neighborhood context for a specific entity |
-| `delete_entity` | Remove an entity and its relationships |
-| `prune_entities` | Bulk prune + orphan detection |
-| `run_audit` | Trigger LLM quality audit on demand |
-| `get_training_status` | Check GLiNER training pipeline status |
-| `get_queue_status` | Check async processing queue |
-
 **claude_desktop_config.json:**
 ```json
 {
@@ -193,6 +179,127 @@ mollygraph-mcp --base-url http://localhost:7422 --api-key YOUR_KEY
   }
 }
 ```
+
+---
+
+### 🛠️ MCP Tool Reference
+
+#### `add_episode`
+Ingest a piece of text. GLiNER2 + GLiREL extract entities and relationships automatically; the graph and vector store are updated asynchronously.
+
+```
+add_episode(content: str, source: str = "mcp", priority: int = 1) -> str
+```
+
+- **content** — text to ingest (conversation turn, document excerpt, etc.)
+- **source** — label for the origin (e.g. `"slack"`, `"email"`, `"mcp"`)
+- **priority** — queue priority; higher = processed sooner (default `1`)
+
+Returns: `"queued <job_id> (depth=<n>)"`
+
+---
+
+#### `search_facts`
+Run a natural-language query against the knowledge graph using **parallel graph + vector search**. Graph exact-match runs simultaneously with vector similarity; results are merged and deduplicated.
+
+```
+search_facts(query: str) -> str
+```
+
+- **query** — natural-language question or keyword string
+
+Returns: up to 5 matching entities with their top-4 relationships, formatted as plain text.
+
+---
+
+#### `search_nodes`
+Search Neo4j nodes (entities) directly by name substring and optional type. Uses the `/entities` endpoint rather than the query pipeline — faster for browsing the graph than for semantic search.
+
+```
+search_nodes(query: str, node_type: str = "", limit: int = 20) -> str
+```
+
+- **query** — substring to match against entity names (case-insensitive)
+- **node_type** — optional type filter: `"Person"`, `"Technology"`, `"Organization"`, `"Project"`, `"Place"`, `"Concept"`, or any custom type
+- **limit** — max results (1–50, default 20)
+
+Returns: newline-delimited list of `"Name [Type]"` strings.
+
+---
+
+#### `get_entity_context`
+Retrieve the full 2-hop neighborhood for a specific entity: all direct facts + second-degree connections.
+
+```
+get_entity_context(name: str) -> str
+```
+
+- **name** — exact or approximate entity name
+
+Returns: entity name, facts (relationship → target), and direct connections summary.
+
+---
+
+#### `delete_entity`
+Remove a single entity from Neo4j (DETACH DELETE, removes all attached relationships) and from the vector store.
+
+```
+delete_entity(name: str) -> str
+```
+
+- **name** — exact entity name to delete
+
+Returns: `"deleted entity=<name> relationships_removed=<n> vector_removed=<bool>"`
+
+---
+
+#### `prune_entities`
+Bulk-delete a list of entities. Each entity is removed from Neo4j (with all relationships) and the vector store. Useful for cleaning up noise or stale data.
+
+```
+prune_entities(names: list[str]) -> str
+```
+
+- **names** — list of entity names to remove
+
+Returns: `"pruned=<n> vectors_removed=<n> entities=[...]"`
+
+---
+
+#### `run_audit`
+Trigger an on-demand LLM quality audit of relationship data. The audit scores relationships deterministically (rule-based signals) and optionally with an LLM, then flags weak/incorrect relationships.
+
+```
+run_audit(limit: int = 500, dry_run: bool = False, schedule: str = "nightly") -> str
+```
+
+- **limit** — max relationships to audit (1–5000, default 500)
+- **dry_run** — if `True`, score without writing changes back
+- **schedule** — `"nightly"` (focused audit) or `"weekly"` (broader sweep)
+
+Returns: `"audit status=<s> scanned=<n> verified=<n> autofixed=<n>"`
+
+---
+
+#### `get_training_status`
+Check the state of the GLiNER self-improvement pipeline: how many examples have accumulated, the last fine-tune timestamp, and whether the last cycle passed benchmark.
+
+```
+get_training_status() -> str
+```
+
+Returns: `"examples=<n> last=<iso_ts> status=<cycle_status>"`
+
+---
+
+#### `get_queue_status`
+Inspect the async extraction queue and vector store counters.
+
+```
+get_queue_status() -> str
+```
+
+Returns: `"pending=<n> processing=<n> vector={...}"`
 
 ---
 
