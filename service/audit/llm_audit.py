@@ -274,8 +274,10 @@ async def _invoke_openai_compatible(
     if require_api_key and not api_key:
         raise RuntimeError(f"{provider} API key is not set")
 
-    # Kimi k2.5 is a thinking model that only accepts temperature=1.0
-    temp = 1.0 if provider in ("moonshot", "kimi") else 0.1
+    # Kimi k2.5: use instant (non-thinking) mode for audit — structured JSON
+    # doesn't need chain-of-thought. Faster, cheaper, allows temp=0.6.
+    is_kimi = provider in ("moonshot", "kimi")
+    temp = 0.6 if is_kimi else 0.1
 
     body = {
         "model": model,
@@ -286,6 +288,10 @@ async def _invoke_openai_compatible(
         "temperature": temp,
         "max_tokens": max_tokens,
     }
+
+    # Disable thinking for Kimi — instant mode
+    if is_kimi:
+        body["thinking"] = {"type": "disabled"}
 
     headers = {"Content-Type": "application/json"}
     if api_key:
