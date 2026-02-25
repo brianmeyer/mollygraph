@@ -1364,6 +1364,61 @@ class GLiNERTrainingService:
 
         return total
 
+    def archive_old_training_examples(self) -> dict[str, Any]:
+        """Compress training example files older than GLINER_ARCHIVE_DAYS days to
+        ~/.graph-memory/training/archive/ as .jsonl.gz files.
+
+        Originals are left on disk (the sliding-window loader skips them in practice
+        once the archive passes 10 K examples).  Archival is idempotent: files that
+        have already been archived are skipped.
+        """
+        import gzip
+
+        training_dir = self.gliner_training_dir()
+        archive_dir = config.GRAPH_MEMORY_DIR / "training" / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(config.GLINER_ARCHIVE_DAYS))
+        archived = 0
+        skipped = 0
+        errors = 0
+
+        for path in sorted(training_dir.glob("*.jsonl")):
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            except Exception:
+                continue
+            if mtime >= cutoff:
+                continue  # file is recent enough, leave it alone
+
+            archive_path = archive_dir / (path.name + ".gz")
+            if archive_path.exists():
+                skipped += 1
+                continue  # already archived
+
+            try:
+                with path.open("rb") as f_in, gzip.open(archive_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                archived += 1
+                log.info(
+                    "archive_old_training_examples: archived %s → %s",
+                    path.name,
+                    archive_path,
+                )
+            except Exception:
+                log.warning(
+                    "archive_old_training_examples: failed to archive %s", path, exc_info=True
+                )
+                errors += 1
+
+        log.info(
+            "archive_old_training_examples: archived=%d skipped=%d errors=%d",
+            archived,
+            skipped,
+            errors,
+        )
+        return {"archived": archived, "skipped": skipped, "errors": errors}
+
     def load_accumulated_gliner_examples(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         training_dir = self.gliner_training_dir()
