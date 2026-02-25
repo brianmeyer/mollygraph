@@ -1,23 +1,27 @@
 """Graph-aware reranking for MollyGraph query results.
 
-Applies three scoring signals on top of raw vector similarity:
+Applies four scoring signals on top of raw vector similarity:
 
-1. Neighborhood score — 1-hop neighbor count + avg relationship strength.
+1. Direct name match — if the query contains the entity name verbatim
+   (case-insensitive), apply a large multiplier boost so exact matches
+   always rank above hub entities with many neighbors.
+
+2. Neighborhood score — 1-hop neighbor count + avg relationship strength.
    Score = base * (1 + log(1 + neighbor_count) * NEIGHBOR_WEIGHT
                      + avg_strength * STRENGTH_WEIGHT)
 
-2. Path distance bonus — if the query mentions entity A and a result is
+3. Path distance bonus — if the query mentions entity A and a result is
    entity B, check A→B shortest path (≤ 2 hops).  Boost B by PATH_BONUS
    per hop closer (i.e., 2-hop: +PATH_BONUS, 1-hop: +2*PATH_BONUS).
 
-3. Relationship type relevance — verbs in the query are matched against
+4. Relationship type relevance — verbs in the query are matched against
    canonical relationship-type labels; results with matching rel types
    in their fact set get a small relevance lift.
 
-4. Dedup by entity — merges graph+vector results for the same entity;
+5. Dedup by entity — merges graph+vector results for the same entity;
    merged items carry retrieval_source="combined".
 
-5. A/B metrics — raw vector ranking and graph-reranked ranking are both
+6. A/B metrics — raw vector ranking and graph-reranked ranking are both
    logged so rank_improvement_avg and rerank_lift_pct can be tracked.
 """
 from __future__ import annotations
@@ -57,6 +61,11 @@ _REL_INTENT_KEYWORDS: dict[str, list[str]] = {
 # Small relevance boost per matching rel-type keyword hit (caps at 0.1)
 _REL_RELEVANCE_BOOST = 0.05
 _REL_RELEVANCE_MAX = 0.10
+
+# Direct name-match boost: multiplier applied when the entity name appears
+# verbatim in the query.  A value of 0.5 means the score is increased by 50%
+# for an exact match, ensuring direct hits outrank high-degree hub entities.
+_NAME_MATCH_BOOST = 0.50
 
 
 def _extract_query_verbs(query: str) -> list[str]:
@@ -268,15 +277,29 @@ def graph_rerank(
         entity_name = item["entity"]
         facts = item.get("facts") or []
 
-        # 2a. Neighborhood score
+        # 2a. Direct name-match boost (highest priority signal)
+        # If the entity name (or any known alias) appears verbatim in the
+        # query we apply a large multiplier so exact hits always float above
+        # high-degree hub entities that would otherwise dominate.
+        query_lower = query.lower()
+        name_lower = entity_name.lower()
+        name_match = name_lower in query_lower
+        if not name_match:
+            # Check word-boundary match for partial names (e.g. "Anisa" in
+            # "Tell me about Anisa Smith")
+            name_parts = name_lower.split()
+            name_match = any(part in query_lower for part in name_parts if len(part) > 2)
+        name_match_multiplier = (1.0 + _NAME_MATCH_BOOST) if name_match else 1.0
+
+        # 2b. Neighborhood score
         neighbor_count, avg_strength = _get_neighborhood_stats(driver, entity_name)
         neighborhood_boost = (
             math.log(1 + neighbor_count) * neighbor_weight
             + avg_strength * strength_weight
         )
-        graph_score = base_score * (1.0 + neighborhood_boost)
+        graph_score = base_score * name_match_multiplier * (1.0 + neighborhood_boost)
 
-        # 2b. Path distance bonus
+        # 2c. Path distance bonus
         max_path_boost = 0.0
         for q_entity in query_entities[:3]:  # limit to top 3 query entities
             if q_entity.lower() == entity_name.lower():
@@ -288,13 +311,14 @@ def graph_rerank(
                 max_path_boost = max(max_path_boost, hops_bonus)
         graph_score += max_path_boost
 
-        # 2c. Relationship type relevance
+        # 2d. Relationship type relevance
         relevance = _rel_relevance_boost(facts, query_verbs)
         graph_score += relevance
 
         item["graph_score"] = round(graph_score, 6)
         item["graph_neighbor_count"] = neighbor_count
         item["graph_avg_strength"] = round(avg_strength, 4)
+        item["graph_name_match"] = name_match
 
     graph_score_ms = (time.perf_counter() - _t0) * 1000
     log.debug("graph_rerank: scored %d items in %.1fms", len(deduped), graph_score_ms)
