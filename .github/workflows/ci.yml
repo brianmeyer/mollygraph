@@ -54,6 +54,20 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     needs: smoke
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '[]'
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -80,4 +94,7 @@ jobs:
       - name: Run integration tests
         env:
           MOLLYGRAPH_TEST_MODE: "1"
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
         run: pytest -q -m integration
