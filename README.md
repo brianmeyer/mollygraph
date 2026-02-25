@@ -1,96 +1,108 @@
 <p align="center">
   <h1 align="center">🧠 MollyGraph</h1>
-  <p align="center"><strong>The AI memory layer that rewrites its own brain.</strong></p>
+  <p align="center"><strong>The self-improving context graph for AI agents.</strong></p>
 </p>
 
 <p align="center">
-  <em>Local-first knowledge graph with self-improving extraction, parallel graph+vector retrieval, and a LoRA training loop that ships only when it wins.</em>
+  <em>Local-first knowledge graph that fine-tunes its own extraction model, runs three-layer NER+relation extraction, and proves graph+vector beats vector-alone — with metrics to back it up.</em>
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> · <a href="#mcp-integration">MCP</a> · <a href="#python-sdk">Python SDK</a> · <a href="#http-api">HTTP API</a> · <a href="#roadmap">Roadmap</a>
+  <a href="#quick-start">Quick Start</a> · <a href="#mcp-integration">MCP</a> · <a href="#python-sdk">Python SDK</a> · <a href="#http-api">HTTP API</a> · <a href="#architecture">Architecture</a> · <a href="#roadmap">Roadmap</a>
 </p>
 
 ---
 
-Most memory layers are **static pipes** — same extraction quality on day 1 as day 1000. MollyGraph is different: it **fine-tunes its own extraction model on your data**, runs a benchmark A/B test, and auto-promotes only if it wins. Your memory gets better the more you use it.
+Most memory layers are **static vector stores with a fancy wrapper**. Same extraction quality on day 1 as day 1000. Same cosine similarity search. No structure. No relationships. No learning.
 
-Oh, and queries now run graph exact + vector similarity **in parallel** and merge results. No more waterfall cascades.
+MollyGraph is a **context graph** — it extracts entities and relationships, builds a knowledge graph, fine-tunes its own extraction model on your data via LoRA, and auto-promotes the new model only if it wins a benchmark A/B test. Three extraction layers (GLiNER2 → spaCy → GLiREL) catch what single-model systems miss. Queries run graph exact + vector similarity **in parallel** and merge results.
+
+**The result: 92% combined retrieval hits. Graph finds things vector misses. Vector finds things graph misses. Together they cover everything.**
 
 ---
 
 ## ✨ What Makes This Different
 
-| Feature | Other memory systems | MollyGraph |
-|---------|---------------------|------------|
-| Extraction quality | Static, day 1 = day 1000 | Self-improving LoRA loop |
-| Retrieval | Sequential fallback | Parallel graph + vector, merged |
-| Embeddings | Hardcoded model | Env-var swappable, tiered fallback |
-| Training gating | None | Benchmark A/B + shadow eval |
-| Graph health | You figure it out | `/metrics/dashboard` unified JSON |
-| Memory management | Append-only | Delete, prune, orphan detection |
-| Schema drift | Silently explodes | Alarm at >5%/day growth |
+| Feature | Vector-only memory | MollyGraph |
+|---------|-------------------|------------|
+| Extraction | Static NER, never improves | Self-improving GLiNER2 LoRA loop |
+| Relation extraction | None or rule-based | Three-layer: GLiNER2 → spaCy → GLiREL |
+| Retrieval | Cosine similarity only | Parallel graph + vector, merged + reranked |
+| Structure | Flat chunks | Knowledge graph with typed relationships |
+| Embeddings | Hardcoded model | Env-var swappable, tiered fallback chain |
+| Training gating | None | Benchmark A/B + shadow eval, ships only if it wins |
+| Graph health | You figure it out | `/metrics/dashboard` — unified health JSON |
+| Memory management | Append-only | Delete, prune, orphan detection, strength decay |
+| Schema evolution | Manual | Auto-adoption pipeline with frequency gates |
 
 ---
 
 ## 🚀 Key Features
 
-### 🔁 Self-Evolving Extraction (The Killer Feature)
-Every ingested episode becomes a training example. Periodically, MollyGraph fine-tunes GLiNER on your accumulated real-world graph data — not synthetic examples, not pre-baked benchmarks. The candidate model gets A/B tested against the active model on a held-out eval split, shadow-evaluated on live traffic, and hot-reloaded with zero downtime only if it **wins**. Loses? Automatic rollback. No manual labeling. No prompt engineering. Just run your agents.
+### 🔁 Self-Evolving Extraction
+Every ingested episode becomes a training example. MollyGraph fine-tunes GLiNER2 on your accumulated real-world graph data — not synthetic examples, not pre-baked benchmarks. The candidate model gets A/B tested against the active model on a held-out eval split, shadow-evaluated on live traffic, and hot-reloaded with zero downtime only if it **wins**. No manual labeling. No prompt engineering. Just run your agents.
 
-> **From last LoRA run: Entity F1 +7%, Relation F1 +1.6%**  
-> **Training set: 1,798 real examples, zero human annotation**
+> **Last LoRA run: Entity F1 +7%, Relation F1 +1.6%**  
+> **1,798 real training examples, zero human annotation**
 
-### ⚡ Parallel Graph + Vector Retrieval (New)
-Old system: try graph exact → if miss, try fuzzy → if miss, try vector. Waterfalls are slow and lossy.  
-New system: graph exact AND vector similarity fire simultaneously. Results are merged and deduped. The `graph_lift_pct` metric proves graph is doing real work on top of vector — it's not just a slow wrapper around semantic search.
+### 🧬 Three-Layer Extraction Pipeline
+Single-model extraction misses things. MollyGraph runs three layers:
 
-> **Current stats: 2.3% RELATED_TO fallback rate** (down from 8.4%)
+1. **GLiNER2** — Primary NER + relation extraction with self-improving LoRA
+2. **spaCy** — Additive NER enrichment (catches entities GLiNER2 misses)
+3. **GLiREL** — Dedicated relation extraction with 35-entry synonym map and confidence-gated training data generation
 
-### 🧬 Live Graph — Right Now
+GLiREL's high-confidence extractions (>0.4) become silver-label training data for the LoRA loop. The system teaches itself.
+
+### ⚡ Parallel Graph + Vector Retrieval
+Old way: try graph → if miss, try vector. Waterfalls are slow and lossy.  
+MollyGraph: graph exact AND vector similarity fire **simultaneously**. Results merge and dedup. Retrieval lift metrics prove each system catches what the other misses.
+
+> **100% hit rate · 92% combined retrieval · 3.8% RELATED_TO fallback (down from 8.4%)**
+
+### 🧬 Live Graph
 ```
-907 entities   ·   2,196 relationships   ·   28 relationship types
-2.42 density (relationships per entity)
+975 entities  ·  2,701 relationships  ·  28 types  ·  2.77 density
+1,798 training examples  ·  5 LoRA runs  ·  Last F1 gain: +4.32%
 ```
 
-### 🎛️ Jina v5-nano Embeddings (Feb 18 2026)
-Upgraded from `embeddingGemma-300m` to `jinaai/jina-embeddings-v5-text-nano` — 71.0 MTEB score, 239M params. Still fully local, still swappable via env var. Tiered fallback: sentence-transformers → ollama → cloud → hash. Never breaks.
+### 🎛️ Jina v5-nano Embeddings
+`jinaai/jina-embeddings-v5-text-nano` — 71.0 MTEB, 239M params, 8192 context window. Fully local, swappable via env var. Tiered fallback: sentence-transformers → ollama → cloud → hash. Never breaks.
 
 ### 🔍 Configurable Reranker
-Jina reranker v2 (same embedding family). Off by default. One env var to enable. Reranks merged graph+vector results for max precision.
+Jina reranker v2 (same embedding family). Off by default — one env var to enable at scale. Reranks merged graph+vector results for max precision.
 
 ### 🗑️ Memory Management
-Delete entities. Delete relationships. Bulk prune with orphan detection. The nightly audit can auto-execute its own suggestions (opt-in). Your graph stays lean.
+Delete entities. Delete relationships. Bulk prune with orphan detection. Strength decay fades stale knowledge. Nightly LLM audit with opt-in auto-execute. Your graph stays lean.
 
 ### 📊 Unified Metrics Dashboard
-`GET /metrics/dashboard` — single JSON endpoint with graph health, retrieval stats, embedding config, training status, uptime, and lift metrics. Know your memory's health at a glance.
+`GET /metrics/dashboard` — graph health, retrieval stats (hit rate, lift %, latency percentiles), embedding config, extraction yields, training status, uptime. One endpoint, full picture.
 
 ### 🤖 MCP Tools (9 tools)
-`search_facts`, `search_nodes`, `get_entity_context`, `add_episode`, `delete_entity`, `prune_entities`, `run_audit`, `get_training_status`, `get_queue_status`
+`search_facts` · `search_nodes` · `get_entity_context` · `add_episode` · `delete_entity` · `prune_entities` · `run_audit` · `get_training_status` · `get_queue_status`
 
 ---
 
-## 📈 Live Metrics Snapshot
+## 📈 Live Metrics
 
 ```
-Graph Health
-  Entities:          907
-  Relationships:    2,196
-  Relationship types:  28
-  Graph density:      2.42 (rels/entity)
+Graph                              Retrieval
+  Entities:        975               Hit rate:           100%
+  Relationships:  2,701              Combined hits:       92%
+  Types:            28               Avg latency:        244ms
+  Density:         2.77              Graph lift:         100%
+  RELATED_TO rate: 3.8%              Vector lift:        100%
 
-Retrieval Quality
-  RELATED_TO fallback:  2.3%  (was 8.4%)
-  graph_lift_pct:       tracked per query
-
-Extraction (GLiNER LoRA)
-  Training examples:   1,798
-  Last cycle delta:     Entity F1 +7.0%, Relation F1 +1.6%
+Extraction                         Training
+  Backend:     GLiNER2 + LoRA        Examples:          1,798
+  + spaCy enrichment                 LoRA runs:             5
+  + GLiREL relations                 Last F1 delta:    +4.32%
+  Avg entity yield:  5.56            Cooldown:           48h
+  Unique entity rate: 51%
 
 Embeddings
-  Model:  jinaai/jina-embeddings-v5-text-nano
-  MTEB:   71.0
-  Params: 239M
+  Model:   jinaai/jina-embeddings-v5-text-nano (71.0 MTEB, 239M params)
+  Vectors: 954 (tiered fallback: sentence-transformers → ollama → cloud → hash)
 ```
 
 ---
@@ -106,7 +118,8 @@ Embeddings
        │
        ▼
   GLiNER2 extraction ──────────────────────────────────┐
-  + SpaCy enrichment                                    │
+  + spaCy enrichment                                    │
+  + GLiREL relation extraction                          │
        │                                                │
        ▼                                                ▼
   Neo4j graph write                            training example
@@ -314,8 +327,9 @@ MOLLYGRAPH_STATE_DIR=~/.graph-memory
 
 ### Enrichment Pipeline
 - [ ] **Specialized GLiNER passes** — domain-specific models as additive passes: biomedical (`gliner-biomed`), PII detection (`nvidia/gliner-PII`), multilingual (`gliner_multi-v2.1`)
-- [ ] **GLiREL integration** — `jackboyla/glirel-large-v0` as second-pass relation extractor; targets the residual RELATED_TO fallback
-- [ ] **Entity merge & dedup** — when multiple models extract the same entity, merge by confidence score
+- [ ] **Graph-aware reranking** — score results by graph neighborhood density, path distance, and relationship relevance (not just cosine similarity)
+- [ ] **Per-source quality metrics** — track entity yield, unique rate, and quality score per ingestion source
+- [ ] **Decision traces** — capture reasoning chains as first-class graph nodes for audit trails and precedent search
 
 ### Model Infrastructure
 - [ ] **Model hot-swap with unload** — config change → unload old model → load new one, no restart
@@ -336,25 +350,24 @@ MOLLYGRAPH_STATE_DIR=~/.graph-memory
 - [ ] MLX embeddings (Apple Silicon)
 
 ### Done ✅
-- [x] Self-evolving GLiNER extraction with LoRA
+- [x] Self-evolving GLiNER2 extraction with LoRA fine-tuning
 - [x] Benchmark-gated deployment with shadow evaluation
+- [x] **Three-layer extraction: GLiNER2 → spaCy → GLiREL** (Feb 2026)
+- [x] **GLiREL relation extraction** with 35-entry synonym map + auto-synonym generation
 - [x] **Parallel graph + vector retrieval** (Feb 2026)
-- [x] **Jina v5-nano embeddings** (Feb 2026)
-- [x] **Tiered embedding fallback** (sentence-transformers → ollama → cloud → hash)
-- [x] **Configurable Jina reranker v2** (off by default)
-- [x] **Entity + relationship delete endpoints**
-- [x] **POST /entities/prune** (bulk + orphan detection)
-- [x] **GET /metrics/dashboard** unified health JSON
-- [x] **Retrieval lift metrics** (graph_lift_pct, vector_lift_pct)
-- [x] **Audit auto-delete** (opt-in nightly auto-execute)
-- [x] MCP server + Python SDK
-- [x] Local embedding support (sentence-transformers, Ollama)
-- [x] Relationship suggestion system
-- [x] Hot-reload model deployment + automatic rollback
+- [x] **Jina v5-nano embeddings** — 71.0 MTEB, tiered fallback chain
+- [x] **Configurable Jina reranker v2** (off by default, same embedding family)
+- [x] **Entity + relationship delete** + bulk prune with orphan detection
+- [x] **Unified metrics dashboard** — graph, retrieval, extraction, training, uptime
+- [x] **Retrieval lift metrics** — graph_lift_pct, vector_lift_pct, combined_hits
+- [x] **Tiered LLM audit** — deterministic → local → primary → fallback (8 providers)
+- [x] **Audit auto-delete** (opt-in, blast radius capped at 5% per run)
+- [x] **Schema auto-adoption** — frequency-gated with GLiREL synonym generation
+- [x] MCP server (9 tools) + Python SDK
+- [x] PID file + stuck job recovery + Neo4j connection pooling
 - [x] Strength decay — stale knowledge fades, active stays prominent
 - [x] Bi-temporal graph (valid_from, valid_to, observed_at, last_seen)
 - [x] Schema drift alarm (>5%/day growth threshold)
-- [x] Retrieval source tracking — Graph Lift metric
 
 ---
 
