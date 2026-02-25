@@ -50,6 +50,7 @@ class ExtractionQueue:
                     id TEXT PRIMARY KEY,
                     content TEXT NOT NULL,
                     source TEXT NOT NULL,
+                    speaker TEXT,
                     priority INTEGER DEFAULT 1,
                     reference_time TEXT NOT NULL,
                     episode_id TEXT,
@@ -66,6 +67,13 @@ class ExtractionQueue:
             # Migration: add retry_count column to existing databases.
             try:
                 conn.execute("ALTER TABLE jobs ADD COLUMN retry_count INTEGER DEFAULT 0")
+                conn.commit()
+            except Exception:
+                pass  # Column already exists — no-op
+
+            # Migration: add speaker column to existing databases.
+            try:
+                conn.execute("ALTER TABLE jobs ADD COLUMN speaker TEXT")
                 conn.commit()
             except Exception:
                 pass  # Column already exists — no-op
@@ -93,13 +101,14 @@ class ExtractionQueue:
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT INTO jobs (
-                    id, content, source, priority, reference_time,
+                    id, content, source, speaker, priority, reference_time,
                     episode_id, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.id,
                 job.content,
                 job.source,
+                job.speaker,
                 job.priority,
                 job.reference_time.isoformat(),
                 job.episode_id,
@@ -278,6 +287,7 @@ class ExtractionQueue:
             id=row['id'],
             content=row['content'],
             source=row['source'],
+            speaker=row['speaker'] if 'speaker' in row.keys() else None,
             priority=row['priority'],
             reference_time=datetime.fromisoformat(row['reference_time']),
             episode_id=row['episode_id'],

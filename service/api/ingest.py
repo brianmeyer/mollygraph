@@ -33,9 +33,10 @@ log = logging.getLogger("mollygraph")
 router = APIRouter()
 
 
-class _IngestBody(BaseModel):
+class IngestRequest(BaseModel):
     content: str
     source: str = "manual"
+    speaker: str | None = None
     priority: int = 1
 
 
@@ -44,13 +45,15 @@ class _IngestBody(BaseModel):
 async def ingest(
     content: str | None = None,
     source: str = "manual",
+    speaker: str | None = None,
     priority: int = 1,
     _api_key: str = Depends(verify_api_key),
-    body: _IngestBody | None = Body(None),
+    body: IngestRequest | None = Body(None),
 ) -> dict[str, Any]:
     if body is not None and content is None:
         content = body.content
         source = body.source
+        speaker = body.speaker
         priority = body.priority
     if not content:
         raise HTTPException(status_code=422, detail="content is required (query param or JSON body)")
@@ -60,6 +63,7 @@ async def ingest(
     job = ExtractionJob(
         content=content,
         source=source,
+        speaker=speaker,
         priority=priority,
         reference_time=datetime.now(UTC),
     )

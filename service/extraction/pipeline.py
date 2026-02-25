@@ -309,15 +309,25 @@ class ExtractionPipeline:
         try:
             job.status = "processing"
             job.started_at = datetime.now(UTC)
+            ingest_source = self._normalize_source(job.source)
+            speaker = (job.speaker or "").strip() or None
+            content_for_extraction = (
+                f"Statement by {speaker}: {job.content}" if speaker else job.content
+            )
+            threshold = getattr(service_config, "EXTRACTION_CONFIDENCE", {}).get(
+                ingest_source,
+                getattr(service_config, "EXTRACTION_CONFIDENCE_DEFAULT", 0.4),
+            )
 
-            extracted = await asyncio.to_thread(gliner_extractor.extract, job.content, 0.4)
+            extracted = await asyncio.to_thread(gliner_extractor.extract, content_for_extraction, threshold)
             gliner_entities_raw = extracted.get("entities", []) if isinstance(extracted, dict) else []
             raw_relations_raw = extracted.get("relations", []) if isinstance(extracted, dict) else []
             gliner_entities = gliner_entities_raw if isinstance(gliner_entities_raw, list) else []
             raw_relations = raw_relations_raw if isinstance(raw_relations_raw, list) else []
 
             spacy_entities: list[dict[str, Any]] = []
-            if service_config.SPACY_ENRICHMENT:
+            chat_sources = {"session", "conversation", "whatsapp", "imessage"}
+            if service_config.SPACY_ENRICHMENT and ingest_source not in chat_sources:
                 spacy_entities = self._spacy_enrich_entities(
                     content=job.content,
                     gliner_entity_count=len(gliner_entities),
@@ -328,6 +338,8 @@ class ExtractionPipeline:
                 gliner_entities=gliner_entities,
                 spacy_entities=spacy_entities,
             )
+            if speaker:
+                raw_entities = self._ensure_speaker_entity(raw_entities, speaker)
 
             # ── Create episode with incomplete=True BEFORE any graph writes ─
             # This ensures any crash during entity/relationship writes leaves
@@ -335,7 +347,7 @@ class ExtractionPipeline:
             _episode_id = job.episode_id or str(uuid.uuid4())
             _preliminary_episode = Episode(
                 id=_episode_id,
-                source=self._normalize_source(job.source),
+                source=ingest_source,
                 content_preview=job.content[:500],
                 content_hash=self._hash_content(job.content),
                 occurred_at=job.reference_time,
@@ -350,7 +362,6 @@ class ExtractionPipeline:
             stored_entities: list[Entity] = []
             new_entity_count = 0
             existing_entity_count = 0
-            ingest_source = self._normalize_source(job.source)
 
             for entity in entities:
                 entity_id, is_new = self.graph.upsert_entity(entity)
@@ -454,6 +465,11 @@ class ExtractionPipeline:
                         "GLiREL enrichment failed; continuing with GLiNER2-only relations",
                         exc_info=True,
                     )
+            if speaker:
+                raw_relations_with_source = self._anchor_relations_to_speaker(
+                    raw_relations_with_source,
+                    speaker,
+                )
 
             relationships, fallback_count = self._build_relationships(
                 raw_relations=raw_relations_with_source,
@@ -741,6 +757,67 @@ class ExtractionPipeline:
 
         return entities
 
+    def _ensure_speaker_entity(
+        self,
+        raw_entities: list[dict[str, Any]],
+        speaker: str,
+    ) -> list[dict[str, Any]]:
+        speaker_name = speaker.strip()
+        if not speaker_name:
+            return raw_entities
+
+        speaker_key = self._normalize(speaker_name)
+        for item in raw_entities:
+            if not isinstance(item, dict):
+                continue
+            candidate = str(item.get("text") or item.get("name") or "").strip()
+            if self._normalize(candidate) == speaker_key:
+                return raw_entities
+
+        return [
+            {
+                "text": speaker_name,
+                "label": "Person",
+                "score": 1.0,
+                "source": "speaker",
+            },
+            *raw_entities,
+        ]
+
+    def _anchor_relations_to_speaker(
+        self,
+        relations: list[dict[str, Any]],
+        speaker: str,
+    ) -> list[dict[str, Any]]:
+        speaker_name = speaker.strip()
+        if not speaker_name:
+            return relations
+
+        speaker_key = self._normalize(speaker_name)
+        anchored: list[dict[str, Any]] = []
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+
+            head = str(relation.get("head") or "").strip()
+            tail = str(relation.get("tail") or "").strip()
+            if not head and not tail:
+                continue
+
+            if self._normalize(head) == speaker_key and tail:
+                target = tail
+            elif self._normalize(tail) == speaker_key and head:
+                target = head
+            else:
+                target = tail or head
+
+            if not target or self._normalize(target) == speaker_key:
+                continue
+
+            anchored.append({**relation, "head": speaker_name, "tail": target})
+
+        return anchored
+
     def _build_relationships(
         self,
         raw_relations: list[dict[str, Any]],
@@ -930,7 +1007,17 @@ class ExtractionPipeline:
     @staticmethod
     def _normalize_source(source: str) -> str:
         normalized = (source or "manual").strip().lower()
-        allowed = {"manual", "whatsapp", "voice", "email", "imessage"}
+        allowed = {
+            "manual",
+            "whatsapp",
+            "voice",
+            "email",
+            "imessage",
+            "session",
+            "conversation",
+            "correction",
+            "contacts_json",
+        }
         if normalized in allowed:
             return normalized
         return "manual"

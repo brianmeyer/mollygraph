@@ -106,6 +106,7 @@ class ExtractionJob(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     content: str
     source: str
+    speaker: Optional[str] = None
     priority: int = 1  # 0=realtime, 1=normal, 2=batch
     
     # Context

@@ -128,6 +128,15 @@ if _extractor_backend_raw not in {"gliner2", "gliner"}:
     )
 EXTRACTOR_BACKEND = "gliner2"
 EXTRACTOR_MODEL = os.environ.get("MOLLYGRAPH_EXTRACTOR_MODEL", "").strip()
+EXTRACTION_CONFIDENCE_DEFAULT = float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_DEFAULT", "0.4"))
+EXTRACTION_CONFIDENCE = {
+    "session": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_SESSION", "0.55")),
+    "conversation": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_CONVERSATION", "0.55")),
+    "whatsapp": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_WHATSAPP", "0.55")),
+    "imessage": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_IMESSAGE", "0.55")),
+    "email": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_EMAIL", "0.45")),
+    "voice": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_VOICE", "0.50")),
+}
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
 RERANKER_ENABLED = os.environ.get("MOLLYGRAPH_RERANKER_ENABLED", "false").lower() == "true"
