@@ -80,8 +80,6 @@ _ALLOWED_REL_TYPES: frozenset[str] = frozenset()
 
 
 class GLiNERTrainingService:
-    _GLINER_MAX_RUNS = 3
-    _GLINER_MAX_BACKUPS = 2
 
     def __init__(self, state_file: Path | None = None):
         self._state_file = state_file or config.STATE_FILE
@@ -1797,8 +1795,10 @@ class GLiNERTrainingService:
             for record in train_records:
                 f.write(json.dumps(record, ensure_ascii=True) + "\n")
 
-        output_dir = runs_dir / ts
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Transient training output dir — deleted after candidate is populated.
+        # gliner_runs/<ts>/ receives ONLY KB-sized metadata (no model weights).
+        tmp_train_dir = models_dir / f".training-{ts}"
+        tmp_train_dir.mkdir(parents=True, exist_ok=True)
 
         batch_size = min(4, max(1, len(train_records)))
         normalized_mode = "full" if str(mode).strip().lower() == "full" else "lora"
@@ -1808,7 +1808,7 @@ class GLiNERTrainingService:
         _train_kwargs = dict(
             model_path=self.active_gliner_model_ref(),
             train_data=train_records,
-            output_dir=str(output_dir),
+            output_dir=str(tmp_train_dir),
             num_epochs=num_epochs,
             batch_size=batch_size,
             eval_strategy="no",
@@ -1837,26 +1837,40 @@ class GLiNERTrainingService:
                 result = train_gliner2(**_minimal_kwargs)
             except Exception as exc2:
                 log.error("GLiNER fine-tune failed (minimal signature)", exc_info=True)
+                shutil.rmtree(tmp_train_dir, ignore_errors=True)
                 return {"ok": False, "error": str(exc2)}
         except Exception as exc:
             log.error("GLiNER fine-tune failed", exc_info=True)
+            shutil.rmtree(tmp_train_dir, ignore_errors=True)
             return {"ok": False, "error": str(exc)}
 
-        final_dir = output_dir / "final"
+        # Locate trained model checkpoint inside tmp dir.
+        final_dir = tmp_train_dir / "final"
         if not final_dir.exists():
-            best_dir = output_dir / "best"
+            best_dir = tmp_train_dir / "best"
             if best_dir.exists():
                 final_dir = best_dir
             else:
+                shutil.rmtree(tmp_train_dir, ignore_errors=True)
                 return {
                     "ok": False,
                     "error": "trained_model_not_found",
-                    "output_dir": str(output_dir),
+                    "output_dir": str(tmp_train_dir),
                 }
 
+        # Populate gliner_candidate from the trained checkpoint.
         self.discard_gliner_candidate_model(candidate_dir)
-        shutil.copytree(final_dir, candidate_dir, dirs_exist_ok=False)
+        try:
+            final_dir.rename(candidate_dir)  # atomic on same filesystem
+        except OSError:
+            shutil.copytree(final_dir, candidate_dir, dirs_exist_ok=False)
 
+        # Delete the transient training dir now that candidate is populated.
+        shutil.rmtree(tmp_train_dir, ignore_errors=True)
+
+        # Write KB-sized metadata to gliner_runs/<ts>/ — no model weights here.
+        run_meta_dir = runs_dir / ts
+        run_meta_dir.mkdir(parents=True, exist_ok=True)
         metadata = {
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "base_model": self.active_gliner_model_ref(),
@@ -1864,11 +1878,19 @@ class GLiNERTrainingService:
             "batch_size": batch_size,
             "mode": normalized_mode,
             "num_epochs": num_epochs,
-            "output_dir": str(output_dir),
+            "candidate_dir": str(candidate_dir),
             "result": result,
         }
-        metadata_path = candidate_dir / "fine_tune_metadata.json"
+        metadata_path = run_meta_dir / "metadata.json"
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+        # Also write a copy into candidate for introspection.
+        try:
+            (candidate_dir / "fine_tune_metadata.json").write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
+            )
+        except Exception:
+            pass  # non-fatal
 
         self.prune_gliner_dirs()
 
@@ -1876,32 +1898,42 @@ class GLiNERTrainingService:
             "ok": True,
             "candidate_model": str(candidate_dir),
             "train_split_path": str(train_split_path),
-            "output_dir": str(output_dir),
+            "output_dir": str(run_meta_dir),
             "metadata_path": str(metadata_path),
             "mode": normalized_mode,
             "result": result,
         }
 
     def prune_gliner_dirs(self) -> dict[str, Any]:
-        pruned: dict[str, list[str]] = {"runs": [], "backups": []}
+        """Delete any model directory in models_dir that isn't gliner_active or gliner_candidate.
 
-        for subdir, limit in [
-            (self.gliner_models_dir() / "gliner_runs", self._GLINER_MAX_RUNS),
-            (self.gliner_models_dir() / "gliner_backups", self._GLINER_MAX_BACKUPS),
-        ]:
-            if not subdir.exists():
+        gliner_runs/ is kept because it stores KB-sized metadata; its subdirectory contents
+        are NOT pruned here.  Dotfiles/temp dirs (e.g. .training-*, .deploy-*) are skipped
+        so concurrent operations are not disrupted.
+        """
+        pruned: list[str] = []
+        models_dir = self.gliner_models_dir()
+        if not models_dir.exists():
+            return {"pruned": pruned}
+
+        # Only these dirs are permitted to exist in models_dir.
+        keep = {"gliner_active", "gliner_candidate", "gliner_runs"}
+
+        for item in models_dir.iterdir():
+            if item.name.startswith("."):
+                continue  # skip hidden/temp dirs
+            if not item.is_dir():
                 continue
+            if item.name in keep:
+                continue
+            try:
+                shutil.rmtree(item, ignore_errors=True)
+                pruned.append(item.name)
+                log.info("prune_gliner_dirs: deleted stale model dir %s", item)
+            except Exception:
+                log.warning("prune_gliner_dirs: failed to delete %s", item, exc_info=True)
 
-            dirs = sorted([d for d in subdir.iterdir() if d.is_dir()], key=lambda p: p.name, reverse=True)
-            for old_dir in dirs[limit:]:
-                try:
-                    shutil.rmtree(old_dir, ignore_errors=True)
-                    pruned[subdir.name].append(old_dir.name)
-                    log.info("Pruned GLiNER dir: %s", old_dir)
-                except Exception:
-                    log.warning("Failed pruning %s", old_dir, exc_info=True)
-
-        return pruned
+        return {"pruned": pruned}
 
     @staticmethod
     def discard_gliner_candidate_model(candidate_path: Path | None) -> None:
@@ -1914,6 +1946,14 @@ class GLiNERTrainingService:
         benchmark: dict[str, Any],
         fine_tune: dict[str, Any],
     ) -> dict[str, Any]:
+        """Deploy gliner_candidate → gliner_active with minimal disk footprint.
+
+        Lifecycle (active+candidate only — no backups, no previous):
+          1. Delete gliner_active if it exists (frees disk immediately).
+          2. Rename gliner_candidate → gliner_active (atomic on same filesystem).
+
+        gliner_candidate ceases to exist after this call succeeds.
+        """
         if not candidate_path.exists():
             return {"ok": False, "error": "candidate_path_missing"}
 
@@ -1921,36 +1961,20 @@ class GLiNERTrainingService:
         active_dir.parent.mkdir(parents=True, exist_ok=True)
         previous_active_ref = self.active_gliner_model_ref()
 
-        backup_dir: Path | None = None
+        # Step 1: Delete existing active model to free disk before rename.
         if active_dir.exists():
-            backup_root = self.gliner_models_dir() / "gliner_backups"
-            backup_root.mkdir(parents=True, exist_ok=True)
-            backup_dir = backup_root / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            shutil.copytree(active_dir, backup_dir, dirs_exist_ok=False)
+            shutil.rmtree(active_dir, ignore_errors=True)
 
-        # ── Atomic rename-swap deploy (avoids race between rmtree and read) ──
-        # Copy candidate → temp, rename active → .old, rename temp → active.
-        temp_dir = active_dir.parent / f".deploy-{int(time.time())}"
+        # Step 2: Rename candidate → active (atomic on same filesystem, zero extra disk).
         try:
-            shutil.copytree(candidate_path, temp_dir)
-            old_dir = active_dir.parent / f".old-{int(time.time())}"
-            if active_dir.exists():
-                try:
-                    active_dir.rename(old_dir)  # atomic on same filesystem
-                except FileNotFoundError:
-                    pass  # active dir already gone
-            temp_dir.rename(active_dir)          # atomic on same filesystem
-            # Best-effort cleanup of displaced old dir
-            try:
-                shutil.rmtree(old_dir, ignore_errors=True)
-            except Exception:
-                pass
-        except Exception as deploy_exc:
-            log.error("Atomic deploy failed, falling back to direct copy: %s", deploy_exc)
-            # Non-atomic fallback
-            if active_dir.exists():
-                shutil.rmtree(active_dir, ignore_errors=True)
+            candidate_path.rename(active_dir)
+        except OSError as rename_exc:
+            # Cross-device rename: fall back to copy + delete.
+            log.warning(
+                "deploy: rename failed (%s), falling back to copy+delete", rename_exc
+            )
             shutil.copytree(candidate_path, active_dir, dirs_exist_ok=False)
+            shutil.rmtree(candidate_path, ignore_errors=True)
 
         deployed_at = datetime.now(timezone.utc).isoformat()
         self.state["gliner_active_model_ref"] = str(active_dir)
@@ -1961,7 +1985,6 @@ class GLiNERTrainingService:
             "updated_at": deployed_at,
             "active_model_ref": str(active_dir),
             "previous_model_ref": previous_active_ref,
-            "backup_model_ref": str(backup_dir) if backup_dir else None,
             "benchmark": benchmark,
             "fine_tune": {
                 "mode": fine_tune.get("mode", "lora"),
@@ -1980,7 +2003,6 @@ class GLiNERTrainingService:
             from metrics.model_health import model_health_monitor
 
             base_eval = benchmark.get("base") or {}
-            base_metrics = base_eval.get("metrics") or {}
             # Compute pre-deploy fallback rate from base benchmark: (FP+FN) / total
             tp = int(base_eval.get("counts", {}).get("tp", 0) or 0)
             fp = int(base_eval.get("counts", {}).get("fp", 0) or 0)
@@ -2000,7 +2022,6 @@ class GLiNERTrainingService:
         return {
             "ok": True,
             "active_model": str(active_dir),
-            "backup_model": str(backup_dir) if backup_dir else None,
             "training_config": str(config_path),
             "pruned": pruned,
         }
