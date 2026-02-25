@@ -666,7 +666,7 @@ class GLiNERTrainingService:
         # the IDs that were already processed in the previous batch.
         where_cursor = (
             "AND datetime(coalesce(ep.created_at, toString(ep.ingested_at), toString(ep.occurred_at))) >= datetime($cursor)"
-            " AND ep.id NOT IN $seen_ids"
+            " AND NOT ep.id IN $seen_ids"
             if cursor
             else ""
         )
