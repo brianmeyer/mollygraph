@@ -136,6 +136,10 @@ EXTRACTION_CONFIDENCE = {
     "imessage": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_IMESSAGE", "0.55")),
     "email": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_EMAIL", "0.45")),
     "voice": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_VOICE", "0.50")),
+    # correction: user-supplied corrections are conversational → treat like chat
+    "correction": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_CORRECTION", "0.55")),
+    # contacts_json: structured import data → slightly lower threshold to capture more entities
+    "contacts_json": float(os.environ.get("MOLLYGRAPH_EXTRACTION_CONFIDENCE_CONTACTS_JSON", "0.40")),
 }
 
 # ── Reranker ──────────────────────────────────────────────────────────────────

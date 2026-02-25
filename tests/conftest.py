@@ -114,6 +114,23 @@ def client(monkeypatch):
     main.vector_store = FakeVectorStore()
     main.pipeline = object()
 
+    # Patch runtime singletons across all modules that import them
+    from api import deps as deps_module
+    from api import ingest as ingest_module
+    from api import query as query_module
+
+    for mod in [deps_module, ingest_module, query_module]:
+        if hasattr(mod, "require_runtime_ready"):
+            monkeypatch.setattr(mod, "require_runtime_ready", lambda: None)
+        if hasattr(mod, "get_queue_instance"):
+            monkeypatch.setattr(mod, "get_queue_instance", lambda: main.queue)
+        if hasattr(mod, "get_graph_instance"):
+            monkeypatch.setattr(mod, "get_graph_instance", lambda: main.graph)
+        if hasattr(mod, "get_pipeline_instance"):
+            monkeypatch.setattr(mod, "get_pipeline_instance", lambda: main.pipeline)
+        if hasattr(mod, "get_vector_store_instance"):
+            monkeypatch.setattr(mod, "get_vector_store_instance", lambda: main.vector_store)
+
     # Patch admin module functions where routes actually call them
     from api import admin as admin_module
     from maintenance import auditor as auditor_module

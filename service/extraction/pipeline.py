@@ -789,12 +789,20 @@ class ExtractionPipeline:
         relations: list[dict[str, Any]],
         speaker: str,
     ) -> list[dict[str, Any]]:
+        """Re-orient relations so speaker is always the head node when involved.
+
+        Rules:
+        - Speaker is already head → keep as-is.
+        - Speaker is tail → reverse (speaker→head, other→tail).
+        - Speaker not involved → pass through unchanged (do NOT inject speaker
+          as head; that would corrupt unrelated entity-to-entity facts).
+        """
         speaker_name = speaker.strip()
         if not speaker_name:
             return relations
 
         speaker_key = self._normalize(speaker_name)
-        anchored: list[dict[str, Any]] = []
+        result: list[dict[str, Any]] = []
         for relation in relations:
             if not isinstance(relation, dict):
                 continue
@@ -804,19 +812,21 @@ class ExtractionPipeline:
             if not head and not tail:
                 continue
 
-            if self._normalize(head) == speaker_key and tail:
-                target = tail
-            elif self._normalize(tail) == speaker_key and head:
-                target = head
+            if self._normalize(head) == speaker_key:
+                # Speaker is head — keep direction; drop pure self-relations.
+                if not tail or self._normalize(tail) == speaker_key:
+                    continue
+                result.append(relation)
+            elif self._normalize(tail) == speaker_key:
+                # Speaker is tail — reverse so speaker becomes head.
+                if not head:
+                    continue
+                result.append({**relation, "head": speaker_name, "tail": head})
             else:
-                target = tail or head
+                # Speaker not involved — preserve relation exactly as extracted.
+                result.append(relation)
 
-            if not target or self._normalize(target) == speaker_key:
-                continue
-
-            anchored.append({**relation, "head": speaker_name, "tail": target})
-
-        return anchored
+        return result
 
     def _build_relationships(
         self,
