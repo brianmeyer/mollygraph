@@ -15,9 +15,9 @@
 
 Most memory layers are **static vector stores with a fancy wrapper**. Same extraction quality on day 1 as day 1000. Same cosine similarity search. No structure. No relationships. No learning.
 
-MollyGraph is a **context graph** — it extracts entities and relationships, builds a knowledge graph, fine-tunes its own extraction model on your data via LoRA, and auto-promotes the new model only if it wins a benchmark A/B test. Three extraction layers (GLiNER2 → spaCy → GLiREL) catch what single-model systems miss. Queries run graph exact + vector similarity **in parallel** and merge results.
+MollyGraph is a **context graph** — it extracts entities and relationships, builds a knowledge graph, fine-tunes its own extraction model on your data via LoRA, and auto-promotes the new model only if it wins a benchmark A/B test. Speaker-anchored extraction processes each message individually with per-source confidence thresholds. Queries run graph exact + vector similarity **in parallel** and merge results. A tiered LLM audit (Moonshot/Kimi → Gemini Flash → deterministic) reviews relationships and auto-cleans garbage.
 
-**The result: 92% combined retrieval hits. Graph finds things vector misses. Vector finds things graph misses. Together they cover everything.**
+**The result: 251 verified entities, 1,419 relationships, zero noise. Graph finds things vector misses. Vector finds things graph misses. Together they cover everything.**
 
 ---
 
@@ -27,13 +27,13 @@ MollyGraph is a **context graph** — it extracts entities and relationships, bu
 |---------|-------------------|------------|
 | Extraction | Static NER, never improves | Self-improving GLiNER2 LoRA loop |
 | Relation extraction | None or rule-based | Three-layer: GLiNER2 → spaCy → GLiREL |
+| Chat extraction | Dumps everything, hopes for the best | Speaker-anchored, per-source confidence gates |
 | Retrieval | Cosine similarity only | Parallel graph + vector, merged + reranked |
+| Quality control | None | Tiered LLM audit (Kimi k2.5 → Gemini Flash → rules) |
 | Structure | Flat chunks | Knowledge graph with typed relationships |
 | Embeddings | Hardcoded model | Env-var swappable, tiered fallback chain |
 | Training gating | None | Benchmark A/B + shadow eval, ships only if it wins |
-| Graph health | You figure it out | `/metrics/dashboard` — unified health JSON |
-| Memory management | Append-only | Delete, prune, orphan detection, strength decay |
-| Schema evolution | Manual | Auto-adoption pipeline with frequency gates |
+| Memory management | Append-only | Delete, prune, LLM audit, strength decay |
 
 ---
 
@@ -42,8 +42,13 @@ MollyGraph is a **context graph** — it extracts entities and relationships, bu
 ### 🔁 Self-Evolving Extraction
 Every ingested episode becomes a training example. MollyGraph fine-tunes GLiNER2 on your accumulated real-world graph data — not synthetic examples, not pre-baked benchmarks. The candidate model gets A/B tested against the active model on a held-out eval split, shadow-evaluated on live traffic, and hot-reloaded with zero downtime only if it **wins**. No manual labeling. No prompt engineering. Just run your agents.
 
-> **Last LoRA run: Entity F1 +7%, Relation F1 +1.6%**  
-> **1,798 real training examples, zero human annotation**
+> **Last LoRA run: Entity F1 +4.32%**  
+> **Training from clean, verified graph data only**
+
+### 🎯 Speaker-Anchored Extraction
+Most graph memory systems dump 50 messages into one chunk and hope for the best. Every speaker name becomes an entity. Every co-occurrence becomes a relationship. Garbage in, garbage out.
+
+MollyGraph processes each message individually with the **speaker as the anchor entity**. Per-source confidence thresholds (0.55 for chat, 0.45 for email, 0.40 for manual) gate what enters the graph. Chat noise stays out. Real relationships get in.
 
 ### 🧬 Three-Layer Extraction Pipeline
 Single-model extraction misses things. MollyGraph runs three layers:
@@ -58,12 +63,15 @@ GLiREL's high-confidence extractions (>0.4) become silver-label training data fo
 Old way: try graph → if miss, try vector. Waterfalls are slow and lossy.  
 MollyGraph: graph exact AND vector similarity fire **simultaneously**. Results merge and dedup. Retrieval lift metrics prove each system catches what the other misses.
 
-> **100% hit rate · 92% combined retrieval · 3.8% RELATED_TO fallback (down from 8.4%)**
+> **100% hit rate · Parallel graph + vector · Merged + deduped**
 
-### 📊 Live Graph
+### 🔍 Tiered LLM Audit
+Relationships get reviewed by an LLM audit chain: Moonshot/Kimi k2.5 (instant mode) → Gemini 2.5 Flash (fallback) → deterministic rules. Each relationship is scored with context snippets from the original conversation. Verdicts: verify, reclassify, quarantine, or delete. Auto-executes with blast radius caps.
+
+### 📊 Live Graph (post-purge, clean slate)
 ```
-975 entities  ·  2,701 relationships  ·  28 types  ·  2.77 density
-1,798 training examples  ·  5 LoRA runs  ·  Last F1 gain: +4.32%
+251 entities  ·  1,419 relationships  ·  28 types
+183 episodes  ·  100% verified data  ·  Zero legacy noise
 ```
 
 ### 🎛️ Jina v5-nano Embeddings
@@ -86,23 +94,21 @@ Delete entities. Delete relationships. Bulk prune with orphan detection. Strengt
 ## 📈 Live Metrics
 
 ```
-Graph                              Retrieval
-  Entities:        975               Hit rate:           100%
-  Relationships:  2,701              Combined hits:       92%
-  Types:            28               Avg latency:        244ms
-  Density:         2.77              Graph lift:         100%
-  RELATED_TO rate: 3.8%              Vector lift:        100%
+Graph                              Audit
+  Entities:        251               Provider:     Kimi k2.5 (instant)
+  Relationships:  1,419              Fallback:     Gemini 2.5 Flash
+  Types:            28               Parse failures:     0
+  Episodes:        183               Auto-delete:     enabled
 
 Extraction                         Training
-  Backend:     GLiNER2 + LoRA        Examples:          1,798
-  + spaCy enrichment                 LoRA runs:             5
-  + GLiREL relations                 Last F1 delta:    +4.32%
-  Avg entity yield:  5.56            Cooldown:           48h
-  Unique entity rate: 51%
+  Backend:     GLiNER2               Examples:    rebuilding from clean graph
+  + GLiREL relations                 LoRA:        base model (post-purge)
+  Speaker-anchored:   ✅             Cooldown:    48h between runs
+  Per-source thresholds: ✅
 
 Embeddings
   Model:   jinaai/jina-embeddings-v5-text-nano (71.0 MTEB, 239M params)
-  Vectors: 954 (tiered fallback: sentence-transformers → ollama → cloud → hash)
+  Tiered fallback: sentence-transformers → ollama → cloud → hash
 ```
 
 ---
@@ -408,17 +414,31 @@ TRAINING_EVAL_SPLIT=0.2        # held-out benchmark fraction
 ### Audit
 
 ```env
-# Tiered LLM audit: deterministic → local → primary → fallback
+# Tiered LLM audit: primary → fallback → deterministic
 AUDIT_LLM_ENABLED=true
-AUDIT_AUTO_DELETE=false        # opt-in: audit auto-executes its delete suggestions
+MOLLYGRAPH_AUDIT_PROVIDER_TIERS=primary,fallback,deterministic
 
-# Provider order (first available wins)
-AUDIT_PROVIDER_ORDER=ollama,anthropic,openai
+# Primary: Moonshot/Kimi k2.5 (instant mode — no thinking overhead)
+MOLLYGRAPH_AUDIT_TIER_PRIMARY=moonshot
+MOLLYGRAPH_AUDIT_MODEL_PRIMARY=kimi-k2.5
 
-# Supported: moonshot, groq, ollama, openai, openrouter, together, fireworks, anthropic, gemini
-AUDIT_MODEL_LOCAL=llama3.1:8b
-AUDIT_MODEL_PRIMARY=claude-3-5-haiku-20241022
-AUDIT_MODEL_FALLBACK=gpt-4o-mini
+# Fallback: Gemini 2.5 Flash
+MOLLYGRAPH_AUDIT_TIER_FALLBACK=gemini
+MOLLYGRAPH_AUDIT_MODEL_FALLBACK=gemini-2.5-flash
+
+# Supported providers: moonshot, groq, ollama, openai, openrouter, together, fireworks, anthropic, gemini
+```
+
+### Extraction Confidence
+
+```env
+# Per-source confidence thresholds (speaker-anchored extraction)
+MOLLYGRAPH_EXTRACTION_CONFIDENCE_DEFAULT=0.4
+MOLLYGRAPH_EXTRACTION_CONFIDENCE_SESSION=0.55
+MOLLYGRAPH_EXTRACTION_CONFIDENCE_WHATSAPP=0.55
+MOLLYGRAPH_EXTRACTION_CONFIDENCE_IMESSAGE=0.55
+MOLLYGRAPH_EXTRACTION_CONFIDENCE_EMAIL=0.45
+MOLLYGRAPH_EXTRACTION_CONFIDENCE_VOICE=0.50
 ```
 
 ### Core
@@ -451,24 +471,20 @@ MOLLYGRAPH_STATE_DIR=~/.graph-memory
 - [ ] Plugin system for custom extractors
 
 ### Done ✅
+- [x] **Speaker-anchored extraction** — Graphiti-style per-message processing with speaker as anchor entity (Feb 2026)
+- [x] **Per-source confidence thresholds** — chat 0.55, email 0.45, manual 0.40 (Feb 2026)
+- [x] **Tiered LLM audit** — Kimi k2.5 instant → Gemini 2.5 Flash → deterministic rules (Feb 2026)
+- [x] **Graph purge tooling** — bulk delete old/noisy data, reset LoRA, rebuild clean (Feb 2026)
 - [x] Self-evolving GLiNER2 extraction with LoRA fine-tuning
 - [x] Benchmark-gated deployment with shadow evaluation
-- [x] **Three-layer extraction: GLiNER2 → spaCy → GLiREL** (Feb 2026)
-- [x] **GLiREL relation extraction** with 35-entry synonym map + auto-synonym generation
-- [x] **Parallel graph + vector retrieval** (Feb 2026)
-- [x] **Jina v5-nano embeddings** — 71.0 MTEB, tiered fallback chain
-- [x] **Configurable Jina reranker v2** (off by default, same embedding family)
-- [x] **Entity + relationship delete** + bulk prune with orphan detection
-- [x] **Unified metrics dashboard** — graph, retrieval, extraction, training, uptime
-- [x] **Retrieval lift metrics** — graph_lift_pct, vector_lift_pct, combined_hits
-- [x] **Tiered LLM audit** — deterministic → local → primary → fallback (8 providers)
-- [x] **Audit auto-delete** (opt-in, blast radius capped at 5% per run)
-- [x] **Schema auto-adoption** — frequency-gated with GLiREL synonym generation
+- [x] Three-layer extraction: GLiNER2 → spaCy → GLiREL
+- [x] GLiREL relation extraction with 35-entry synonym map
+- [x] Parallel graph + vector retrieval
+- [x] Jina v5-nano embeddings — 71.0 MTEB, tiered fallback chain
+- [x] Configurable Jina reranker v2
+- [x] Unified metrics dashboard
 - [x] MCP server (9 tools) + Python SDK
-- [x] PID file + stuck job recovery + Neo4j connection pooling
-- [x] Strength decay — stale knowledge fades, active stays prominent
-- [x] Bi-temporal graph (valid_from, valid_to, observed_at, last_seen)
-- [x] Schema drift alarm (>5%/day growth threshold)
+- [x] Bi-temporal graph + strength decay + schema drift alarm
 
 ---
 
