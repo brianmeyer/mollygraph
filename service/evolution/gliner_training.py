@@ -329,6 +329,9 @@ class GLiNERTrainingService:
 
         # Training succeeded — stamp the cooldown timer and update status.
         self.state["gliner_last_finetune_at"] = datetime.now(timezone.utc).isoformat()
+        # Cursor-based new-example gate: snapshot total on-disk example count so the next
+        # nightly cycle can compute how many NEW examples have arrived since this run.
+        self.state["gliner_examples_at_last_train"] = self.count_accumulated_gliner_examples()
         self.state["gliner_last_cycle_status"] = "finetune_completed"
         self.state["gliner_last_result"] = (
             f"GLiNER {mode} training completed. {len(train_rows)} train / {len(eval_rows)} eval. "
@@ -448,6 +451,12 @@ class GLiNERTrainingService:
                     )
                     self.state["gliner_last_cycle_status"] = "deployed"
                     self.save_state()
+                    # Archive training example files older than GLINER_ARCHIVE_DAYS post-deploy.
+                    try:
+                        archive_result = await asyncio.to_thread(self.archive_old_training_examples)
+                        log.info("Post-deploy archival: %s", archive_result)
+                    except Exception:
+                        log.warning("Post-deploy archival failed (non-fatal)", exc_info=True)
                 else:
                     status = "deploy_failed"
                     decision_reason = f"Combined improvement {combined_improvement:.4f} >= threshold but deploy failed"
@@ -1100,22 +1109,16 @@ class GLiNERTrainingService:
 
         selected_names = sorted({str(ent["text"]).strip() for ent in selected_entities})
         episode_id = str(episode.get("episode_id") or "").strip()
-        episode_created_at = str(episode.get("created_at") or "").strip()
+        # Filter strictly by episode_id to prevent label bleed from other
+        # episodes whose entity names happen to overlap with this episode.
         relation_rows = [
             dict(record)
             for record in session.run(
                 """
                 MATCH (h:Entity)-[r]->(t:Entity)
                 WHERE h.name IN $names AND t.name IN $names
+                  AND r.episode_id = $episode_id
                   AND (r.audit_status IS NULL OR NOT r.audit_status IN ['quarantined', 'deleted'])
-                  AND (
-                    r.episode_id = $episode_id
-                    OR (
-                      r.valid_at IS NOT NULL
-                      AND $episode_created_at <> ''
-                      AND abs(duration.between(r.valid_at, datetime($episode_created_at)).seconds) < 300
-                    )
-                  )
                 RETURN h.name AS head,
                        t.name AS tail,
                        type(r) AS label,
@@ -1123,7 +1126,6 @@ class GLiNERTrainingService:
                 """,
                 names=selected_names,
                 episode_id=episode_id,
-                episode_created_at=episode_created_at,
             )
         ]
 
@@ -1142,21 +1144,16 @@ class GLiNERTrainingService:
             relations.append({"head": head, "tail": tail, "label": label})
 
         # ── Hard negative relations (quarantined / deleted audit_status) ───
+        # Filter strictly by episode_id to prevent negatives from bleeding in
+        # from other episodes that share entity names.
         negative_relation_rows = [
             dict(record)
             for record in session.run(
                 """
                 MATCH (h:Entity)-[r]->(t:Entity)
                 WHERE h.name IN $names AND t.name IN $names
+                  AND r.episode_id = $episode_id
                   AND r.audit_status IN ['quarantined', 'deleted']
-                  AND (
-                    r.episode_id = $episode_id
-                    OR (
-                      r.valid_at IS NOT NULL
-                      AND $episode_created_at <> ''
-                      AND abs(duration.between(r.valid_at, datetime($episode_created_at)).seconds) < 300
-                    )
-                  )
                 RETURN h.name AS head,
                        t.name AS tail,
                        type(r) AS label,
@@ -1164,7 +1161,6 @@ class GLiNERTrainingService:
                 """,
                 names=selected_names,
                 episode_id=episode_id,
-                episode_created_at=episode_created_at,
             )
         ]
 
@@ -1374,6 +1370,8 @@ class GLiNERTrainingService:
         if not training_dir.exists():
             return rows
 
+        # Files are sorted oldest-first by filename timestamp; examples are appended
+        # in the same order so rows[-max:] yields the most recent window.
         for path in sorted(training_dir.glob("*.jsonl")):
             try:
                 with path.open("r", encoding="utf-8") as f:
@@ -1392,6 +1390,17 @@ class GLiNERTrainingService:
                             rows.append(row)
             except Exception:
                 log.debug("Failed loading examples from %s", path, exc_info=True)
+
+        # Sliding window: cap at GLINER_MAX_TRAINING_EXAMPLES most recent examples.
+        # Older examples remain on disk but are not loaded for training.
+        max_examples = int(config.GLINER_MAX_TRAINING_EXAMPLES)
+        if len(rows) > max_examples:
+            log.info(
+                "Sliding window: %d total examples on disk; using most recent %d for training",
+                len(rows),
+                max_examples,
+            )
+            rows = rows[-max_examples:]
 
         return rows
 
