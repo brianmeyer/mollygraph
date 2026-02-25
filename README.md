@@ -145,8 +145,9 @@ MOLLYGRAPH_EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-nano
 - [ ] Web UI for graph exploration
 
 **Implemented (behind feature flags):**
-- Graph-aware reranking (`GRAPH_RERANK_ENABLED` — activate at scale)
-- Jina reranker v2 (`MOLLYGRAPH_RERANKER_ENABLED` — activate at 5K+ entities)
+- Graph-aware reranking — neighborhood density, shortest-path distance, relationship-type relevance (`GRAPH_RERANK_ENABLED`)
+- Jina reranker v2 (`MOLLYGRAPH_RERANKER_ENABLED`)
+- Both designed to activate at scale (5K+ entities)
 
 ---
 
