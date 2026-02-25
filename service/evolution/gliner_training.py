@@ -31,6 +31,7 @@ GLINER_BENCHMARK_THRESHOLD = config.GLINER_BENCHMARK_THRESHOLD
 GLINER_FINETUNE_COOLDOWN_DAYS = config.GLINER_FINETUNE_COOLDOWN_DAYS
 GLINER_LORA_COOLDOWN_DAYS = config.GLINER_LORA_COOLDOWN_DAYS
 GLINER_TRAINING_SCAN_LIMIT = config.GLINER_TRAINING_SCAN_LIMIT
+GLINER_MIN_NEW_EXAMPLES = config.GLINER_MIN_NEW_EXAMPLES
 
 _ALLOWED_ENTITY_TYPES = {
     "Person",
@@ -142,19 +143,27 @@ class GLiNERTrainingService:
             GLINER_TRAINING_SCAN_LIMIT,
         )
         total_examples = int(accumulation.get("total_examples", 0))
-        required = int(config.GLINER_FINETUNE_MIN_EXAMPLES)
+        # Cursor-based new-example gate: count examples accumulated since the last
+        # successful training run (tracked via gliner_examples_at_last_train in state.json).
+        examples_at_last_train = int(self.state.get("gliner_examples_at_last_train", 0))
+        new_examples = max(0, total_examples - examples_at_last_train)
+        required_new = int(config.GLINER_MIN_NEW_EXAMPLES)
 
-        progress_line = f"GLiNER training data: {total_examples}/{required} examples accumulated"
+        progress_line = (
+            f"GLiNER training data: {total_examples} total, {new_examples}/{required_new} new examples since last train"
+        )
         self.state["gliner_training_examples"] = total_examples
         self.state["gliner_last_result"] = progress_line
         self.state["gliner_last_cycle_status"] = "accumulated"
         self.save_state()
 
-        if total_examples < required:
+        if new_examples < required_new:
             return {
-                "status": "insufficient_examples",
+                "status": "insufficient_new_examples",
                 "count": total_examples,
-                "required": required,
+                "new_examples": new_examples,
+                "required_new": required_new,
+                "examples_at_last_train": examples_at_last_train,
                 "accumulation": accumulation,
                 "message": progress_line,
             }
@@ -187,7 +196,8 @@ class GLiNERTrainingService:
             return {
                 "status": "cooldown_active",
                 "count": total_examples,
-                "required": required,
+                "new_examples": new_examples,
+                "required_new": required_new,
                 "last_run": last_run.isoformat(),
                 "accumulation": accumulation,
                 "message": cooldown_line,
@@ -628,9 +638,14 @@ class GLiNERTrainingService:
         seen_episode_ids = self.load_existing_gliner_episode_ids(training_dir)
         opus_analysis_text = self.latest_maintenance_analysis_text()
         cursor = str(self.state.get("gliner_training_cursor", "")).strip()
-        # Issue 6: Load the episode IDs seen at the previous cursor boundary so
-        # we can exclude them from the >= query and avoid re-processing them.
-        cursor_seen_ids: list[str] = list(self.state.get("gliner_training_cursor_seen_ids", []))
+        # Load the episode IDs seen at the previous cursor boundary so we can
+        # exclude them from the >= query and avoid re-processing them.
+        # Guard against corrupt state (non-list or non-string elements).
+        _raw_seen = self.state.get("gliner_training_cursor_seen_ids", [])
+        cursor_seen_ids: list[str] = [
+            str(x) for x in (_raw_seen if isinstance(_raw_seen, list) else [])
+            if x and str(x).strip()
+        ]
 
         # Only accumulate episodes older than 24 hours, giving the nightly audit
         # time to review and quarantine bad data before it enters training.
