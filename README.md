@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> · <a href="#mcp-integration">MCP</a> · <a href="#python-sdk">Python SDK</a> · <a href="#http-api">HTTP API</a> · <a href="#architecture">Architecture</a> · <a href="#roadmap">Roadmap</a>
+  <a href="#quick-start">Quick Start</a> · <a href="#mcp-integration">MCP</a> · <a href="#python-sdk">Python SDK</a> · <a href="#http-api">HTTP API</a> · <a href="#-the-loop">The Loop</a> · <a href="#roadmap">Roadmap</a>
 </p>
 
 ---
@@ -60,7 +60,7 @@ MollyGraph: graph exact AND vector similarity fire **simultaneously**. Results m
 
 > **100% hit rate · 92% combined retrieval · 3.8% RELATED_TO fallback (down from 8.4%)**
 
-### 🧬 Live Graph
+### 📊 Live Graph
 ```
 975 entities  ·  2,701 relationships  ·  28 types  ·  2.77 density
 1,798 training examples  ·  5 LoRA runs  ·  Last F1 gain: +4.32%
@@ -282,12 +282,19 @@ MOLLYGRAPH_OLLAMA_EMBED_MODEL=nomic-embed-text
 
 ```env
 # GLiNER2 — self-improving LoRA loop
-# Starts with base model, accumulates training data, fine-tunes on your graph
 GLINER_MODEL=fastino/gliner2-large-v1
-SPACY_ENRICHMENT_ENABLED=true  # SpaCy enrichment pass (on by default)
+SPACY_ENRICHMENT_ENABLED=true       # spaCy NER enrichment (on by default)
+
+# GLiREL — dedicated relation extraction (second pass)
+MOLLYGRAPH_GLIREL_ENABLED=true
+MOLLYGRAPH_GLIREL_MODEL=jackboyla/glirel-large-v0
+MOLLYGRAPH_GLIREL_CONFIDENCE=0.15   # minimum confidence to surface
+MOLLYGRAPH_GLIREL_TRAINING_THRESHOLD=0.4  # confidence gate for silver-label training data
+MOLLYGRAPH_GLIREL_LLM_SYNONYMS=true # LLM-assisted synonym generation on type adoption
 
 # Training
-TRAINING_MIN_EXAMPLES=100      # examples before first fine-tune
+GLINER_MIN_NEW_EXAMPLES=500    # new examples since last run to trigger training
+GLINER_MAX_TRAINING_EXAMPLES=10000  # sliding window cap
 TRAINING_EVAL_SPLIT=0.2        # held-out benchmark fraction
 ```
 
