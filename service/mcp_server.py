@@ -65,21 +65,65 @@ async def search_facts(query: str) -> str:
 
 
 @mcp.tool()
-async def search_nodes(query: str, limit: int = 20) -> str:
-    # Backward compatible alias over /query response entities.
-    resp = await http_client.get("/query", params={"q": query})
-    _ensure_ok(resp)
-    data = resp.json()
+async def search_nodes(query: str, node_type: str = "", limit: int = 20) -> str:
+    """Search Neo4j nodes by name and optional type via the /entities endpoint.
 
-    names: list[str] = []
-    for item in data.get("results", []):
-        name = str(item.get("entity") or "").strip()
-        if name:
-            names.append(name)
+    Returns a newline-delimited list of matching entity names (and types).
+    Falls back to the /query response if /entities is unavailable.
 
-    if not names:
+    Args:
+        query:     Substring to match against entity names (case-insensitive).
+        node_type: Optional entity type filter, e.g. 'Person' or 'Technology'.
+        limit:     Maximum number of results to return (default 20, max 50).
+    """
+    effective_limit = max(1, min(int(limit), 50))
+
+    # Build request parameters for GET /entities.
+    params: dict = {"limit": effective_limit, "offset": 0}
+    if node_type:
+        params["type"] = node_type
+
+    try:
+        resp = await http_client.get("/entities", params=params)
+        _ensure_ok(resp)
+        data = resp.json()
+        entities: list[dict] = data.get("entities", [])
+
+        # Filter by name substring (server returns all of a given type;
+        # we narrow down client-side so the limit is applied after filtering).
+        query_lower = query.strip().lower()
+        matches: list[str] = []
+        for ent in entities:
+            name = str(ent.get("name") or "").strip()
+            if not name:
+                continue
+            if query_lower and query_lower not in name.lower():
+                continue
+            etype = str(ent.get("entity_type") or "").strip()
+            matches.append(f"{name} [{etype}]" if etype else name)
+            if len(matches) >= effective_limit:
+                break
+
+        if matches:
+            return "\n".join(matches)
+        return f"no entities matched {query!r}" + (f" (type={node_type!r})" if node_type else "")
+
+    except Exception:
+        # Graceful fallback: attempt /query if /entities is not yet available.
+        try:
+            resp = await http_client.get("/query", params={"q": query})
+            _ensure_ok(resp)
+            data = resp.json()
+            names: list[str] = []
+            for item in data.get("results", []):
+                name = str(item.get("entity") or "").strip()
+                if name:
+                    names.append(name)
+            if names:
+                return "\n".join(names[:effective_limit])
+        except Exception:
+            pass
         return f"no entities matched {query!r}"
-    return "\n".join(names[: max(1, limit)])
 
 
 @mcp.tool()
