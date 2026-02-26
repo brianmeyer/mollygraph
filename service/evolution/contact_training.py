@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,75 @@ _PERSON_LABEL = "Person"
 _ORG_LABEL = "Organization"
 _PLACE_LABEL = "Place"
 _CONCEPT_LABEL = "Concept"
+
+
+@dataclass(frozen=True)
+class RelationshipNoteNormalization:
+    text: str | None
+    high_confidence: bool
+    school: str | None = None
+    campus: str | None = None
+    cohort: str | None = None
+
+
+_KELLOGG_CANONICAL = "Kellogg School of Management"
+_KELLOGG_ALIASES = (
+    "kellogg",
+    "kellogg emba",
+    "northwestern kellogg",
+    "northwestern university - kellogg",
+)
+_CAMPUS_ALIASES: dict[str, tuple[str, ...]] = {
+    "Miami": ("miami", "miami campus"),
+    "Evanston": ("evanston", "evanston campus"),
+    "Chicago": ("chicago", "chicago campus", "downtown chicago"),
+}
+
+
+def _normalize_relationship_note(note: str | None) -> RelationshipNoteNormalization:
+    """Normalize relationship notes and gate noisy classmate assertions.
+
+    LinkedIn note strings can be noisy. We only emit classmate assertions for
+    high-confidence patterns (explicit classmate/cohort/alumni language).
+    """
+    raw = str(note or "").strip()
+    if not raw:
+        return RelationshipNoteNormalization(text=None, high_confidence=False)
+
+    lowered = raw.lower()
+    has_kellogg = any(alias in lowered for alias in _KELLOGG_ALIASES)
+    has_classmate_signal = any(token in lowered for token in ("classmate", "cohort", "alumni", "emba"))
+
+    cohort: str | None = None
+    m = re.search(r"\bclass\s+of\s+(20\d{2})\b", lowered)
+    if m:
+        cohort = f"Class of {m.group(1)}"
+
+    campus: str | None = None
+    for canonical, aliases in _CAMPUS_ALIASES.items():
+        if any(alias in lowered for alias in aliases):
+            campus = canonical
+            break
+
+    if has_kellogg and has_classmate_signal:
+        qualifiers: list[str] = []
+        if campus:
+            qualifiers.append(f"{campus} campus")
+        if cohort:
+            qualifiers.append(cohort)
+        suffix = f" ({', '.join(qualifiers)})" if qualifiers else ""
+        return RelationshipNoteNormalization(
+            text=f"classmates from {_KELLOGG_CANONICAL}{suffix}",
+            high_confidence=True,
+            school=_KELLOGG_CANONICAL,
+            campus=campus,
+            cohort=cohort,
+        )
+
+    if has_classmate_signal:
+        return RelationshipNoteNormalization(text=raw, high_confidence=True)
+
+    return RelationshipNoteNormalization(text=None, high_confidence=False)
 
 
 # ── Structured field extraction ───────────────────────────────────────────────
@@ -109,7 +179,7 @@ def _build_natural_sentences(
     title: str | None,
     location: str | None,
     owner_name: str | None,
-    relationship_note: str | None,
+    relationship_note: RelationshipNoteNormalization,
 ) -> list[str]:
     """Build GLiREL-friendly natural language sentences from parsed fields."""
     sentences: list[str] = []
@@ -127,8 +197,8 @@ def _build_natural_sentences(
         sentences.append(f"{contact_name} is based in {location}.")
 
     # Relationship sentence
-    if owner_name and relationship_note:
-        sentences.append(f"{contact_name} and {owner_name} are {relationship_note}.")
+    if owner_name and relationship_note.high_confidence and relationship_note.text:
+        sentences.append(f"{contact_name} and {owner_name} are {relationship_note.text}.")
     elif owner_name:
         sentences.append(f"{contact_name} is a contact of {owner_name}.")
 
@@ -147,7 +217,7 @@ def _build_entity_spans(
     title: str | None,
     location: str | None,
     owner_name: str | None,
-    relationship_note: str | None,
+    relationship_note: RelationshipNoteNormalization,
 ) -> list[dict[str, str]]:
     """Build clean entity-span dicts from structured fields."""
     entities: list[dict[str, str]] = []
@@ -168,6 +238,8 @@ def _build_entity_spans(
         _add(location, _PLACE_LABEL)
     if owner_name:
         _add(owner_name, _PERSON_LABEL)
+    if relationship_note.school:
+        _add(relationship_note.school, _ORG_LABEL)
 
     return entities
 
@@ -200,7 +272,7 @@ def reformat_contact_text(content: str) -> str | None:
     )
     location = _extract_field(content, "Location") or _extract_field(content, "City")
     owner_name = _extract_owner_name(content)
-    relationship_note = _extract_relationship_note(content)
+    relationship_note = _normalize_relationship_note(_extract_relationship_note(content))
 
     sentences = _build_natural_sentences(
         contact_name=contact_name,
@@ -228,7 +300,7 @@ def generate_contact_ner_examples(content: str) -> list[dict[str, Any]]:
     title = _extract_field(content, "Title") or _extract_field(content, "Role") or _extract_field(content, "Job Title")
     location = _extract_field(content, "Location") or _extract_field(content, "City")
     owner_name = _extract_owner_name(content)
-    relationship_note = _extract_relationship_note(content)
+    relationship_note = _normalize_relationship_note(_extract_relationship_note(content))
 
     sentences = _build_natural_sentences(
         contact_name=contact_name,
