@@ -21,6 +21,7 @@ from typing import Any
 
 import config as service_config
 from extraction.glirel_enrichment import GLiRELEnrichment
+from extraction.relation_gate import GateResult, get_gate
 from memory.models import Entity, Episode, ExtractionJob, Relationship
 from memory.graph import BiTemporalGraph
 from memory.vector_store import VectorStore
@@ -494,11 +495,18 @@ class ExtractionPipeline:
                     speaker,
                 )
 
-            relationships, fallback_count = self._build_relationships(
+            # Build name→entity_type map so the relation gate can assess type triples.
+            entity_type_map: dict[str, str] = {
+                self._normalize(e.name): e.entity_type for e in stored_entities
+            }
+
+            relationships, fallback_count, gate_quarantine_count, gate_skip_count = self._build_relationships(
                 raw_relations=raw_relations_with_source,
                 canonical_names=canonical_names,
                 reference_time=job.reference_time,
                 context=job.content,
+                entity_type_map=entity_type_map,
+                ingest_source=ingest_source,
             )
 
             # ── Finalize episode: mark complete + set entities_extracted ──────
@@ -595,6 +603,8 @@ class ExtractionPipeline:
                     "entities": len(stored_entities),
                     "relationships": len(relationships),
                     "fallbacks": fallback_count,
+                    "gate_quarantined": gate_quarantine_count,
+                    "gate_skipped": gate_skip_count,
                     "glirel_relations_found": glirel_relations_found,
                     "glirel_overrides": glirel_overrides,
                     "glirel_additions": glirel_additions,
@@ -880,11 +890,26 @@ class ExtractionPipeline:
         canonical_names: dict[str, str],
         reference_time: datetime,
         context: str,
-    ) -> tuple[list[Relationship], int]:
-        """Build relationships list. Returns (relationships, fallback_count)."""
+        entity_type_map: dict[str, str] | None = None,
+        ingest_source: str = "manual",
+    ) -> tuple[list[Relationship], int, int, int]:
+        """Build relationships list.
+
+        Returns (relationships, fallback_count, gate_quarantine_count, gate_skip_count).
+
+        The gate never silently drops signals:
+        - allow      → appended normally
+        - quarantine → appended with audit_status='quarantined' + suggestion signal
+        - skip       → NOT appended, but suggestion signal is emitted so evolution learns
+        """
         relationships: list[Relationship] = []
         seen: set[tuple[str, str, str]] = set()
         fallback_count = 0
+        gate_quarantine_count = 0
+        gate_skip_count = 0
+
+        _entity_type_map: dict[str, str] = entity_type_map or {}
+        gate = get_gate()
 
         for item in raw_relations:
             if not isinstance(item, dict):
@@ -920,6 +945,93 @@ class ExtractionPipeline:
 
             score = self._safe_float(item.get("score"), default=0.5)
             relation_source = str(item.get("source") or "gliner2").strip().lower() or "gliner2"
+
+            # ── Soft relation gate ────────────────────────────────────────────
+            head_type = _entity_type_map.get(self._normalize(source_entity), "Concept")
+            tail_type = _entity_type_map.get(self._normalize(target_entity), "Concept")
+
+            gate_result: GateResult = gate.evaluate(
+                head_type=head_type,
+                rel_type=rel_type,
+                tail_type=tail_type,
+                source=ingest_source,
+                confidence=score,
+                context=context[:200],
+            )
+
+            if gate_result.decision == "skip":
+                # Do NOT write, but always emit a suggestion signal so the
+                # evolution pipeline can still learn from this candidate.
+                gate_skip_count += 1
+                log.debug(
+                    "relation_gate skip: %s -[%s]-> %s | reason=%s",
+                    source_entity, rel_type, target_entity, gate_result.reason,
+                )
+                try:
+                    from memory.graph_suggestions import log_relation_gate_decision
+                    log_relation_gate_decision(
+                        head=source_entity,
+                        tail=target_entity,
+                        head_type=head_type,
+                        rel_type=rel_type,
+                        tail_type=tail_type,
+                        decision="skip",
+                        reason=gate_result.reason,
+                        gate_score=gate_result.score,
+                        confidence=score,
+                        source=ingest_source,
+                        context=context[:200],
+                    )
+                except Exception:
+                    log.debug("relation_gate: failed to log skip signal", exc_info=True)
+                continue  # skip: do not write
+
+            # Build the relationship object; quarantine sets audit_status
+            audit_status: str = "unverified"
+            if gate_result.decision == "quarantine":
+                audit_status = "quarantined"
+                gate_quarantine_count += 1
+                log.debug(
+                    "relation_gate quarantine: %s -[%s]-> %s | reason=%s",
+                    source_entity, rel_type, target_entity, gate_result.reason,
+                )
+                try:
+                    from memory.graph_suggestions import log_relation_gate_decision
+                    log_relation_gate_decision(
+                        head=source_entity,
+                        tail=target_entity,
+                        head_type=head_type,
+                        rel_type=rel_type,
+                        tail_type=tail_type,
+                        decision="quarantine",
+                        reason=gate_result.reason,
+                        gate_score=gate_result.score,
+                        confidence=score,
+                        source=ingest_source,
+                        context=context[:200],
+                    )
+                except Exception:
+                    log.debug("relation_gate: failed to log quarantine signal", exc_info=True)
+                # Emit audit bus signal for monitoring
+                try:
+                    from audit.signals import get_signal_bus
+                    get_signal_bus().publish(
+                        "relationship_quarantined",
+                        {
+                            "head": source_entity,
+                            "tail": target_entity,
+                            "head_type": head_type,
+                            "rel_type": rel_type,
+                            "tail_type": tail_type,
+                            "gate_score": gate_result.score,
+                            "confidence": score,
+                            "source": ingest_source,
+                            "reason": gate_result.reason,
+                        },
+                    )
+                except Exception:
+                    log.debug("relation_gate: failed to publish quarantine signal", exc_info=True)
+
             relationships.append(
                 Relationship(
                     source_entity=source_entity,
@@ -930,10 +1042,11 @@ class ExtractionPipeline:
                     context_snippets=[context[:200]],
                     source=relation_source,
                     episode_ids=[],
+                    audit_status=audit_status,  # type: ignore[arg-type]
                 )
             )
 
-        return relationships, fallback_count
+        return relationships, fallback_count, gate_quarantine_count, gate_skip_count
 
     def _spacy_enrich_entities(self, content: str, gliner_entity_count: int) -> list[dict[str, Any]]:
         """Optional NER enrichment when GLiNER yields sparse extraction."""

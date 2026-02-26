@@ -119,6 +119,47 @@ def log_entity_type_fallback(entity: str, original_type: str, confidence: float,
     )
 
 
+def log_relation_gate_decision(
+    head: str,
+    tail: str,
+    head_type: str,
+    rel_type: str,
+    tail_type: str,
+    decision: str,
+    reason: str,
+    gate_score: float,
+    confidence: float,
+    source: str,
+    context: str = "",
+) -> None:
+    """Log a soft-gate decision (quarantine or skip) as a suggestion signal.
+
+    This keeps the evolution pipeline informed even for relations that were not
+    written to the graph.  Skip signals are candidates for future schema
+    expansion; quarantine signals flag edge-cases that need audit review.
+    """
+    _append_jsonl(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "relation_gate_decision",
+            "head": head,
+            "tail": tail,
+            "head_type": head_type,
+            "rel_type": rel_type,
+            "tail_type": tail_type,
+            "decision": decision,
+            "reason": reason,
+            "gate_score": round(gate_score, 4),
+            "confidence": round(confidence, 4),
+            "source": source,
+            "context": (context or "")[:200],
+            "suggestion": (
+                f"Gate {decision} for {head_type}-[{rel_type}]->{tail_type}: {reason}"
+            ),
+        }
+    )
+
+
 def log_repeated_related_to(head: str, tail: str, mention_count: int) -> None:
     """Log hotspot when RELATED_TO reaches 3+ mentions."""
     _append_jsonl(
@@ -789,6 +830,7 @@ __all__ = [
     "get_suggestions",
     "init_adopted_schema",
     "log_entity_type_fallback",
+    "log_relation_gate_decision",
     "log_relationship_fallback",
     "log_repeated_related_to",
     "persist_glirel_synonyms_for_relation",

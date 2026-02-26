@@ -224,6 +224,28 @@ AUDIT_AUTO_DELETE_PCT = float(os.environ.get("MOLLYGRAPH_AUDIT_AUTO_DELETE_PCT",
 AUDIT_AUTO_DELETE_MIN = int(os.environ.get("MOLLYGRAPH_AUDIT_AUTO_DELETE_MIN", "3"))
 AUDIT_AUTO_DELETE_MAX = int(os.environ.get("MOLLYGRAPH_AUDIT_AUTO_DELETE_MAX", "15"))
 
+# ── Relation soft gate ───────────────────────────────────────────────────────
+# Pre-write semantic gate that scores each relation candidate before the graph
+# upsert.  Decisions: allow | quarantine | skip+signal.  Never silently drops.
+RELATION_SOFT_GATE_ENABLED = os.environ.get(
+    "MOLLYGRAPH_RELATION_SOFT_GATE_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Plausibility score above which a relation is written normally.
+RELATION_GATE_ALLOW_THRESHOLD = float(
+    os.environ.get("MOLLYGRAPH_RELATION_GATE_ALLOW_THRESHOLD", "0.45")
+)
+# Plausibility score above which a relation is quarantined (written but flagged).
+# Below both thresholds → skip (but suggestion signal is always emitted).
+RELATION_GATE_QUARANTINE_THRESHOLD = float(
+    os.environ.get("MOLLYGRAPH_RELATION_GATE_QUARANTINE_THRESHOLD", "0.25")
+)
+# Extractor confidence that can override a "skip" decision to "quarantine",
+# ensuring very confident but unusual triples are preserved for audit review.
+RELATION_GATE_HIGH_CONF_OVERRIDE = float(
+    os.environ.get("MOLLYGRAPH_RELATION_GATE_HIGH_CONF_OVERRIDE", "0.85")
+)
+
 # ── Ensure runtime dirs exist ────────────────────────────────────────────────
 for _d in (
     GRAPH_MEMORY_DIR,
