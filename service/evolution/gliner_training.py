@@ -1485,27 +1485,49 @@ class GLiNERTrainingService:
             from audit.llm_audit import call_audit_model, build_audit_prompt
             from runtime_graph import require_graph_instance
             
-            # Sample recent relationships for quality check
-            rels = require_graph_instance().get_relationships_for_audit(limit=40)
+            # Sample recent relationships for quality check.
+            # Keep sample modest to avoid JSON truncation/parse failures.
+            rels = require_graph_instance().get_relationships_for_audit(limit=25)
             if not rels:
                 return {"passed": True, "reason": "no_relationships_to_audit"}
-            
-            prompt = build_audit_prompt(rels)
-            
-            # Call Kimi for pre-training audit
+
+            # Call pretrain audit model with retry + fallback on parse failure.
             audit_model = getattr(config, "AUDIT_MODEL_PRETRAIN", "kimi-k2.5")
-            llm_result = await call_audit_model(prompt, schedule="nightly", model_override=audit_model)
-            
-            content = str(llm_result.get("content") or "")
-            provider = str(llm_result.get("provider") or "unknown")
-            fallback = str(llm_result.get("fallback") or "")
-            
-            # Parse verdicts
+            fallback_model = getattr(config, "AUDIT_MODEL_PRETRAIN_FALLBACK", "gemini-2.5-flash")
+
             from audit.llm_audit import parse_verdicts
-            verdicts = parse_verdicts(content, len(rels))
-            
+            verdicts: list[dict[str, Any]] = []
+            provider = "unknown"
+            fallback = ""
+
+            async def _invoke_and_parse(model_name: str, sample: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, str]:
+                prompt = build_audit_prompt(sample)
+                llm_result = await call_audit_model(prompt, schedule="nightly", model_override=model_name)
+                content = str(llm_result.get("content") or "")
+                prov = str(llm_result.get("provider") or "unknown")
+                fb = str(llm_result.get("fallback") or "")
+                return parse_verdicts(content, len(sample)), prov, fb
+
+            # Attempt 1: primary model on full sample.
+            verdicts, provider, fallback = await _invoke_and_parse(audit_model, rels)
+
+            # Attempt 2: primary model on smaller sample (reduce truncation risk).
+            if not verdicts and len(rels) > 15:
+                smaller = rels[:15]
+                verdicts, provider, fallback = await _invoke_and_parse(audit_model, smaller)
+                rels = smaller if verdicts else rels
+
+            # Attempt 3: fallback model if primary still unparsable.
+            if not verdicts and fallback_model and fallback_model != audit_model:
+                verdicts, provider, fallback = await _invoke_and_parse(fallback_model, rels)
+
             if not verdicts:
-                return {"passed": False, "reason": "audit_parse_failed", "provider": provider}
+                return {
+                    "passed": False,
+                    "reason": "audit_parse_failed",
+                    "provider": provider,
+                    "fallback": fallback,
+                }
             
             # Calculate quality metrics
             total = len(verdicts)
