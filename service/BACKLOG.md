@@ -93,7 +93,7 @@ Status legend:
 - Graph-aware reranker is live.
 - Next: robust blended policy with Jina cross-encoder at larger scale.
 
-### 13) Decision Traces — 📝
+### 13) Decision Traces — 🔄
 - Planned major differentiator. Implement per `DECISION_TRACES_PLAN.md` phases 1–4.
 
 ### 14) API ergonomics — 📝

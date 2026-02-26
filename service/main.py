@@ -372,10 +372,12 @@ async def health() -> dict[str, Any]:
 from api import query as _query_module
 from api import ingest as _ingest_module
 from api import admin as _admin_module
+from api import decisions as _decisions_module
 
 app.include_router(_query_module.router)
 app.include_router(_ingest_module.router)
 app.include_router(_admin_module.router)
+app.include_router(_decisions_module.router)
 
 
 if __name__ == "__main__":

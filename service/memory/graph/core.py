@@ -4,6 +4,7 @@ from __future__ import annotations
 from neo4j import GraphDatabase
 
 from .constants import VALID_REL_TYPES, RELATION_TIERS
+from .decisions import DecisionMixin
 from .entities import EntityMixin
 from .episodes import EpisodeMixin
 from .maintenance import MaintenanceMixin
@@ -16,7 +17,14 @@ from .relationships import RelationshipMixin
 _ALL_INDEXED_REL_TYPES: frozenset[str] = frozenset(VALID_REL_TYPES) | frozenset(RELATION_TIERS.keys())
 
 
-class BiTemporalGraph(EntityMixin, RelationshipMixin, EpisodeMixin, QueryMixin, MaintenanceMixin):
+class BiTemporalGraph(
+    EntityMixin,
+    RelationshipMixin,
+    EpisodeMixin,
+    QueryMixin,
+    DecisionMixin,
+    MaintenanceMixin,
+):
     """Neo4j graph operations with bi-temporal tracking."""
     def __init__(self, uri: str, user: str, password: str):
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -34,6 +42,18 @@ class BiTemporalGraph(EntityMixin, RelationshipMixin, EpisodeMixin, QueryMixin, 
             session.run("CREATE INDEX episode_id IF NOT EXISTS FOR (ep:Episode) ON (ep.id)")
             session.run("CREATE INDEX episode_occurred IF NOT EXISTS FOR (ep:Episode) ON (ep.occurred_at)")
             session.run("CREATE INDEX episode_ingested IF NOT EXISTS FOR (ep:Episode) ON (ep.ingested_at)")
+
+            # Decision indexes
+            session.run(
+                "CREATE CONSTRAINT decision_id_unique IF NOT EXISTS "
+                "FOR (d:Decision) REQUIRE d.id IS UNIQUE"
+            )
+            session.run("CREATE INDEX decision_timestamp IF NOT EXISTS FOR (d:Decision) ON (d.timestamp)")
+            session.run("CREATE INDEX decision_decided_by IF NOT EXISTS FOR (d:Decision) ON (d.decided_by)")
+            session.run(
+                "CREATE INDEX decision_source_episode_id IF NOT EXISTS "
+                "FOR (d:Decision) ON (d.source_episode_id)"
+            )
 
             # audit_status indexes for every known relationship type.
             # Neo4j syntax: FOR ()-[r:TYPE]-() ON (r.property)
