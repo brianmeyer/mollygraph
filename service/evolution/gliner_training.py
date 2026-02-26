@@ -1502,11 +1502,15 @@ class GLiNERTrainingService:
 
             async def _invoke_and_parse(model_name: str, sample: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, str]:
                 prompt = build_audit_prompt(sample)
-                llm_result = await call_audit_model(prompt, schedule="nightly", model_override=model_name)
-                content = str(llm_result.get("content") or "")
-                prov = str(llm_result.get("provider") or "unknown")
-                fb = str(llm_result.get("fallback") or "")
-                return parse_verdicts(content, len(sample)), prov, fb
+                try:
+                    llm_result = await call_audit_model(prompt, schedule="nightly", model_override=model_name)
+                    content = str(llm_result.get("content") or "")
+                    prov = str(llm_result.get("provider") or "unknown")
+                    fb = str(llm_result.get("fallback") or "")
+                    return parse_verdicts(content, len(sample)), prov, fb
+                except Exception as _exc:
+                    log.warning("Pre-training audit model invocation failed for %s: %s", model_name, _exc)
+                    return [], str(model_name or "unknown"), ""
 
             # Attempt 1: primary model on full sample.
             verdicts, provider, fallback = await _invoke_and_parse(audit_model, rels)
@@ -1522,11 +1526,23 @@ class GLiNERTrainingService:
                 verdicts, provider, fallback = await _invoke_and_parse(fallback_model, rels)
 
             if not verdicts:
+                # Deterministic fallback: avoid blocking LoRA solely on parser/model formatting failures.
+                rel_types = [str(r.get("rel_type") or r.get("type") or "").upper() for r in rels]
+                related_to = sum(1 for t in rel_types if t == "RELATED_TO")
+                related_to_ratio = (related_to / len(rel_types)) if rel_types else 0.0
+                passed = related_to_ratio <= 0.20
                 return {
-                    "passed": False,
-                    "reason": "audit_parse_failed",
+                    "passed": passed,
+                    "reason": (
+                        f"audit_parse_failed_fallback_related_to_ratio={related_to_ratio:.2f}"
+                        if passed
+                        else f"audit_parse_failed_fallback_blocked_related_to_ratio={related_to_ratio:.2f}"
+                    ),
                     "provider": provider,
                     "fallback": fallback,
+                    "fallback_mode": "deterministic",
+                    "total_audited": len(rel_types),
+                    "related_to_ratio": related_to_ratio,
                 }
             
             # Calculate quality metrics
