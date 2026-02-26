@@ -107,6 +107,17 @@ class EmbeddingReindexRequest(BaseModel):
     dry_run: bool = False
 
 
+class InfraHealthEvaluateRequest(BaseModel):
+    dry_run: bool = False
+    enable_llm_advisory: bool | None = None
+    allow_rebuild: bool = False
+
+
+class ReconcileVectorsRequest(BaseModel):
+    mode: str = Field(default="orphan_cleanup")
+    force: bool = False
+
+
 class ExtractorConfigRequest(BaseModel):
     backend: str = Field(default="gliner2")
     model: str | None = None

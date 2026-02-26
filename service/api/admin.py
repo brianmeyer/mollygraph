@@ -40,6 +40,7 @@ from extractor_schema_registry import (
     upload_custom_extractor_schema,
 )
 from maintenance.auditor import run_maintenance_cycle
+from maintenance.infra_health import evaluate_live_infra_health, InfraHealthDecision
 from memory import extractor as memory_extractor
 from memory.graph_suggestions import build_suggestion_digest
 from metrics.model_health import model_health_monitor
@@ -62,6 +63,8 @@ from api.deps import (
     EmbeddingConfigRequest,
     EmbeddingModelRequest,
     EmbeddingReindexRequest,
+    InfraHealthEvaluateRequest,
+    ReconcileVectorsRequest,
     ExtractorConfigRequest,
     ExtractorModelRequest,
     ExtractorPrefetchRequest,
@@ -881,9 +884,50 @@ async def backfill_temporal_properties(_api_key: str = Depends(verify_api_key)) 
     }
 
 
+@router.post("/maintenance/infra-health/evaluate")
+async def evaluate_infra_health(
+    req: InfraHealthEvaluateRequest,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Evaluate infra health with deterministic policy (LLM advisory optional)."""
+    require_runtime_ready()
+    graph = get_graph_instance()
+    vector_store = get_vector_store_instance()
+    queue = get_queue_instance()
+    if graph is None or vector_store is None or queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    evaluation = await evaluate_live_infra_health(
+        graph,
+        vector_store,
+        queue,
+        allow_rebuild=req.allow_rebuild,
+        llm_advisory_enabled=req.enable_llm_advisory,
+    )
+
+    return {
+        "status": "dry_run" if req.dry_run else "ok",
+        "metrics": _json_safe(evaluation.metrics.__dict__),
+        "deterministic_decision": evaluation.deterministic_decision.value,
+        "reasons": evaluation.reasons,
+        "llm_advisory": evaluation.llm_advisory,
+        "final_action": evaluation.final_action.value,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
 @router.post("/maintenance/reconcile-vectors")
-async def reconcile_vectors(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
-    """Remove vector store entries with no matching Neo4j entity."""
+async def reconcile_vectors(
+    req: ReconcileVectorsRequest | None = None,
+    _api_key: str = Depends(verify_api_key),
+) -> dict[str, Any]:
+    """Remove vector store entries with no matching Neo4j entity.
+
+    Notes:
+    - mode=orphan_cleanup (default): existing behavior (list vector ids and remove orphans).
+    - mode=rebuild: fallback for backends like zvec that cannot list all ids.
+      Rebuild is gated by deterministic infra health unless force=true.
+    """
     require_runtime_ready()
     graph = get_graph_instance()
     vector_store = get_vector_store_instance()
@@ -891,19 +935,68 @@ async def reconcile_vectors(_api_key: str = Depends(verify_api_key)) -> dict[str
         raise HTTPException(status_code=503, detail="Service not ready")
 
     try:
+        req = req or ReconcileVectorsRequest()
+        mode = (req.mode or "orphan_cleanup").strip().lower()
+        if mode not in {"orphan_cleanup", "rebuild"}:
+            raise HTTPException(status_code=400, detail="mode must be orphan_cleanup or rebuild")
+
         neo4j_rows = await asyncio.to_thread(graph.list_entities_for_embedding, 500_000)
         neo4j_ids: set[str] = {row["entity_id"] for row in neo4j_rows}
 
-        all_vec_ids: list[str] | None = await asyncio.to_thread(
-            vector_store.list_all_entity_ids
-        )
+        if mode == "rebuild":
+            evaluation = await evaluate_live_infra_health(graph, vector_store, get_queue_instance(), allow_rebuild=True)
+            rebuild_allowed = req.force or evaluation.final_action == InfraHealthDecision.REBUILD_VECTORS
+            if not rebuild_allowed:
+                return {
+                    "status": "blocked",
+                    "message": "rebuild mode requires deterministic infra-health rebuild decision or force=true",
+                    "deterministic_decision": evaluation.final_action.value,
+                    "reasons": evaluation.reasons,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+
+            # Best-effort full re-embed from Neo4j (fallback path for zvec where full vector ID listing is unavailable)
+            reindexed = 0
+            failed = 0
+            for row in neo4j_rows:
+                entity_id = str(row.get("entity_id") or "").strip()
+                name = str(row.get("name") or "").strip()
+                if not entity_id or not name:
+                    failed += 1
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        vector_store.add_entity,
+                        entity_id,
+                        name,
+                        str(row.get("entity_type") or "Concept"),
+                        str(row.get("content") or name),
+                    )
+                    reindexed += 1
+                except Exception:
+                    failed += 1
+            optimize_result = await asyncio.to_thread(vector_store.optimize)
+            return {
+                "status": "ok",
+                "mode": "rebuild",
+                "deterministic_decision": evaluation.final_action.value,
+                "reasons": evaluation.reasons,
+                "neo4j_entities": len(neo4j_ids),
+                "reindexed": reindexed,
+                "failed": failed,
+                "optimize": _json_safe(optimize_result),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+
+        all_vec_ids: list[str] | None = await asyncio.to_thread(vector_store.list_all_entity_ids)
 
         if all_vec_ids is None:
             return {
                 "status": "partial",
+                "mode": "orphan_cleanup",
                 "message": (
-                    "Active vector backend does not support listing all entity ids. "
-                    "Reconciliation skipped."
+                    "Active vector backend does not support listing all entity ids (zvec limitation). "
+                    "Use mode=rebuild as a fallback path when infra-health allows it."
                 ),
                 "neo4j_entities": len(neo4j_ids),
                 "orphans_removed": 0,
@@ -925,6 +1018,7 @@ async def reconcile_vectors(_api_key: str = Depends(verify_api_key)) -> dict[str
         )
         return {
             "status": "ok",
+            "mode": "orphan_cleanup",
             "vectors_checked": len(all_vec_ids),
             "neo4j_entities": len(neo4j_ids),
             "orphans_found": len(orphan_ids),
@@ -1006,6 +1100,29 @@ async def trigger_nightly_maintenance(
         lora_status_str: str | None = None
         error_str: str | None = None
         _audit_result: dict[str, Any] = {}
+        infra_health_result: dict[str, Any] = {}
+
+        try:
+            # Step 0: deterministic infra health evaluation (advisory only in nightly payload)
+            queue = get_queue_instance()
+            vs = get_vector_store_instance()
+            if graph is not None and vs is not None and queue is not None:
+                eval_result = await evaluate_live_infra_health(
+                    graph,
+                    vs,
+                    queue,
+                    allow_rebuild=False,
+                    llm_advisory_enabled=False,
+                )
+                infra_health_result = {
+                    "deterministic_decision": eval_result.deterministic_decision.value,
+                    "reasons": eval_result.reasons,
+                    "final_action": eval_result.final_action.value,
+                    "metrics": _json_safe(eval_result.metrics.__dict__),
+                }
+        except Exception:
+            log.warning("Nightly infra health step failed", exc_info=True)
+            infra_health_result = {"status": "error"}
 
         try:
             # Step 1: LLM audit
@@ -1084,6 +1201,7 @@ async def trigger_nightly_maintenance(
             relationships_approved=int(_audit_result.get("relationships_approved", 0)),
             relationships_flagged=int(_audit_result.get("relationships_flagged", 0)),
             relationships_reclassified=int(_audit_result.get("relationships_reclassified", 0)),
+            infra_health=infra_health_result,
         )
         log.info("Nightly maintenance pipeline complete: %s", overall)
 
@@ -1091,5 +1209,5 @@ async def trigger_nightly_maintenance(
     return {
         "status": "nightly_maintenance_triggered",
         "timestamp": datetime.now(UTC).isoformat(),
-        "sequence": ["llm_audit", "model_health_check", "stale_training_cleanup", "lora_pipeline"],
+        "sequence": ["infra_health_eval", "llm_audit", "model_health_check", "stale_training_cleanup", "lora_pipeline"],
     }

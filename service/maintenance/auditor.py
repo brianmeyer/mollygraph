@@ -10,10 +10,12 @@ from evolution.gliner_training import (
     cleanup_stale_gliner_training_examples,
     run_gliner_finetune_pipeline,
 )
+from maintenance.infra_health import evaluate_live_infra_health
 from maintenance.lock import maintenance_lock
 from memory.graph_suggestions import build_suggestion_digest, run_auto_adoption
 from runtime_graph import require_graph_instance
 from runtime_pipeline import get_pipeline_instance
+from runtime_queue import get_queue_instance
 from runtime_vector_store import get_vector_store_instance
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,27 @@ async def _run_maintenance_cycle_inner() -> dict[str, Any]:
         "orphans_deleted": 0,
         "self_refs_deleted": 0,
     }
+
+    infra_health: dict[str, Any] = {}
+    try:
+        queue = get_queue_instance()
+        vs = get_vector_store_instance()
+        if vs is not None and queue is not None:
+            eval_result = await evaluate_live_infra_health(
+                graph,
+                vs,
+                queue,
+                allow_rebuild=False,
+                llm_advisory_enabled=False,
+            )
+            infra_health = {
+                "deterministic_decision": eval_result.deterministic_decision.value,
+                "reasons": eval_result.reasons,
+                "final_action": eval_result.final_action.value,
+                "metrics": eval_result.metrics.__dict__,
+            }
+    except Exception:
+        log.warning("Infra health evaluation failed in maintenance cycle", exc_info=True)
 
     try:
         cleanup["strength_decay_updates"] = graph.run_strength_decay_sync()
@@ -121,6 +144,7 @@ async def _run_maintenance_cycle_inner() -> dict[str, Any]:
     return {
         "started_at": started_at,
         "completed_at": completed_at,
+        "infra_health": infra_health,
         "cleanup": cleanup,
         "audit": audit_result,
         "refresh_embeddings": refresh_embeddings_result,

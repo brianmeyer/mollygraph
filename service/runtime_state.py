@@ -34,6 +34,7 @@ def record_nightly_result(
     relationships_approved: int = 0,
     relationships_flagged: int = 0,
     relationships_reclassified: int = 0,
+    infra_health: dict[str, Any] | None = None,
 ) -> None:
     """Record a nightly pipeline run result (success or failure)."""
     global _NIGHTLY_RESULTS
@@ -47,6 +48,7 @@ def record_nightly_result(
         "relationships_approved": relationships_approved,
         "relationships_flagged": relationships_flagged,
         "relationships_reclassified": relationships_reclassified,
+        "infra_health": infra_health or {},
     }
     with _LOCK:
         _NIGHTLY_RESULTS.append(entry)
