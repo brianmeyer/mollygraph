@@ -22,6 +22,20 @@ MollyGraph now includes a deterministic infra health policy at `maintenance/infr
 
 Why this exists: zvec does not support `list_all_entity_ids`, so full orphan reconciliation is unavailable on that backend.
 
+## GLiNER nightly training: auto-rebalance + promotion diagnostics
+
+The nightly LoRA pipeline now runs an automatic, deterministic pre-train rebalance before train/eval split generation:
+
+- Caps dominant relation labels (including `WORKS_AT`) using `MOLLYGRAPH_TRAIN_REBALANCE_WORKSAT_CAP` and `MOLLYGRAPH_TRAIN_REBALANCE_MAX_RATIO`.
+- Upsamples target underrepresented labels (default: `CLASSMATE_OF, STUDIED_AT, LOCATED_IN, CONTACT_OF, MEMBER_OF`) via `MOLLYGRAPH_TRAIN_REBALANCE_TARGET_LABELS`, `MOLLYGRAPH_TRAIN_REBALANCE_TARGET_MIN`, and `MOLLYGRAPH_TRAIN_REBALANCE_TARGET_MULTIPLIERS`.
+- Writes rebalance provenance to `~/.graph-memory/training/runs/<run_id>-rebalance.json`.
+
+When a candidate is below promotion threshold, MollyGraph now writes:
+
+- `~/.graph-memory/training/runs/<run_id>-diagnostics.json`
+
+This diagnostics artifact includes combined/entity/relation deltas, top per-type relation F1 gains/regressions, class distribution before/after rebalance, and tuning recommendations. The diagnostics path is persisted in training state metadata (`last_diagnostics_path`) and included in pipeline results.
+
 ## Decision Traces (Phase 1)
 
 New authenticated endpoints:

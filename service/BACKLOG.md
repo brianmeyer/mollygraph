@@ -1,6 +1,6 @@
 # MollyGraph Backlog (Unified)
 
-Last updated: 2026-02-25
+Last updated: 2026-02-26
 
 Status legend:
 - ✅ Done
@@ -21,6 +21,8 @@ Status legend:
 - ✅ Direct contact NER training generator (`contact-ner-*.jsonl`)
 - ✅ Graph-aware reranker enabled and tuned (direct name-match fix)
 - ✅ Nightly audit + LoRA pipeline operational
+- ✅ Automated pre-train rebalance (class-cap + target-label upsampling) with run artifacts
+- ✅ Below-threshold promotion diagnostics (`<run_id>-diagnostics.json`) + metadata path
 - ✅ Contact re-ingestion completed; training examples rebuilt from real contacts
 
 ---
@@ -70,8 +72,11 @@ Status legend:
 
 ## P1 — Training & Audit Reliability
 
-### 8) Pre-training quality gate robustness — 🧪
-- Quarantine/deleted filtering exists; add stronger contradiction negatives and stricter pre-train checks.
+### 8) Pre-training quality gate robustness — ✅
+- Added deterministic pre-train rebalance before split generation in `evolution/gliner_training.py`.
+- Added configurable dominant-class cap (`WORKS_AT`) + target-label upsampling knobs.
+- Added rebalance provenance artifact per run (`training/runs/<run_id>-rebalance.json`).
+- Added below-threshold diagnostics artifact (`training/runs/<run_id>-diagnostics.json`) with per-type deltas and recommendations.
 - Source: `evolution/gliner_training.py`, `AUDIT_QA.md`
 
 ### 9) Audit state concurrency + durability hardening — 📝

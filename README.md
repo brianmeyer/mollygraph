@@ -138,16 +138,21 @@ MOLLYGRAPH_EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-nano
 
 ## Roadmap
 
-- [ ] Quarantine review system — LLM generates yes/no questions for human review of ambiguous relationships
-- [ ] Local-first audit — get ollama models producing reliable structured JSON for zero-cost audits
-- [ ] Decision traces — reasoning chains as first-class graph nodes
-- [ ] Multi-agent memory isolation
-- [ ] Web UI for graph exploration
+The authoritative roadmap now lives in:
+- `service/BACKLOG.md` (unified P0/P1/P2 priorities)
+- `service/DECISION_TRACES_PLAN.md` (Decision Traces phases)
 
-**Implemented (behind feature flags):**
-- Graph-aware reranking — neighborhood density, shortest-path distance, relationship-type relevance (`GRAPH_RERANK_ENABLED`)
-- Jina reranker v2 (`MOLLYGRAPH_RERANKER_ENABLED`)
-- Both designed to activate at scale (5K+ entities)
+**Top priorities right now:**
+- Pre-write semantic relation gate (soft, schema-aware) to prevent nonsense edges before write
+- Source-routed specialized extraction pipeline (contacts/chat/email have different error profiles)
+- Risk-weighted audit selection for high-impact relation types
+- Local-first audit model reliability (Ollama structured JSON path)
+- Decision Traces as first-class graph objects
+
+**Current feature status:**
+- Graph-aware reranking (`GRAPH_RERANK_ENABLED`) — available and in use
+- Jina cross-encoder reranker (`MOLLYGRAPH_RERANKER_ENABLED`) — available, typically enabled at larger scale
+- Nightly audit + LoRA training loop — active
 
 ---
 

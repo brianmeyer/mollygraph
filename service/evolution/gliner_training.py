@@ -6,8 +6,10 @@ engine/infra dependencies removed in favor of a simple state file.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -240,9 +242,12 @@ class GLiNERTrainingService:
                 "message": msg,
             }
 
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
         # ── Pre-split data stats logging ──────────────────────────────────────
         _pre_pos = sum(len(r.get("relations") or []) for r in rows)
         _pre_neg = sum(len(r.get("negative_relations") or []) for r in rows)
+        relation_dist_before = self.relation_distribution(rows)
         log.info("=" * 60)
         log.info("GLiNER fine-tune pipeline starting")
         log.info("  Total examples:    %d (required: %d)", total_rows, required)
@@ -251,8 +256,12 @@ class GLiNERTrainingService:
         log.info("  Eval ratio:        %.2f  seed=%d", GLINER_BENCHMARK_EVAL_RATIO, GLINER_BENCHMARK_SEED)
         log.info("=" * 60)
 
+        rebalanced_rows, rebalance_summary = self.rebalance_training_rows(rows, run_id=run_id)
+        rows_for_split = rebalanced_rows if rebalance_summary.get("enabled") else rows
+        relation_dist_after = self.relation_distribution(rows_for_split)
+
         train_rows, eval_rows = self.split_holdout_rows(
-            rows,
+            rows_for_split,
             eval_ratio=GLINER_BENCHMARK_EVAL_RATIO,
             seed=GLINER_BENCHMARK_SEED,
         )
@@ -392,6 +401,7 @@ class GLiNERTrainingService:
             "calibration": calibration,
             "threshold": threshold,
             "should_deploy": should_deploy,
+            "rebalance": rebalance_summary,
         }
 
         status = "below_threshold"
@@ -468,9 +478,21 @@ class GLiNERTrainingService:
                 self.discard_gliner_candidate_model,
                 Path(candidate_model_ref) if candidate_model_ref else None,
             )
+            diagnostics_path = await asyncio.to_thread(
+                self.write_promotion_diagnostics,
+                run_id,
+                mode,
+                benchmark,
+                threshold,
+                relation_dist_before,
+                relation_dist_after,
+            )
+            payload["diagnostics_path"] = diagnostics_path
             self.state["gliner_last_cycle_status"] = "below_threshold"
+            self.state["gliner_last_diagnostics_path"] = diagnostics_path
             self.state["gliner_last_result"] = (
-                f"GLiNER {mode} candidate rejected (+{combined_improvement:.4f} combined < {threshold:.4f})."
+                f"GLiNER {mode} candidate rejected (+{combined_improvement:.4f} combined < {threshold:.4f}). "
+                f"Diagnostics: {diagnostics_path}"
             )
             self.save_state()
 
@@ -555,7 +577,7 @@ class GLiNERTrainingService:
             _cal_bins = calibration.get("bins") or []
 
             audit_payload: dict[str, Any] = {
-                "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+                "run_id": run_id,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "mode": mode,
@@ -603,6 +625,8 @@ class GLiNERTrainingService:
                 "decision": status,
                 "decision_reason": decision_reason,
                 "status": status,
+                "rebalance": rebalance_summary,
+                "diagnostics_path": payload.get("diagnostics_path"),
                 "deploy_decision": {
                     "should_deploy": status == "deployed",
                     "combined_improvement": float(benchmark.get("combined_improvement", 0.0) or 0.0),
@@ -629,8 +653,10 @@ class GLiNERTrainingService:
             "training_strategy": strategy,
             "benchmark": benchmark,
             "fine_tune": fine_tune,
+            "rebalance": rebalance_summary,
             **({"shadow": payload.get("shadow")} if "shadow" in payload else {}),
             **({"deploy": payload.get("deploy")} if "deploy" in payload else {}),
+            **({"diagnostics_path": payload.get("diagnostics_path")} if payload.get("diagnostics_path") else {}),
         }
         if run_audit_path:
             result["run_audit_path"] = run_audit_path
@@ -2065,6 +2091,183 @@ class GLiNERTrainingService:
         }
 
     @staticmethod
+    def relation_distribution(rows: list[dict[str, Any]]) -> dict[str, int]:
+        dist: dict[str, int] = {}
+        for row in rows:
+            for rel in row.get("relations") or []:
+                if not isinstance(rel, dict):
+                    continue
+                label = str(rel.get("label") or "").strip().upper()
+                if label:
+                    dist[label] = dist.get(label, 0) + 1
+        return dict(sorted(dist.items()))
+
+    @staticmethod
+    def _parse_target_labels(raw: str) -> list[str]:
+        return [x.strip().upper() for x in str(raw or "").split(",") if x.strip()]
+
+    @staticmethod
+    def _parse_target_multipliers(raw: str) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for part in str(raw or "").split(","):
+            item = part.strip()
+            if not item or ":" not in item:
+                continue
+            label, mult = item.split(":", 1)
+            try:
+                out[label.strip().upper()] = max(1.0, float(mult.strip()))
+            except Exception:
+                continue
+        return out
+
+    def write_rebalance_summary(self, run_id: str, summary: dict[str, Any]) -> str:
+        runs_dir = config.GRAPH_MEMORY_DIR / "training" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        out_path = runs_dir / f"{run_id}-rebalance.json"
+        out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        return str(out_path)
+
+    def rebalance_training_rows(
+        self,
+        rows: list[dict[str, Any]],
+        run_id: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        enabled = bool(getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_ENABLED", True))
+        before = self.relation_distribution(rows)
+        summary: dict[str, Any] = {
+            "enabled": enabled,
+            "before": before,
+            "after": before,
+            "dropped": {},
+            "upsampled": {},
+            "artifact_path": None,
+        }
+        if not enabled:
+            return rows, summary
+
+        out_rows = copy.deepcopy(rows)
+        worksat_cap = max(0, int(getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_WORKSAT_CAP", 1200)))
+        max_ratio = max(0.0, min(1.0, float(getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_MAX_RATIO", 0.35))))
+        target_labels = self._parse_target_labels(getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_TARGET_LABELS", ""))
+        target_min = max(0, int(getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_TARGET_MIN", 250)))
+        multipliers = self._parse_target_multipliers(
+            getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_TARGET_MULTIPLIERS", "")
+        )
+
+        total_rel = sum(before.values())
+        ratio_cap = int(math.floor(total_rel * max_ratio)) if total_rel > 0 else 0
+        effective_cap = min(c for c in (worksat_cap, ratio_cap) if c > 0) if (worksat_cap > 0 and ratio_cap > 0) else max(worksat_cap, ratio_cap)
+
+        if effective_cap > 0 and before.get("WORKS_AT", 0) > effective_cap:
+            drop_needed = before["WORKS_AT"] - effective_cap
+            dropped = 0
+            for row in reversed(out_rows):
+                rels = row.get("relations") or []
+                kept: list[Any] = []
+                for rel in rels:
+                    if (
+                        isinstance(rel, dict)
+                        and str(rel.get("label") or "").strip().upper() == "WORKS_AT"
+                        and dropped < drop_needed
+                    ):
+                        dropped += 1
+                        continue
+                    kept.append(rel)
+                row["relations"] = kept
+                if dropped >= drop_needed:
+                    break
+            summary["dropped"]["WORKS_AT"] = dropped
+
+        # Remove empty rows caused by caps.
+        out_rows = [r for r in out_rows if (r.get("relations") or r.get("entities") or r.get("negative_relations"))]
+
+        # Upsample scarce target labels by deterministic row duplication.
+        current = self.relation_distribution(out_rows)
+        for label in target_labels:
+            count = int(current.get(label, 0))
+            mult = float(multipliers.get(label, 1.0))
+            desired = max(target_min, int(math.ceil(count * mult)))
+            deficit = max(0, desired - count)
+            if deficit <= 0:
+                continue
+            source_rows = [r for r in out_rows if any(str(rel.get("label") or "").strip().upper() == label for rel in (r.get("relations") or []) if isinstance(rel, dict))]
+            if not source_rows:
+                continue
+            for i in range(deficit):
+                src = source_rows[i % len(source_rows)]
+                dup = copy.deepcopy(src)
+                dup["episode_id"] = f"{src.get('episode_id', 'rebalance')}:rebalance:{label}:{i+1}"
+                dup["rebalance_source_episode_id"] = src.get("episode_id")
+                dup["rebalance_target_label"] = label
+                out_rows.append(dup)
+            summary["upsampled"][label] = deficit
+            current[label] = count + deficit
+
+        after = self.relation_distribution(out_rows)
+        summary["after"] = after
+        summary["config"] = {
+            "worksat_cap": worksat_cap,
+            "max_ratio": max_ratio,
+            "effective_worksat_cap": effective_cap,
+            "target_labels": target_labels,
+            "target_min": target_min,
+            "target_multipliers": multipliers,
+        }
+        summary["artifact_path"] = self.write_rebalance_summary(run_id, summary)
+        return out_rows, summary
+
+    def write_promotion_diagnostics(
+        self,
+        run_id: str,
+        mode: str,
+        benchmark: dict[str, Any],
+        threshold: float,
+        class_dist_before: dict[str, int],
+        class_dist_after: dict[str, int],
+    ) -> str:
+        improvements = (benchmark.get("per_type_relation_f1") or {}).get("improvement") or {}
+        sorted_types = sorted(
+            ((str(k), float(v or 0.0)) for k, v in improvements.items()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        top_positive = [{"label": k, "delta_f1": round(v, 4)} for k, v in sorted_types[:5]]
+        top_negative = [{"label": k, "delta_f1": round(v, 4)} for k, v in sorted(sorted_types, key=lambda x: x[1])[:5]]
+
+        recommendations: list[str] = []
+        for item in top_negative[:3]:
+            recommendations.append(f"Increase examples for {item['label']} (delta {item['delta_f1']:+.4f}).")
+        scarce = [k for k, v in class_dist_after.items() if v < int(getattr(config, "MOLLYGRAPH_TRAIN_REBALANCE_TARGET_MIN", 250))]
+        if scarce:
+            recommendations.append("Consider stronger upsampling for: " + ", ".join(sorted(scarce[:5])))
+
+        payload = {
+            "run_id": run_id,
+            "mode": mode,
+            "status": "below_threshold",
+            "threshold": float(threshold),
+            "deltas": {
+                "combined": float(benchmark.get("combined_improvement", 0.0) or 0.0),
+                "entity": float(benchmark.get("entity_improvement", 0.0) or 0.0),
+                "relation": float(benchmark.get("relation_improvement", 0.0) or 0.0),
+            },
+            "per_type_f1": {
+                "top_positive": top_positive,
+                "top_negative": top_negative,
+            },
+            "class_distribution": {
+                "before_rebalance": class_dist_before,
+                "after_rebalance": class_dist_after,
+            },
+            "recommendations": recommendations,
+        }
+        runs_dir = config.GRAPH_MEMORY_DIR / "training" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        out_path = runs_dir / f"{run_id}-diagnostics.json"
+        out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        return str(out_path)
+
+    @staticmethod
     def split_holdout_rows(
         rows: list[dict[str, Any]],
         eval_ratio: float = GLINER_BENCHMARK_EVAL_RATIO,
@@ -2856,6 +3059,7 @@ class GLiNERTrainingService:
             "last_strategy": str(self.state.get("gliner_last_training_strategy", "lora") or "lora"),
             "last_result": str(self.state.get("gliner_last_result", "") or ""),
             "last_cycle_status": str(self.state.get("gliner_last_cycle_status", "") or ""),
+            "last_diagnostics_path": str(self.state.get("gliner_last_diagnostics_path", "") or ""),
             "cooldown_remaining_hours": max(0, cooldown_remaining_hours),
             "active_model": self.active_gliner_model_ref(),
             "base_model": GLINER_BASE_MODEL,
