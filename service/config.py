@@ -70,6 +70,56 @@ AUDIT_MODEL_LOCAL    = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_LOCAL", "llama3.1:
 AUDIT_MODEL_PRIMARY  = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_PRIMARY", "")
 AUDIT_MODEL_FALLBACK = os.environ.get("MOLLYGRAPH_AUDIT_MODEL_FALLBACK", "")
 
+# ── Decision traces (Phase 2 ingest-time auto-detection) ─────────────────────
+DECISION_TRACES_INGEST_ENABLED = os.environ.get(
+    "MOLLYGRAPH_DECISION_TRACES_INGEST_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+DECISION_TRACES_PREFILTER_ENABLED = os.environ.get(
+    "MOLLYGRAPH_DECISION_TRACES_PREFILTER_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+DECISION_TRACES_MIN_CONTENT_CHARS = int(
+    os.environ.get("MOLLYGRAPH_DECISION_TRACES_MIN_CONTENT_CHARS", "24")
+)
+DECISION_TRACES_PREFILTER_MIN_SCORE = int(
+    os.environ.get("MOLLYGRAPH_DECISION_TRACES_PREFILTER_MIN_SCORE", "2")
+)
+DECISION_TRACES_MIN_CONFIDENCE = float(
+    os.environ.get("MOLLYGRAPH_DECISION_TRACES_MIN_CONFIDENCE", "0.6")
+)
+DECISION_TRACES_MAX_ALTERNATIVES = int(
+    os.environ.get("MOLLYGRAPH_DECISION_TRACES_MAX_ALTERNATIVES", "6")
+)
+DECISION_TRACES_MAX_INPUTS = int(
+    os.environ.get("MOLLYGRAPH_DECISION_TRACES_MAX_INPUTS", "8")
+)
+DECISION_TRACES_MAX_RELATED_ENTITIES = int(
+    os.environ.get("MOLLYGRAPH_DECISION_TRACES_MAX_RELATED_ENTITIES", "8")
+)
+DECISION_TRACES_SOURCE_BLOCKLIST = [
+    token.strip().lower()
+    for token in os.environ.get(
+        "MOLLYGRAPH_DECISION_TRACES_SOURCE_BLOCKLIST",
+        "promo,promotions,ads,newsletter,notification,noise,spam",
+    ).split(",")
+    if token.strip()
+]
+DECISION_TRACES_TIER_PRIMARY = os.environ.get(
+    "MOLLYGRAPH_DECISION_TRACES_TIER_PRIMARY",
+    AUDIT_TIER_PRIMARY,
+).strip().lower()
+DECISION_TRACES_MODEL_PRIMARY = os.environ.get(
+    "MOLLYGRAPH_DECISION_TRACES_MODEL_PRIMARY",
+    AUDIT_MODEL_PRIMARY or AUDIT_MODEL_NIGHTLY,
+).strip()
+DECISION_TRACES_TIER_FALLBACK = os.environ.get(
+    "MOLLYGRAPH_DECISION_TRACES_TIER_FALLBACK",
+    AUDIT_TIER_FALLBACK,
+).strip().lower()
+DECISION_TRACES_MODEL_FALLBACK = os.environ.get(
+    "MOLLYGRAPH_DECISION_TRACES_MODEL_FALLBACK",
+    AUDIT_MODEL_FALLBACK or AUDIT_MODEL_NIGHTLY,
+).strip()
+
 # ── GLiREL synonym LLM enrichment ─────────────────────────────────────────────
 # When enabled, the auto-adoption pipeline calls the audit LLM to generate
 # 2-3 additional natural-language phrasings per new relation type and merges

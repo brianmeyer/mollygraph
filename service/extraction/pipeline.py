@@ -20,6 +20,10 @@ from datetime import datetime, UTC
 from typing import Any
 
 import config as service_config
+from extraction.decision_traces import (
+    extract_decision_trace,
+    run_decision_prefilter,
+)
 from extraction.glirel_enrichment import GLiRELEnrichment
 from extraction.relation_gate import GateResult, get_gate
 from memory.models import Entity, Episode, ExtractionJob, Relationship
@@ -225,6 +229,96 @@ class ExtractionPipeline:
         """Proxy to vector store search."""
         embedding = self._text_embedding(query)
         return self.vector_store.similarity_search(embedding, top_k=top_k)
+
+    async def _maybe_record_decision_trace(
+        self,
+        *,
+        job: ExtractionJob,
+        ingest_source: str,
+        episode_id: str,
+        speaker: str | None,
+        related_entities: list[str],
+    ) -> dict[str, Any] | None:
+        if not bool(getattr(service_config, "DECISION_TRACES_INGEST_ENABLED", False)):
+            return None
+
+        prefilter_result = run_decision_prefilter(
+            content=job.content,
+            source=ingest_source,
+            raw_source=job.source,
+        )
+        if not prefilter_result.passed:
+            log.debug(
+                "decision_trace skipped by prefilter: source=%s reason=%s score=%d",
+                ingest_source,
+                prefilter_result.reason,
+                prefilter_result.score,
+            )
+            return None
+
+        extraction_result = await extract_decision_trace(
+            content=job.content,
+            source=ingest_source,
+            speaker=speaker,
+        )
+        if extraction_result.error:
+            log.warning("decision_trace extraction skipped: %s", extraction_result.error)
+            return None
+        if not extraction_result.is_decision or extraction_result.payload is None:
+            log.debug("decision_trace classification negative (provider=%s)", extraction_result.provider)
+            return None
+
+        payload = extraction_result.payload
+        min_conf = float(getattr(service_config, "DECISION_TRACES_MIN_CONFIDENCE", 0.6))
+        if payload.confidence < min_conf:
+            log.debug(
+                "decision_trace below min confidence: %.3f < %.3f",
+                payload.confidence,
+                min_conf,
+            )
+            return None
+
+        max_related = max(0, int(getattr(service_config, "DECISION_TRACES_MAX_RELATED_ENTITIES", 8)))
+        clean_related: list[str] = []
+        seen: set[str] = set()
+        for raw in related_entities:
+            item = str(raw or "").strip()
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            clean_related.append(item)
+            if len(clean_related) >= max_related:
+                break
+
+        try:
+            created = self.graph.create_decision(
+                decision=payload.decision,
+                reasoning=payload.reasoning,
+                alternatives=payload.alternatives,
+                inputs=payload.inputs,
+                outcome=payload.outcome,
+                decided_by=payload.decided_by,
+                related_entities=clean_related,
+                source_episode_id=episode_id,
+                confidence=payload.confidence,
+                timestamp=job.reference_time,
+            )
+        except Exception:
+            log.warning("decision_trace write failed", exc_info=True)
+            return None
+
+        log.info(
+            "decision_trace created: id=%s tier=%s provider=%s model=%s confidence=%.3f",
+            created.get("id", ""),
+            extraction_result.tier,
+            extraction_result.provider,
+            extraction_result.model,
+            payload.confidence,
+        )
+        return created
 
     def _mark_episode_incomplete(self, episode_id: str, reason: str = "") -> None:
         """Mark a Neo4j episode node as incomplete after a mid-job failure.
@@ -574,6 +668,18 @@ class ExtractionPipeline:
                     "Relationships: %d created/updated, %d skipped (missing entities)",
                     rels_created, rels_skipped,
                 )
+
+            # ── Decision traces (Phase 2): selective LLM extraction ──────────
+            # Cheap deterministic pre-filter runs first. The LLM chain is only
+            # invoked on likely decision-language episodes and then requires a
+            # minimum confidence threshold before writing a Decision node.
+            await self._maybe_record_decision_trace(
+                job=job,
+                ingest_source=ingest_source,
+                episode_id=_episode_id,
+                speaker=speaker,
+                related_entities=[entity.name for entity in stored_entities],
+            )
 
             job.extracted_entities = stored_entities
             job.extracted_relationships = relationships

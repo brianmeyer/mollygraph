@@ -61,3 +61,26 @@ curl -X POST "http://127.0.0.1:7422/decisions" \
     "confidence": 0.92
   }'
 ```
+
+## Decision Traces (Phase 2: ingest-time auto-detection)
+
+During ingestion, MollyGraph can now auto-detect decision moments and write
+`Decision` nodes automatically.
+
+Behavior:
+
+- Run a cheap deterministic pre-filter for decision-like language.
+- Apply source guards to skip obvious low-signal sources (promo/noise markers).
+- Only if pre-filter passes, run a dedicated audit-LM chain (`primary` then `fallback`)
+  to classify + extract:
+  `decision`, `reasoning`, `alternatives[]`, `inputs[]`, `outcome` (optional),
+  `decided_by`, `confidence`.
+- Write to the existing `graph.create_decision(...)` path only when extraction is
+  positive and confidence meets `MOLLYGRAPH_DECISION_TRACES_MIN_CONFIDENCE`.
+
+Cost-control notes:
+
+- Feature is opt-in via `MOLLYGRAPH_DECISION_TRACES_INGEST_ENABLED=false` by default.
+- Deterministic pre-filter prevents unnecessary LLM calls on most ingests.
+- Provider chain is bounded to `primary -> fallback` only.
+- Payload list caps (`MAX_ALTERNATIVES`, `MAX_INPUTS`, `MAX_RELATED_ENTITIES`) limit noise.
