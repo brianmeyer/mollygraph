@@ -205,6 +205,8 @@ def log_retrieval(
         "reranker_ms": round(reranker_ms, 2),
         "graph_result_count": graph_result_count,
         "vector_result_count": vector_result_count,
+        "graph_entity_names": [str(n) for n in (graph_entity_names or [])],
+        "vector_entity_names": [str(n) for n in (vector_entity_names or [])],
         "graph_reranked": graph_reranked,
         "rank_improvement_avg": round(rank_improvement_avg, 4),
         "rerank_lift_pct": round(rerank_lift_pct, 2),
@@ -299,6 +301,8 @@ def get_retrieval_summary(date_str: str | None = None) -> dict[str, Any]:
 
     latencies = [float(r.get("latency_ms", 0.0) or 0.0) for r in recs]
     vector_search = [float(r.get("vector_search_ms", 0.0) or 0.0) for r in recs]
+    rerank_lifts = [float(r.get("rerank_lift_pct", 0.0) or 0.0) for r in recs if bool(r.get("graph_reranked", False))]
+    rank_improvements = [float(r.get("rank_improvement_avg", 0.0) or 0.0) for r in recs if bool(r.get("graph_reranked", False))]
     total = len(recs)
 
     source_breakdown = {
@@ -329,6 +333,12 @@ def get_retrieval_summary(date_str: str | None = None) -> dict[str, Any]:
         if g_cnt is not None and v_cnt is not None and int(g_cnt) >= 0 and int(v_cnt) >= 0:
             if int(g_cnt) > 0 and int(v_cnt) > 0:
                 combined_count += 1
+                g_names = set(str(n).lower() for n in (rec.get("graph_entity_names") or []))
+                v_names = set(str(n).lower() for n in (rec.get("vector_entity_names") or []))
+                if g_names and (g_names - v_names):
+                    combined_g_unique += 1
+                if v_names and (v_names - g_names):
+                    combined_v_unique += 1
             elif int(g_cnt) > 0:
                 graph_only += 1
             elif int(v_cnt) > 0:
@@ -362,6 +372,9 @@ def get_retrieval_summary(date_str: str | None = None) -> dict[str, Any]:
         "combined_hits": combined_count,
         "graph_lift_pct": graph_lift_pct,
         "vector_lift_pct": vector_lift_pct,
+        "reranked_query_count": len(rerank_lifts),
+        "avg_rerank_lift_pct": round(sum(rerank_lifts) / len(rerank_lifts), 2) if rerank_lifts else 0.0,
+        "avg_rank_improvement": round(sum(rank_improvements) / len(rank_improvements), 4) if rank_improvements else 0.0,
     }
 
 

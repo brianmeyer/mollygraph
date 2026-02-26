@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 ROLLBACKS_DIR = Path.home() / ".graph-memory" / "training" / "rollbacks"
 TRAINING_CONFIG_PATH = Path.home() / ".graph-memory" / "gliner_finetune_config.json"
+MODEL_HEALTH_STATE_PATH = Path.home() / ".graph-memory" / "metrics" / "model_health_state.json"
 
 
 class ModelHealthMonitor:
@@ -55,6 +56,41 @@ class ModelHealthMonitor:
         self.model_ref: str | None = None
         self.rollback_triggered: bool = False
         self._extraction_counter: int = 0
+        self._load_state()
+
+    def _load_state(self) -> None:
+        """Load persisted baseline state so restart does not reset monitoring."""
+        try:
+            if not MODEL_HEALTH_STATE_PATH.exists():
+                return
+            payload = json.loads(MODEL_HEALTH_STATE_PATH.read_text(encoding="utf-8"))
+            self.baseline_fallback_rate = (
+                float(payload["baseline_fallback_rate"])
+                if payload.get("baseline_fallback_rate") is not None
+                else None
+            )
+            self.model_ref = str(payload.get("model_ref") or "") or None
+            deployed_at = payload.get("deployed_at")
+            self.deployed_at = datetime.fromisoformat(deployed_at) if deployed_at else None
+            self.degradation_detected = bool(payload.get("degradation_detected", False))
+        except Exception:
+            log.warning("Failed to load model health state", exc_info=True)
+
+    def _save_state(self) -> None:
+        """Persist baseline state for restart-safe monitoring."""
+        try:
+            MODEL_HEALTH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "baseline_fallback_rate": self.baseline_fallback_rate,
+                "model_ref": self.model_ref,
+                "deployed_at": self.deployed_at.isoformat() if self.deployed_at else None,
+                "degradation_detected": self.degradation_detected,
+            }
+            tmp_path = MODEL_HEALTH_STATE_PATH.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp_path.replace(MODEL_HEALTH_STATE_PATH)
+        except Exception:
+            log.warning("Failed to save model health state", exc_info=True)
 
     def set_baseline(self, fallback_rate: float, model_ref: str) -> None:
         """Called after each training deploy with the benchmark fallback rate.
@@ -70,6 +106,7 @@ class ModelHealthMonitor:
         self.degradation_detected = False
         self.rollback_triggered = False
         self._extraction_counter = 0
+        self._save_state()
         log.info(
             "Model health baseline set: fallback_rate=%.3f model=%s",
             fallback_rate,
@@ -160,7 +197,9 @@ class ModelHealthMonitor:
                     threshold,
                     len(self.degradation_window),
                 )
-            self.degradation_detected = True
+            if not self.degradation_detected:
+                self.degradation_detected = True
+                self._save_state()
         else:
             # Rate has recovered — clear the flag
             if self.degradation_detected:
@@ -170,7 +209,8 @@ class ModelHealthMonitor:
                     current_rate,
                     threshold,
                 )
-            self.degradation_detected = False
+                self.degradation_detected = False
+                self._save_state()
 
     def get_status(self) -> dict[str, Any]:
         """Return rolling stats from both windows plus the degradation flag.
@@ -218,6 +258,7 @@ class ModelHealthMonitor:
             return  # don't double-rollback
 
         self.rollback_triggered = True
+        self._save_state()
         log.critical(
             "MODEL HEALTH DEGRADED – triggering rollback! "
             "current_fallback_rate=%.4f baseline=%.4f spike_ratio=%.2f samples=%d",
