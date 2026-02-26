@@ -18,8 +18,13 @@ Signal types
 """
 from __future__ import annotations
 
+import atexit
+import json
 import logging
+import os
+from pathlib import Path
 import threading
+import tempfile
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
@@ -95,18 +100,106 @@ def get_signal_bus() -> AuditSignalBus:
 
 _signal_counts: dict[str, int] = {}
 _counts_lock = threading.Lock()
+_counts_loaded = False
+_persist_timer: threading.Timer | None = None
+_PERSIST_DEBOUNCE_SECONDS = 0.5
+_AUDIT_SIGNAL_COUNTS_PATH = (
+    Path.home() / ".graph-memory" / "metrics" / "audit_signal_counts.json"
+)
+
+
+def _coerce_signal_counts(payload: Any) -> dict[str, int]:
+    """Parse persisted signal counts with backward-compatible shape handling."""
+    raw_counts: Any = payload
+    if isinstance(payload, dict) and isinstance(payload.get("signal_counts"), dict):
+        raw_counts = payload.get("signal_counts")
+    if not isinstance(raw_counts, dict):
+        return {}
+    parsed: dict[str, int] = {}
+    for key, value in raw_counts.items():
+        try:
+            count = int(value)
+        except Exception:
+            continue
+        if count < 0:
+            continue
+        parsed[str(key)] = count
+    return parsed
+
+
+def _load_signal_counts_locked() -> None:
+    global _counts_loaded, _signal_counts
+    if _counts_loaded:
+        return
+    _counts_loaded = True
+    try:
+        if not _AUDIT_SIGNAL_COUNTS_PATH.exists():
+            return
+        payload = json.loads(_AUDIT_SIGNAL_COUNTS_PATH.read_text(encoding="utf-8"))
+        _signal_counts = _coerce_signal_counts(payload)
+    except Exception:
+        log.debug("Failed to load audit signal counts", exc_info=True)
+
+
+def _write_signal_counts_atomic(counts: dict[str, int]) -> None:
+    _AUDIT_SIGNAL_COUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=_AUDIT_SIGNAL_COUNTS_PATH.parent, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(counts, indent=2, ensure_ascii=True) + "\n")
+        os.replace(tmp_name, str(_AUDIT_SIGNAL_COUNTS_PATH))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _flush_signal_counts_to_disk() -> None:
+    global _persist_timer
+    with _counts_lock:
+        timer = _persist_timer
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
+        _persist_timer = None
+        if not _counts_loaded:
+            return
+        snapshot = dict(_signal_counts)
+    try:
+        _write_signal_counts_atomic(snapshot)
+    except Exception:
+        log.debug("Failed to persist audit signal counts", exc_info=True)
+
+
+def _schedule_signal_counts_persist_locked() -> None:
+    global _persist_timer
+    if _persist_timer is not None:
+        _persist_timer.cancel()
+    timer = threading.Timer(_PERSIST_DEBOUNCE_SECONDS, _flush_signal_counts_to_disk)
+    timer.daemon = True
+    _persist_timer = timer
+    timer.start()
 
 
 def _metrics_listener(signal_type: str, _details: dict[str, Any]) -> None:
     """Increment the in-memory counter for *signal_type*."""
     with _counts_lock:
+        _load_signal_counts_locked()
         _signal_counts[signal_type] = _signal_counts.get(signal_type, 0) + 1
+        _schedule_signal_counts_persist_locked()
 
 
 def get_signal_counts() -> dict[str, int]:
     """Return a copy of signal counts accumulated since the last process restart."""
     with _counts_lock:
+        _load_signal_counts_locked()
         return dict(_signal_counts)
+
+
+atexit.register(_flush_signal_counts_to_disk)
 
 
 __all__ = [

@@ -59,11 +59,13 @@ class ModelHealthMonitor:
         self._load_state()
 
     def _load_state(self) -> None:
-        """Load persisted baseline state so restart does not reset monitoring."""
+        """Load persisted monitor state with backward compatibility."""
         try:
             if not MODEL_HEALTH_STATE_PATH.exists():
                 return
             payload = json.loads(MODEL_HEALTH_STATE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
             self.baseline_fallback_rate = (
                 float(payload["baseline_fallback_rate"])
                 if payload.get("baseline_fallback_rate") is not None
@@ -73,11 +75,30 @@ class ModelHealthMonitor:
             deployed_at = payload.get("deployed_at")
             self.deployed_at = datetime.fromisoformat(deployed_at) if deployed_at else None
             self.degradation_detected = bool(payload.get("degradation_detected", False))
+            self.rollback_triggered = bool(payload.get("rollback_triggered", False))
+            try:
+                self._extraction_counter = max(0, int(payload.get("extraction_counter", 0)))
+            except Exception:
+                self._extraction_counter = 0
+
+            rolling_payload = payload.get("rolling_extractions")
+            if isinstance(rolling_payload, list):
+                self.rolling_extractions.clear()
+                for entry in rolling_payload:
+                    if isinstance(entry, dict):
+                        self.rolling_extractions.append(dict(entry))
+
+            degradation_payload = payload.get("degradation_window")
+            if isinstance(degradation_payload, list):
+                self.degradation_window.clear()
+                for entry in degradation_payload:
+                    if isinstance(entry, dict):
+                        self.degradation_window.append(dict(entry))
         except Exception:
             log.warning("Failed to load model health state", exc_info=True)
 
     def _save_state(self) -> None:
-        """Persist baseline state for restart-safe monitoring."""
+        """Persist monitor state for restart-safe monitoring."""
         try:
             MODEL_HEALTH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -85,6 +106,10 @@ class ModelHealthMonitor:
                 "model_ref": self.model_ref,
                 "deployed_at": self.deployed_at.isoformat() if self.deployed_at else None,
                 "degradation_detected": self.degradation_detected,
+                "rollback_triggered": self.rollback_triggered,
+                "extraction_counter": self._extraction_counter,
+                "rolling_extractions": list(self.rolling_extractions),
+                "degradation_window": list(self.degradation_window),
             }
             tmp_path = MODEL_HEALTH_STATE_PATH.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -128,6 +153,7 @@ class ModelHealthMonitor:
         self.rolling_extractions.append(entry)
         self.degradation_window.append(entry)
         self._extraction_counter += 1
+        self._save_state()
 
         # Check every 10 extractions
         if self._extraction_counter % 10 == 0:

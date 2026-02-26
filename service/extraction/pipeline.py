@@ -9,14 +9,19 @@ This implementation is OpenClaw-first:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hashlib
+import json
 import logging
 import math
+import os
 import re
 import threading
+import tempfile
 import time
 import uuid
 from datetime import datetime, UTC
+from pathlib import Path
 from typing import Any
 
 import config as service_config
@@ -136,33 +141,128 @@ class ExtractionPipeline:
     # ── Class-level daily ingestion counters (reset when date changes) ────────
     # These are shared across all instances (there's only one per process).
     _counter_lock = threading.Lock()
+    _counters_loaded = False
+    _persist_timer: threading.Timer | None = None
+    _PERSIST_DEBOUNCE_SECONDS = 0.5
+    _INGESTION_COUNTERS_PATH = (
+        Path.home() / ".graph-memory" / "metrics" / "ingestion_counters.json"
+    )
     _counter_date: str = ""  # YYYY-MM-DD; reset when date changes
-    _ingestion_counters: dict[str, Any] = {
-        "jobs_processed": 0,
-        "total_entities_extracted": 0,
-        "total_relationships_extracted": 0,
-        "total_new_entities": 0,       # entities that did NOT exist before
-        "total_existing_entities": 0,  # entities that already existed (upserted)
-        "total_fallback_relationships": 0,  # RELATED_TO fallback count
-    }
+    _ingestion_counters: dict[str, Any] = {}
+
+    @classmethod
+    def _empty_ingestion_counters(cls) -> dict[str, int]:
+        return {
+            "jobs_processed": 0,
+            "total_entities_extracted": 0,
+            "total_relationships_extracted": 0,
+            "total_new_entities": 0,
+            "total_existing_entities": 0,
+            "total_fallback_relationships": 0,
+        }
+
+    @classmethod
+    def _today_iso(cls) -> str:
+        from datetime import date
+        return date.today().isoformat()
+
+    @classmethod
+    def _coerce_ingestion_counters(cls, payload: Any) -> tuple[str, dict[str, int]]:
+        data = payload
+        if isinstance(payload, dict) and isinstance(payload.get("counters"), dict):
+            data = payload.get("counters")
+            raw_date = payload.get("date")
+        else:
+            raw_date = payload.get("date") if isinstance(payload, dict) else None
+
+        counters = cls._empty_ingestion_counters()
+        if isinstance(data, dict):
+            for key in counters:
+                try:
+                    counters[key] = max(0, int(data.get(key, 0)))
+                except Exception:
+                    counters[key] = 0
+        counter_date = str(raw_date or "").strip()
+        return counter_date, counters
+
+    @classmethod
+    def _load_ingestion_counters_locked(cls) -> None:
+        if cls._counters_loaded:
+            return
+        cls._counters_loaded = True
+        cls._ingestion_counters = cls._empty_ingestion_counters()
+        cls._counter_date = ""
+        try:
+            if not cls._INGESTION_COUNTERS_PATH.exists():
+                return
+            payload = json.loads(cls._INGESTION_COUNTERS_PATH.read_text(encoding="utf-8"))
+            cls._counter_date, cls._ingestion_counters = cls._coerce_ingestion_counters(payload)
+        except Exception:
+            log.debug("Failed to load ingestion counters", exc_info=True)
+
+    @classmethod
+    def _rollover_if_needed_locked(cls, *, today: str) -> bool:
+        if cls._counter_date == today:
+            return False
+        cls._counter_date = today
+        cls._ingestion_counters = cls._empty_ingestion_counters()
+        return True
+
+    @classmethod
+    def _write_ingestion_counters_atomic(cls, payload: dict[str, Any]) -> None:
+        cls._INGESTION_COUNTERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=cls._INGESTION_COUNTERS_PATH.parent, suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+            os.replace(tmp_name, str(cls._INGESTION_COUNTERS_PATH))
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def _flush_ingestion_counters_to_disk(cls) -> None:
+        with cls._counter_lock:
+            timer = cls._persist_timer
+            if timer is not None and timer is not threading.current_thread():
+                timer.cancel()
+            cls._persist_timer = None
+            if not cls._counters_loaded:
+                return
+            payload = {
+                "date": cls._counter_date,
+                "counters": dict(cls._ingestion_counters),
+            }
+        try:
+            cls._write_ingestion_counters_atomic(payload)
+        except Exception:
+            log.debug("Failed to persist ingestion counters", exc_info=True)
+
+    @classmethod
+    def _schedule_ingestion_counters_persist_locked(cls) -> None:
+        if cls._persist_timer is not None:
+            cls._persist_timer.cancel()
+        timer = threading.Timer(
+            cls._PERSIST_DEBOUNCE_SECONDS,
+            cls._flush_ingestion_counters_to_disk,
+        )
+        timer.daemon = True
+        cls._persist_timer = timer
+        timer.start()
 
     @classmethod
     def _get_ingestion_counters(cls) -> dict[str, Any]:
         """Return a snapshot of today's ingestion counters."""
-        from datetime import date
-        today = date.today().isoformat()
+        today = cls._today_iso()
         with cls._counter_lock:
-            if cls._counter_date != today:
-                # Day rolled over — reset
-                cls._counter_date = today
-                cls._ingestion_counters = {
-                    "jobs_processed": 0,
-                    "total_entities_extracted": 0,
-                    "total_relationships_extracted": 0,
-                    "total_new_entities": 0,
-                    "total_existing_entities": 0,
-                    "total_fallback_relationships": 0,
-                }
+            cls._load_ingestion_counters_locked()
+            if cls._rollover_if_needed_locked(today=today):
+                cls._schedule_ingestion_counters_persist_locked()
             c = dict(cls._ingestion_counters)
         jobs = c["jobs_processed"]
         total_ent = c["total_entities_extracted"]
@@ -195,25 +295,17 @@ class ExtractionPipeline:
         fallback_count: int,
     ) -> None:
         """Update class-level daily counters after a successful job."""
-        from datetime import date
-        today = date.today().isoformat()
+        today = cls._today_iso()
         with cls._counter_lock:
-            if cls._counter_date != today:
-                cls._counter_date = today
-                cls._ingestion_counters = {
-                    "jobs_processed": 0,
-                    "total_entities_extracted": 0,
-                    "total_relationships_extracted": 0,
-                    "total_new_entities": 0,
-                    "total_existing_entities": 0,
-                    "total_fallback_relationships": 0,
-                }
+            cls._load_ingestion_counters_locked()
+            cls._rollover_if_needed_locked(today=today)
             cls._ingestion_counters["jobs_processed"] += 1
             cls._ingestion_counters["total_entities_extracted"] += entities_extracted
             cls._ingestion_counters["total_relationships_extracted"] += relationships_extracted
             cls._ingestion_counters["total_new_entities"] += new_entities
             cls._ingestion_counters["total_existing_entities"] += existing_entities
             cls._ingestion_counters["total_fallback_relationships"] += fallback_count
+            cls._schedule_ingestion_counters_persist_locked()
 
     def __init__(self, graph: BiTemporalGraph, vector_store: VectorStore):
         self.graph = graph
@@ -1633,3 +1725,6 @@ class ExtractionPipeline:
             cls._reranker_model = None
 
         return cls._reranker_model
+
+
+atexit.register(ExtractionPipeline._flush_ingestion_counters_to_disk)
