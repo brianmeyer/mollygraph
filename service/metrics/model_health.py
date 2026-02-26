@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import tempfile
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -111,9 +113,20 @@ class ModelHealthMonitor:
                 "rolling_extractions": list(self.rolling_extractions),
                 "degradation_window": list(self.degradation_window),
             }
-            tmp_path = MODEL_HEALTH_STATE_PATH.with_suffix(".tmp")
-            tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            tmp_path.replace(MODEL_HEALTH_STATE_PATH)
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                dir=MODEL_HEALTH_STATE_PATH.parent,
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+                os.replace(tmp_name, str(MODEL_HEALTH_STATE_PATH))
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except Exception:
             log.warning("Failed to save model health state", exc_info=True)
 
