@@ -1,4 +1,14 @@
-"""Decision trace auto-detection helpers for ingestion (Phase 2)."""
+"""Decision trace auto-detection helpers for ingestion (Phase 2).
+
+DORMANT FEATURE: This module is maintained but inactive by default.
+- Set MOLLYGRAPH_DECISION_TRACES_INGEST_ENABLED=true to enable auto-detection
+- When disabled (default), the module loads but adds zero runtime overhead
+- The extraction pipeline lazily imports this module only when enabled
+- Manual API routes remain available for explicit decision recording regardless
+
+Phase 2 adds LLM-based decision extraction during ingestion, creating Decision
+nodes in the graph with structured metadata (alternatives, inputs, confidence).
+"""
 from __future__ import annotations
 
 import json

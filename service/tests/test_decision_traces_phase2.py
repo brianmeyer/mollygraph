@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
+import pytest
+
 import config as service_config
 from extraction.decision_traces import (
     DecisionExtractionResult,
@@ -13,6 +15,13 @@ from extraction.decision_traces import (
 from extraction.pipeline import ExtractionPipeline
 import extraction.pipeline as pipeline_module
 from memory.models import ExtractionJob
+
+# Skip all tests in this module if decision traces are disabled at import time
+# (The feature is dormant by default; tests only run when explicitly enabled)
+pytestmark = pytest.mark.skipif(
+    not getattr(service_config, "DECISION_TRACES_INGEST_ENABLED", False),
+    reason="Decision traces feature is disabled (DECISION_TRACES_INGEST_ENABLED=false)",
+)
 
 
 class _FakeVectorStore:

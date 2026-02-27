@@ -32,6 +32,41 @@ RELATION_SCHEMA_FILE: Path | None = (
     Path(p) if (p := os.environ.get("RELATION_SCHEMA_FILE")) else None
 )
 
+# ── Owner identity ────────────────────────────────────────────────────────────
+# Set MOLLYGRAPH_OWNER_NAME to the graph owner's display name.
+# Used in contact training examples and anywhere an owner reference is needed.
+MOLLYGRAPH_OWNER_NAME: str = os.environ.get("MOLLYGRAPH_OWNER_NAME", "").strip()
+
+# ── School / org normalization for contact relationship notes ─────────────────
+# These settings allow the contact_training module to emit high-confidence
+# classmate assertions for a specific school or organization.
+#
+# MOLLYGRAPH_SCHOOL_CANONICAL  - Display name used in emitted text
+#                                e.g. "Kellogg School of Management"
+# MOLLYGRAPH_SCHOOL_ALIASES    - Comma-separated lowercase aliases to match
+#                                e.g. "kellogg,kellogg emba,northwestern kellogg"
+# MOLLYGRAPH_SCHOOL_CAMPUS_ALIASES - JSON dict of campus canonical → list of aliases
+#                                e.g. '{"Miami": ["miami", "miami campus"]}'
+#
+# Leave all three unset (or empty) to disable school-specific normalization;
+# in that case only generic classmate/alumni signals are used.
+SCHOOL_CANONICAL: str = os.environ.get("MOLLYGRAPH_SCHOOL_CANONICAL", "").strip()
+_SCHOOL_ALIASES_RAW: str = os.environ.get("MOLLYGRAPH_SCHOOL_ALIASES", "").strip()
+SCHOOL_ALIASES: tuple[str, ...] = (
+    tuple(a.strip().lower() for a in _SCHOOL_ALIASES_RAW.split(",") if a.strip())
+    if _SCHOOL_ALIASES_RAW else ()
+)
+
+import json as _json
+_SCHOOL_CAMPUS_JSON: str = os.environ.get("MOLLYGRAPH_SCHOOL_CAMPUS_ALIASES", "").strip()
+try:
+    SCHOOL_CAMPUS_ALIASES: dict[str, tuple[str, ...]] = {
+        k: tuple(str(v).lower() for v in vs)
+        for k, vs in (_json.loads(_SCHOOL_CAMPUS_JSON).items() if _SCHOOL_CAMPUS_JSON else {}).items()
+    }
+except Exception:
+    SCHOOL_CAMPUS_ALIASES = {}
+
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
 NEO4J_URI      = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER     = os.environ.get("NEO4J_USER", "neo4j")
@@ -219,6 +254,16 @@ GLIREL_TRAINING_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_TRAINING_THR
 # polluting GLiNER training data until speaker-aware filtering is validated.
 # Re-enable by setting MOLLYGRAPH_GLIREL_SILVER_ENABLED=true in the env.
 GLIREL_SILVER_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_SILVER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+# ── GLiREL per-message chunking ───────────────────────────────────────────────
+# When enabled, multi-message content blobs are split into per-message (or
+# small-group) chunks before GLiREL extraction.  Each chunk is processed with
+# only the entities that appear within it, preventing anchor-entity over-
+# attribution caused by dominant organisations bleeding across speaker turns.
+# Disable by setting MOLLYGRAPH_GLIREL_CHUNKING_ENABLED=false.
+GLIREL_CHUNKING_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_CHUNKING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Maximum number of messages to group per GLiREL chunk (default: 3).
+GLIREL_CHUNK_SIZE = int(os.environ.get("MOLLYGRAPH_GLIREL_CHUNK_SIZE", "3"))
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")

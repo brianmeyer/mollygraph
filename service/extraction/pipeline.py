@@ -25,12 +25,13 @@ from pathlib import Path
 from typing import Any
 
 import config as service_config
-from extraction.decision_traces import (
-    extract_decision_trace,
-    run_decision_prefilter,
-)
 from extraction.glirel_enrichment import GLiRELEnrichment
 from extraction.relation_gate import GateResult, get_gate
+
+try:
+    from extraction.gliner_training import detect_fanout_pollution as _detect_fanout_pollution
+except Exception:  # pragma: no cover - optional dependency
+    _detect_fanout_pollution = None  # type: ignore
 from memory.models import Entity, Episode, ExtractionJob, Relationship
 from memory.graph import BiTemporalGraph
 from memory.vector_store import VectorStore
@@ -348,6 +349,9 @@ class ExtractionPipeline:
         if not bool(getattr(service_config, "DECISION_TRACES_INGEST_ENABLED", False)):
             return None
 
+        # Lazy import: only load decision_traces module when feature is enabled
+        from extraction.decision_traces import extract_decision_trace, run_decision_prefilter
+
         prefilter_result = run_decision_prefilter(
             content=job.content,
             source=ingest_source,
@@ -502,6 +506,7 @@ class ExtractionPipeline:
         glirel_overrides = 0
         glirel_additions = 0
         glirel_training_examples = 0
+        glirel_relations: list[dict[str, Any]] = []
         # Track partial writes so we can reconcile on failure (Issue 3).
         # These are initialised before the try block so the except clause can
         # reference them regardless of how far processing got.
@@ -651,11 +656,19 @@ class ExtractionPipeline:
             if service_config.GLIREL_ENABLED:
                 try:
                     log.info("GLiREL enrichment starting: %d entities", len(raw_entities))
-                    glirel_relations = await asyncio.to_thread(
-                        self._glirel_enrichment.enrich_relations,
-                        job.content,
-                        raw_entities,
-                    )
+                    _use_chunking = getattr(service_config, "GLIREL_CHUNKING_ENABLED", True)
+                    if _use_chunking:
+                        glirel_relations = await asyncio.to_thread(
+                            self._run_glirel_chunked,
+                            job.content,
+                            raw_entities,
+                        )
+                    else:
+                        glirel_relations = await asyncio.to_thread(
+                            self._glirel_enrichment.enrich_relations,
+                            job.content,
+                            raw_entities,
+                        )
                     glirel_relations_found = len(glirel_relations)
 
                     # ── Speaker-aware attribution filter ──────────────────────
@@ -692,23 +705,6 @@ class ExtractionPipeline:
                         glirel_additions,
                     )
 
-                    if getattr(service_config, "GLIREL_SILVER_ENABLED", True):
-                        training_examples = await asyncio.to_thread(
-                            self._glirel_enrichment.generate_training_examples,
-                            job.content,
-                            glirel_relations,
-                        )
-                        glirel_training_examples = len(training_examples)
-                        if training_examples:
-                            await asyncio.to_thread(
-                                self._glirel_enrichment.persist_training_examples,
-                                training_examples,
-                            )
-                    else:
-                        log.debug(
-                            "GLiREL silver label generation skipped "
-                            "(GLIREL_SILVER_ENABLED=False)"
-                        )
                 except Exception:
                     log.warning(
                         "GLiREL enrichment failed; continuing with GLiNER2-only relations",
@@ -733,6 +729,76 @@ class ExtractionPipeline:
                 entity_type_map=entity_type_map,
                 ingest_source=ingest_source,
             )
+
+            # ── GLiREL silver label generation (post-gate, post-anchor) ─────
+            # Generate silver training labels ONLY from relations that survived
+            # both the speaker-anchor filter AND the relation gate.  This
+            # prevents polluted / misattributed relations from entering the
+            # training corpus.
+            if service_config.GLIREL_ENABLED and glirel_relations:
+                if not getattr(service_config, "GLIREL_SILVER_ENABLED", True):
+                    log.debug(
+                        "GLiREL silver label generation skipped "
+                        "(GLIREL_SILVER_ENABLED=False)"
+                    )
+                else:
+                    try:
+                        # Build the set of normalised (source, target) pairs that
+                        # survived the relation gate and speaker-anchor checks.
+                        _validated_pairs: set[tuple[str, str]] = {
+                            (
+                                self._normalize(r.source_entity),
+                                self._normalize(r.target_entity),
+                            )
+                            for r in relationships
+                        }
+                        # Retain only GLiREL candidates whose head→tail pair
+                        # appears in the validated set.
+                        _silver_candidates = [
+                            rel for rel in glirel_relations
+                            if (
+                                self._normalize(str(rel.get("head") or "")),
+                                self._normalize(str(rel.get("tail") or "")),
+                            ) in _validated_pairs
+                        ]
+                        log.debug(
+                            "GLiREL silver: %d raw candidates → %d survived gate filter",
+                            len(glirel_relations),
+                            len(_silver_candidates),
+                        )
+                        if not _silver_candidates:
+                            log.debug(
+                                "GLiREL silver: no candidates survived gate filter — "
+                                "skipping training example generation"
+                            )
+                        elif (
+                            _detect_fanout_pollution is not None
+                            and _detect_fanout_pollution(_silver_candidates)
+                        ):
+                            # Fan-out pollution detected: dominant tail entity
+                            # absorbs too many relations → batch is suspect.
+                            log.warning(
+                                "GLiREL silver: fan-out pollution detected in %d "
+                                "validated candidates — skipping batch",
+                                len(_silver_candidates),
+                            )
+                        else:
+                            _training_examples = await asyncio.to_thread(
+                                self._glirel_enrichment.generate_training_examples,
+                                job.content,
+                                _silver_candidates,
+                            )
+                            glirel_training_examples = len(_training_examples)
+                            if _training_examples:
+                                await asyncio.to_thread(
+                                    self._glirel_enrichment.persist_training_examples,
+                                    _training_examples,
+                                )
+                    except Exception:
+                        log.warning(
+                            "GLiREL silver label generation failed; continuing",
+                            exc_info=True,
+                        )
 
             # ── Finalize episode: mark complete + set entities_extracted ──────
             # All entity writes succeeded. Clear the incomplete flag and wire
@@ -1191,53 +1257,196 @@ class ExtractionPipeline:
 
         return False
 
-    def _filter_speaker_relations(
-        self,
-        relations: list[dict[str, Any]],
-        speaker: str,
-    ) -> list[dict[str, Any]]:
-        """Drop WORKS_AT/MANAGES/REPORTS_TO relations whose head ≠ speaker.
+    # ── Per-message chunking for GLiREL ──────────────────────────────────────
 
-        GLiREL suffers from *anchor-entity over-attribution*: because the owner's
-        context dominates the training distribution, employment/hierarchy
-        predicates extracted from his messages frequently end up attributed to
-        third parties mentioned in the text
-        OR re-anchored to the owner when the text describes someone else.
+    # Message boundary patterns (order matters — most-specific first).
+    _MSG_BOUNDARY_PATTERNS: tuple[re.Pattern, ...] = (  # type: ignore[type-arg]
+        # WhatsApp/iMessage log format: "- Message YYYY-MM-DD HH:MM:SS UTC: from X to Y; ..."
+        re.compile(
+            r"(?:^|\n)\s*-\s*Message\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}",
+            re.IGNORECASE,
+        ),
+        # Statement prefix: "Statement by X:" or "Statement from X:"
+        re.compile(
+            r"(?:^|\n)\s*Statement\s+(?:by|from)\s+\S",
+            re.IGNORECASE,
+        ),
+        # Email/LinkedIn header: "From: " or "On ... wrote:" at the start of a line
+        re.compile(
+            r"(?:^|\n)\s*From\s*:",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:^|\n)\s*On\s+.{0,60}wrote\s*:",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        # Generic speaker turn: "Name: " at start of line (≥2 non-space chars before colon)
+        re.compile(
+            r"(?:^|\n)\s*\S{2,}[^:\n]{0,60}:\s+\S",
+        ),
+    )
 
-        Conservative rule:
-          • Keep the relation if head IS the speaker (or a first-person pronoun).
-          • Drop the relation if head is anyone else — the signal is unreliable
-            and we'd rather lose it than pollute the graph / training data.
+    def _chunk_content_for_glirel(self, content: str) -> list[str]:
+        """Split multi-message content into per-message or small-group chunks.
 
-        Unaffected: all other relation types (KNOWS, USES, LOCATED_IN, …).
+        Tries each message boundary pattern in order of specificity.  Falls back
+        to returning the whole content as a single chunk when no pattern matches
+        or the content is already short enough.
+
+        Args:
+            content: Raw ingest content (may be a single message or a large blob
+                     containing 80+ concatenated messages from different speakers).
+
+        Returns:
+            A list of text chunks; each chunk contains at most
+            ``GLIREL_CHUNK_SIZE`` (default 3) individual messages.
         """
-        if not speaker:
-            return relations
+        if not content or not content.strip():
+            return []
 
-        filtered: list[dict[str, Any]] = []
-        for rel in relations:
-            if not isinstance(rel, dict):
+        # Short content — no splitting needed.
+        if len(content) < 300:
+            return [content]
+
+        chunk_size: int = int(getattr(service_config, "GLIREL_CHUNK_SIZE", 3))
+
+        # Try each boundary pattern to find split points.
+        for pattern in self._MSG_BOUNDARY_PATTERNS:
+            matches = list(pattern.finditer(content))
+            if len(matches) < 2:
+                continue  # not enough boundaries to be worth splitting
+
+            # Build per-message slices using match positions as delimiters.
+            boundaries = [m.start() for m in matches]
+            raw_messages: list[str] = []
+            for i, start in enumerate(boundaries):
+                # Trim leading newline/whitespace that belongs to the delimiter itself
+                msg_start = start + (1 if content[start] == "\n" else 0)
+                end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
+                segment = content[msg_start:end].strip()
+                if segment:
+                    raw_messages.append(segment)
+
+            if not raw_messages:
                 continue
 
-            label = str(rel.get("label") or rel.get("rel_type") or "").strip().upper()
+            # Group messages into chunks of at most chunk_size.
+            chunks: list[str] = []
+            for i in range(0, len(raw_messages), chunk_size):
+                group = raw_messages[i : i + chunk_size]
+                chunks.append("\n\n".join(group))
+            log.debug(
+                "GLiREL chunking: split %d chars into %d messages → %d chunks "
+                "(pattern=%s, chunk_size=%d)",
+                len(content),
+                len(raw_messages),
+                len(chunks),
+                pattern.pattern[:40],
+                chunk_size,
+            )
+            return chunks
 
-            if label in self._SPEAKER_ANCHOR_REL_TYPES:
+        # No pattern matched — return the content as-is.
+        log.debug(
+            "GLiREL chunking: no message boundaries detected in %d chars; using full content",
+            len(content),
+        )
+        return [content]
+
+    def _run_glirel_chunked(
+        self,
+        content: str,
+        entities: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Run GLiREL per chunk and merge deduplicated results.
+
+        For each chunk produced by :meth:`_chunk_content_for_glirel`, only the
+        entities whose names appear in that chunk are passed to GLiREL.  This
+        prevents dominant organisations from being incorrectly attributed across
+        speaker boundaries.
+
+        Args:
+            content: Full ingest content.
+            entities: Entities extracted from the full content by GLiNER2.
+
+        Returns:
+            Deduplicated list of relation dicts merged from all chunks.
+        """
+        chunks = self._chunk_content_for_glirel(content)
+        if not chunks:
+            return []
+
+        # Fast path: single chunk = same as the un-chunked path.
+        if len(chunks) == 1 and chunks[0] == content:
+            return self._glirel_enrichment.enrich_relations(content, entities)
+
+        all_relations: list[dict[str, Any]] = []
+        seen_triples: set[tuple[str, str, str]] = set()
+
+        for chunk_idx, chunk in enumerate(chunks):
+            chunk_lower = chunk.lower()
+
+            # Filter entities to those whose names appear in this chunk.
+            chunk_entities = [
+                e for e in entities
+                if isinstance(e, dict)
+                and str(e.get("text") or e.get("name") or "").strip()
+                and str(e.get("text") or e.get("name") or "").strip().lower() in chunk_lower
+            ]
+
+            if len(chunk_entities) < 2:
+                log.debug(
+                    "GLiREL chunk %d/%d: only %d entities — skipping",
+                    chunk_idx + 1,
+                    len(chunks),
+                    len(chunk_entities),
+                )
+                continue
+
+            try:
+                chunk_relations = self._glirel_enrichment.enrich_relations(
+                    chunk, chunk_entities
+                )
+            except Exception:
+                log.warning(
+                    "GLiREL chunk %d/%d: extraction failed — skipping chunk",
+                    chunk_idx + 1,
+                    len(chunks),
+                    exc_info=True,
+                )
+                continue
+
+            new_count = 0
+            for rel in chunk_relations:
+                if not isinstance(rel, dict):
+                    continue
                 head = str(rel.get("head") or "").strip()
-                if not self._speaker_matches_entity(speaker, head):
-                    log.debug(
-                        "speaker_filter: dropping %s -[%s]-> %s "
-                        "(head %r ≠ speaker %r)",
-                        head,
-                        label,
-                        rel.get("tail", ""),
-                        head,
-                        speaker,
-                    )
-                    continue  # misattributed — drop
+                tail = str(rel.get("tail") or "").strip()
+                label = str(rel.get("label") or rel.get("rel_type") or "").strip().upper()
+                if not head or not tail or not label:
+                    continue
+                triple = (head.lower(), label, tail.lower())
+                if triple in seen_triples:
+                    continue
+                seen_triples.add(triple)
+                all_relations.append(rel)
+                new_count += 1
 
-            filtered.append(rel)
+            log.debug(
+                "GLiREL chunk %d/%d: entities=%d found=%d new=%d",
+                chunk_idx + 1,
+                len(chunks),
+                len(chunk_entities),
+                len(chunk_relations),
+                new_count,
+            )
 
-        return filtered
+        log.info(
+            "GLiREL chunked extraction: %d chunks → %d unique relations",
+            len(chunks),
+            len(all_relations),
+        )
+        return all_relations
 
     def _build_relationships(
         self,

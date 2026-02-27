@@ -54,18 +54,17 @@ class RelationshipNoteNormalization:
     cohort: str | None = None
 
 
-_KELLOGG_CANONICAL = "Kellogg School of Management"
-_KELLOGG_ALIASES = (
-    "kellogg",
-    "kellogg emba",
-    "northwestern kellogg",
-    "northwestern university - kellogg",
-)
-_CAMPUS_ALIASES: dict[str, tuple[str, ...]] = {
-    "Miami": ("miami", "miami campus"),
-    "Evanston": ("evanston", "evanston campus"),
-    "Chicago": ("chicago", "chicago campus", "downtown chicago"),
-}
+# ── School / org normalization (config-driven, no hardcoded institution names) ─
+# All values come from env vars loaded by config.py:
+#   MOLLYGRAPH_SCHOOL_CANONICAL     → canonical display name for the school/org
+#   MOLLYGRAPH_SCHOOL_ALIASES       → comma-separated lowercase alias strings
+#   MOLLYGRAPH_SCHOOL_CAMPUS_ALIASES → JSON dict { "Campus": ["alias1", ...] }
+#
+# If MOLLYGRAPH_SCHOOL_CANONICAL is unset, school-specific classmate assertions
+# are never emitted; generic classmate/alumni signals still work.
+_SCHOOL_CANONICAL: str = config.SCHOOL_CANONICAL          # e.g. "Kellogg School of Management"
+_SCHOOL_ALIASES: tuple[str, ...] = config.SCHOOL_ALIASES  # e.g. ("kellogg", "kellogg emba", ...)
+_CAMPUS_ALIASES: dict[str, tuple[str, ...]] = config.SCHOOL_CAMPUS_ALIASES  # campus → aliases
 
 
 def _normalize_relationship_note(note: str | None) -> RelationshipNoteNormalization:
@@ -79,7 +78,8 @@ def _normalize_relationship_note(note: str | None) -> RelationshipNoteNormalizat
         return RelationshipNoteNormalization(text=None, high_confidence=False)
 
     lowered = raw.lower()
-    has_kellogg = any(alias in lowered for alias in _KELLOGG_ALIASES)
+    # Match school aliases only when a canonical school name is configured.
+    has_school = bool(_SCHOOL_CANONICAL) and any(alias in lowered for alias in _SCHOOL_ALIASES)
     has_classmate_signal = any(token in lowered for token in ("classmate", "cohort", "alumni", "emba"))
 
     cohort: str | None = None
@@ -93,7 +93,7 @@ def _normalize_relationship_note(note: str | None) -> RelationshipNoteNormalizat
             campus = canonical
             break
 
-    if has_kellogg and has_classmate_signal:
+    if has_school and has_classmate_signal:
         qualifiers: list[str] = []
         if campus:
             qualifiers.append(f"{campus} campus")
@@ -101,9 +101,9 @@ def _normalize_relationship_note(note: str | None) -> RelationshipNoteNormalizat
             qualifiers.append(cohort)
         suffix = f" ({', '.join(qualifiers)})" if qualifiers else ""
         return RelationshipNoteNormalization(
-            text=f"classmates from {_KELLOGG_CANONICAL}{suffix}",
+            text=f"classmates from {_SCHOOL_CANONICAL}{suffix}",
             high_confidence=True,
-            school=_KELLOGG_CANONICAL,
+            school=_SCHOOL_CANONICAL,
             campus=campus,
             cohort=cohort,
         )
@@ -162,7 +162,7 @@ def _extract_owner_name(text: str) -> str | None:
 
 
 def _extract_relationship_note(text: str) -> str | None:
-    """Extract free-text relationship note (e.g. 'Kellogg EMBA classmates')."""
+    """Extract free-text relationship note (e.g. 'EMBA classmates', 'cohort 2024')."""
     # "Relationship: ..." or "Notes: ..."
     for field in ("Relationship", "Notes", "Note"):
         val = _extract_field(text, field)
@@ -250,12 +250,12 @@ def reformat_contact_text(content: str) -> str | None:
     """Reformat a structured contact string into natural language for GLiREL extraction.
 
     Input (low GLiREL yield):
-        "Sarah Smith is a contact of Brian Meyer. Email: sarah@acme.com.
+        "Sarah Smith is a contact of Owner Name. Email: sarah@acme.com.
          Employer: Acme Corp. Title: VP Engineering. Location: Chicago, IL."
 
     Output (GLiREL-friendly):
         "Sarah Smith works at Acme Corp as VP Engineering. Sarah Smith is based in
-         Chicago, IL. Sarah Smith is a contact of Brian Meyer."
+         Chicago, IL. Sarah Smith is a contact of Owner Name."
 
     Returns the reformatted string, or None if the content cannot be parsed as
     a contact (so the pipeline can fall back to the original text).
