@@ -138,6 +138,20 @@ _SPACY_LABEL_MAP = {
 class ExtractionPipeline:
     """End-to-end extraction and graph/vector persistence."""
 
+    # ── Relation types that must have the *speaker* as the head entity ────────
+    # These are employment/hierarchy relations that are highly personal.  When
+    # GLiREL predicts one of these for a non-speaker head we almost certainly
+    # have context-leakage attribution ("account owner talks about Luke → WORKS_AT
+    # attributed to Luke OR falsely re-anchored to owner").  We drop them in
+    # _filter_speaker_relations() unless the head genuinely matches the speaker.
+    _SPEAKER_ANCHOR_REL_TYPES: frozenset[str] = frozenset({
+        "WORKS_AT",
+        "EMPLOYED_BY",
+        "WORKS_FOR",
+        "MANAGES",
+        "REPORTS_TO",
+    })
+
     # ── Class-level daily ingestion counters (reset when date changes) ────────
     # These are shared across all instances (there's only one per process).
     _counter_lock = threading.Lock()
@@ -643,6 +657,25 @@ class ExtractionPipeline:
                         raw_entities,
                     )
                     glirel_relations_found = len(glirel_relations)
+
+                    # ── Speaker-aware attribution filter ──────────────────────
+                    # Drop WORKS_AT/MANAGES/REPORTS_TO predictions where the
+                    # head entity does not match the message speaker.  This is
+                    # the primary mitigation for anchor-entity over-attribution.
+                    if speaker:
+                        _pre_filter_count = len(glirel_relations)
+                        glirel_relations = self._filter_speaker_relations(
+                            glirel_relations, speaker
+                        )
+                        _dropped = _pre_filter_count - len(glirel_relations)
+                        if _dropped:
+                            log.info(
+                                "GLiREL speaker_filter: dropped %d misattributed "
+                                "relations (speaker=%r)",
+                                _dropped,
+                                speaker,
+                            )
+
                     (
                         raw_relations_with_source,
                         glirel_overrides,
@@ -659,16 +692,22 @@ class ExtractionPipeline:
                         glirel_additions,
                     )
 
-                    training_examples = await asyncio.to_thread(
-                        self._glirel_enrichment.generate_training_examples,
-                        job.content,
-                        glirel_relations,
-                    )
-                    glirel_training_examples = len(training_examples)
-                    if training_examples:
-                        await asyncio.to_thread(
-                            self._glirel_enrichment.persist_training_examples,
-                            training_examples,
+                    if getattr(service_config, "GLIREL_SILVER_ENABLED", True):
+                        training_examples = await asyncio.to_thread(
+                            self._glirel_enrichment.generate_training_examples,
+                            job.content,
+                            glirel_relations,
+                        )
+                        glirel_training_examples = len(training_examples)
+                        if training_examples:
+                            await asyncio.to_thread(
+                                self._glirel_enrichment.persist_training_examples,
+                                training_examples,
+                            )
+                    else:
+                        log.debug(
+                            "GLiREL silver label generation skipped "
+                            "(GLIREL_SILVER_ENABLED=False)"
                         )
                 except Exception:
                     log.warning(
@@ -1081,6 +1120,124 @@ class ExtractionPipeline:
                 result.append(relation)
 
         return result
+
+    # ── Speaker-aware helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _speaker_matches_entity(speaker: str, entity_name: str) -> bool:
+        """Return True if *entity_name* refers to the speaker.
+
+        Handles:
+        - First-person pronouns ("I", "me", "my" → always the speaker)
+        - Exact name match ("Owner Name" == "Owner Name")
+        - Partial name match (entity is a subset of speaker name tokens,
+          e.g. first name matches full speaker name)
+        """
+        if not speaker or not entity_name:
+            return False
+
+        entity_norm = re.sub(r"\s+", " ", entity_name.strip().lower())
+
+        # First-person singular / plural pronouns always refer to the speaker
+        if entity_norm in {"i", "me", "my", "myself", "we", "our", "us"}:
+            return True
+
+        speaker_norm = re.sub(r"\s+", " ", speaker.strip().lower())
+
+        # Exact match
+        if speaker_norm == entity_norm:
+            return True
+
+        # Entity tokens are a strict subset of speaker name tokens
+        # (e.g. first-name token ⊆ full-name tokens)
+        speaker_parts = set(speaker_norm.split())
+        entity_parts = entity_norm.split()
+        if entity_parts and all(p in speaker_parts for p in entity_parts):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_concept_entity(
+        entity_name: str,
+        entity_type_map: "dict[str, str] | None" = None,
+    ) -> bool:
+        """Return True if *entity_name* appears to be a concept/thing, not a person.
+
+        Used to avoid filtering third-party person relations that should be kept
+        (e.g. "Luke WORKS_AT Google" is a valid fact about Luke; only suppress
+        when the relation is falsely anchored to the *speaker*).
+
+        Priority order:
+        1. entity_type_map lookup (ground truth from GLiNER)
+        2. Heuristics (numeric prefix, very short token, etc.)
+        """
+        if not entity_name:
+            return True
+
+        entity_lower = entity_name.strip().lower()
+
+        if entity_type_map:
+            normalized = re.sub(r"\s+", " ", entity_lower)
+            etype = entity_type_map.get(normalized, "")
+            if etype:
+                return etype != "Person"
+
+        # Heuristics fallback
+        if re.match(r"^\d", entity_lower):      # starts with digit
+            return True
+        if len(entity_lower) <= 2 and entity_lower not in {"i"}:
+            return True
+
+        return False
+
+    def _filter_speaker_relations(
+        self,
+        relations: list[dict[str, Any]],
+        speaker: str,
+    ) -> list[dict[str, Any]]:
+        """Drop WORKS_AT/MANAGES/REPORTS_TO relations whose head ≠ speaker.
+
+        GLiREL suffers from *anchor-entity over-attribution*: because the owner's
+        context dominates the training distribution, employment/hierarchy
+        predicates extracted from his messages frequently end up attributed to
+        third parties mentioned in the text
+        OR re-anchored to the owner when the text describes someone else.
+
+        Conservative rule:
+          • Keep the relation if head IS the speaker (or a first-person pronoun).
+          • Drop the relation if head is anyone else — the signal is unreliable
+            and we'd rather lose it than pollute the graph / training data.
+
+        Unaffected: all other relation types (KNOWS, USES, LOCATED_IN, …).
+        """
+        if not speaker:
+            return relations
+
+        filtered: list[dict[str, Any]] = []
+        for rel in relations:
+            if not isinstance(rel, dict):
+                continue
+
+            label = str(rel.get("label") or rel.get("rel_type") or "").strip().upper()
+
+            if label in self._SPEAKER_ANCHOR_REL_TYPES:
+                head = str(rel.get("head") or "").strip()
+                if not self._speaker_matches_entity(speaker, head):
+                    log.debug(
+                        "speaker_filter: dropping %s -[%s]-> %s "
+                        "(head %r ≠ speaker %r)",
+                        head,
+                        label,
+                        rel.get("tail", ""),
+                        head,
+                        speaker,
+                    )
+                    continue  # misattributed — drop
+
+            filtered.append(rel)
+
+        return filtered
 
     def _build_relationships(
         self,

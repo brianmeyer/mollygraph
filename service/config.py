@@ -214,6 +214,11 @@ GLIREL_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_ENABLED", "false").lower() ==
 GLIREL_MODEL = os.environ.get("MOLLYGRAPH_GLIREL_MODEL", "jackboyla/glirel-large-v0")
 GLIREL_CONFIDENCE_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_CONFIDENCE", "0.15"))  # GLiREL scores rarely exceed 0.3; 0.15 is a reasonable threshold
 GLIREL_TRAINING_THRESHOLD = float(os.environ.get("MOLLYGRAPH_GLIREL_TRAINING_THRESHOLD", "0.4"))
+# Silver-label generation for GLiREL training data.
+# Temporarily disabled (False) to prevent anchor-entity over-attribution from
+# polluting GLiNER training data until speaker-aware filtering is validated.
+# Re-enable by setting MOLLYGRAPH_GLIREL_SILVER_ENABLED=true in the env.
+GLIREL_SILVER_ENABLED = os.environ.get("MOLLYGRAPH_GLIREL_SILVER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
 # ── GLiNER2 training ──────────────────────────────────────────────────────────
 GLINER_BASE_MODEL                  = os.environ.get("GLINER_BASE_MODEL", "fastino/gliner2-large-v1")

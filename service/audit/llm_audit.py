@@ -124,7 +124,7 @@ def build_audit_prompt(rels: list[dict[str, Any]]) -> str:
     return (
         "You are auditing a personal knowledge graph extracted from conversations.\n\n"
         f"Valid relationship types: {valid_types}\n\n"
-        "This graph tracks entities Brian knows, uses, and talks about.\n\n"
+        "This graph tracks entities the account owner knows, uses, and talks about.\n\n"
         "Review each relationship below. For each, return a verdict:\n"
         '- "verify"     -> relationship is correct, mark as verified\n'
         '- "reclassify" -> wrong type, suggest the correct type from the valid list\n'
