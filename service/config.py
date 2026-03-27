@@ -23,6 +23,15 @@ QUEUE_DB_PATH     = Path(
 SQLITE_VEC_DB_PATH = Path(
     os.environ.get("MOLLYGRAPH_SQLITE_VEC_DB", str(GRAPH_MEMORY_DIR / "vectors.db"))
 ).expanduser()
+LADYBUG_GRAPH_DB_PATH = Path(
+    os.environ.get("MOLLYGRAPH_LADYBUG_GRAPH_DB", str(GRAPH_MEMORY_DIR / "graph.lbug"))
+).expanduser()
+LADYBUG_DB_PATH = Path(
+    os.environ.get(
+        "MOLLYGRAPH_LADYBUG_VECTOR_DB",
+        os.environ.get("MOLLYGRAPH_LADYBUG_DB", str(GRAPH_MEMORY_DIR / "vectors.lbug")),
+    )
+).expanduser()
 ZVEC_COLLECTION_DIR = Path(
     os.environ.get("MOLLYGRAPH_ZVEC_DIR", str(GRAPH_MEMORY_DIR / "zvec_collection"))
 ).expanduser()
@@ -62,7 +71,7 @@ _SCHOOL_CAMPUS_JSON: str = os.environ.get("MOLLYGRAPH_SCHOOL_CAMPUS_ALIASES", ""
 try:
     SCHOOL_CAMPUS_ALIASES: dict[str, tuple[str, ...]] = {
         k: tuple(str(v).lower() for v in vs)
-        for k, vs in (_json.loads(_SCHOOL_CAMPUS_JSON).items() if _SCHOOL_CAMPUS_JSON else {}).items()
+        for k, vs in (_json.loads(_SCHOOL_CAMPUS_JSON) if _SCHOOL_CAMPUS_JSON else {}).items()
     }
 except Exception:
     SCHOOL_CAMPUS_ALIASES = {}
@@ -179,7 +188,8 @@ HOST = os.environ.get("GRAPH_MEMORY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GRAPH_MEMORY_PORT", "7422"))
 API_KEY = os.environ.get("MOLLYGRAPH_API_KEY", "dev-key-change-in-production")
 TEST_MODE = os.environ.get("MOLLYGRAPH_TEST_MODE", "0").strip().lower() in {"1", "true", "yes"}
-VECTOR_BACKEND = os.environ.get("MOLLYGRAPH_VECTOR_BACKEND", "zvec")
+GRAPH_BACKEND = os.environ.get("MOLLYGRAPH_GRAPH_BACKEND", "ladybug").strip().lower()
+VECTOR_BACKEND = os.environ.get("MOLLYGRAPH_VECTOR_BACKEND", "ladybug")
 RUNTIME_PROFILE = os.environ.get("MOLLYGRAPH_RUNTIME_PROFILE", "hybrid").strip().lower()
 STRICT_AI = (
     RUNTIME_PROFILE == "strict_ai"
@@ -189,14 +199,20 @@ SPACY_ENRICHMENT = os.environ.get("MOLLYGRAPH_SPACY_ENRICHMENT", "1").strip().lo
 SPACY_MODEL = os.environ.get("MOLLYGRAPH_SPACY_MODEL", "en_core_web_sm")
 SPACY_MIN_GLINER_ENTITIES = int(os.environ.get("MOLLYGRAPH_SPACY_MIN_GLINER_ENTITIES", "2"))
 EMBEDDING_BACKEND = os.environ.get("MOLLYGRAPH_EMBEDDING_BACKEND", "").strip().lower()  # legacy override; empty = use tier chain
+DEFAULT_LOCAL_EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-s"
 # Embedding tier chain (falls through on failure; hash is always last resort)
 EMBEDDING_TIER_ORDER = os.environ.get(
     "MOLLYGRAPH_EMBEDDING_TIER_ORDER",
-    "sentence-transformers,ollama,cloud,hash",
+    "sentence-transformers,ollama,hash",
 ).split(",")
 # Per-tier embedding config
 EMBEDDING_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_MODEL", "")  # empty = use tier default
-EMBEDDING_ST_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_ST_MODEL", "")  # sentence-transformers model
+EMBEDDING_ST_MODEL = (
+    os.environ.get("MOLLYGRAPH_EMBEDDING_ST_MODEL", "").strip()
+    or os.environ.get("MOLLYGRAPH_EMBEDDING_MODEL", "").strip()
+    or DEFAULT_LOCAL_EMBEDDING_MODEL
+)  # sentence-transformers model
+EMBEDDING_VECTOR_DIMENSION = int(os.environ.get("MOLLYGRAPH_EMBEDDING_VECTOR_DIMENSION", "384"))
 EMBEDDING_OLLAMA_MODEL = os.environ.get("MOLLYGRAPH_EMBEDDING_OLLAMA_MODEL",
     os.environ.get("MOLLYGRAPH_OLLAMA_EMBED_MODEL", "nomic-embed-text"))  # also accepts old var
 EMBEDDING_CLOUD_PROVIDER = os.environ.get("MOLLYGRAPH_EMBEDDING_CLOUD_PROVIDER", "openai")  # openai, google, etc.
@@ -368,6 +384,7 @@ for _d in (
     SUGGESTIONS_DIR,
     QUEUE_DB_PATH.parent,
     SQLITE_VEC_DB_PATH.parent,
+    LADYBUG_DB_PATH.parent,
     ZVEC_COLLECTION_DIR.parent,
 ):
     try:

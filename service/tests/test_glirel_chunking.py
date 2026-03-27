@@ -245,6 +245,16 @@ class TestGLiRELChunking(unittest.TestCase):
 
     def setUp(self) -> None:
         self.pipeline = _StubPipeline()
+        self._method_config = getattr(
+            getattr(self.pipeline, "_chunk_content_for_glirel"),
+            "__globals__",
+            {},
+        ).get("service_config")
+
+    def _set_chunk_size(self, value: int) -> None:
+        service_config.GLIREL_CHUNK_SIZE = value
+        if self._method_config is not None:
+            self._method_config.GLIREL_CHUNK_SIZE = value
 
     # ── Empty / trivial content ──────────────────────────────────────────────
 
@@ -274,7 +284,7 @@ class TestGLiRELChunking(unittest.TestCase):
 
     def test_multi_message_log_splits_into_chunks(self) -> None:
         """12 message-log entries with chunk_size=3 → 4 chunks."""
-        service_config.GLIREL_CHUNK_SIZE = 3
+        self._set_chunk_size(3)
         content = _make_messages(12, fmt="message_log")
         result = self.pipeline._chunk_content_for_glirel(content)
         self.assertGreater(len(result), 1, "Multi-message log must produce >1 chunk")
@@ -292,7 +302,7 @@ class TestGLiRELChunking(unittest.TestCase):
             )
 
     def test_six_messages_makes_two_chunks_of_three(self) -> None:
-        service_config.GLIREL_CHUNK_SIZE = 3
+        self._set_chunk_size(3)
         content = _make_messages(6, fmt="message_log")
         result = self.pipeline._chunk_content_for_glirel(content)
         self.assertEqual(len(result), 2, "6 messages / chunk_size=3 → 2 chunks")
@@ -300,7 +310,7 @@ class TestGLiRELChunking(unittest.TestCase):
     # ── Statement format ─────────────────────────────────────────────────────
 
     def test_statement_format_splits(self) -> None:
-        service_config.GLIREL_CHUNK_SIZE = 3
+        self._set_chunk_size(3)
         content = _make_messages(6, fmt="statement")
         result = self.pipeline._chunk_content_for_glirel(content)
         self.assertGreater(len(result), 1, "Statement format should split")
@@ -308,7 +318,7 @@ class TestGLiRELChunking(unittest.TestCase):
     # ── Email format ─────────────────────────────────────────────────────────
 
     def test_email_format_splits(self) -> None:
-        service_config.GLIREL_CHUNK_SIZE = 3
+        self._set_chunk_size(3)
         content = _make_messages(6, fmt="email")
         result = self.pipeline._chunk_content_for_glirel(content)
         self.assertGreater(len(result), 1, "Email format should split")
@@ -316,7 +326,7 @@ class TestGLiRELChunking(unittest.TestCase):
     # ── chunk_size = 1 ───────────────────────────────────────────────────────
 
     def test_chunk_size_one_each_message_separate(self) -> None:
-        service_config.GLIREL_CHUNK_SIZE = 1
+        self._set_chunk_size(1)
         content = _make_messages(4, fmt="message_log")
         result = self.pipeline._chunk_content_for_glirel(content)
         self.assertEqual(len(result), 4, "chunk_size=1 → one chunk per message")
@@ -337,7 +347,7 @@ class TestGLiRELChunking(unittest.TestCase):
 
     def test_no_content_lost_across_chunks(self) -> None:
         """All original messages should appear in some chunk (no data loss)."""
-        service_config.GLIREL_CHUNK_SIZE = 3
+        self._set_chunk_size(3)
         n = 9
         content = _make_messages(n, fmt="message_log")
         chunks = self.pipeline._chunk_content_for_glirel(content)

@@ -1,96 +1,122 @@
 """MollyGraph MCP server (HTTP proxy)."""
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception:  # pragma: no cover - optional dependency path
+    FastMCP = None
 
 MOLLYGRAPH_URL = os.getenv("MOLLYGRAPH_URL", "http://localhost:7422")
 API_KEY = os.getenv("MOLLYGRAPH_API_KEY", "dev-key-change-in-production")
 
-http_client: httpx.AsyncClient | None = None
+_PROBE_TIMEOUT = httpx.Timeout(3.0, connect=1.5)
+log = logging.getLogger("mollygraph.mcp")
 
 
-@asynccontextmanager
-async def app_lifespan(_server: FastMCP):
-    global http_client
-    http_client = httpx.AsyncClient(
-        base_url=MOLLYGRAPH_URL,
-        headers={"Authorization": f"Bearer {API_KEY}"},
-        timeout=45.0,
-    )
-    yield
-    await http_client.aclose()
-
-
-mcp = FastMCP("mollygraph", lifespan=app_lifespan)
-
-
-def _ensure_ok(resp: httpx.Response) -> None:
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:400]}")
-
-
-@mcp.tool()
-async def add_episode(content: str, source: str = "mcp", priority: int = 1) -> str:
-    resp = await http_client.post(
-        "/ingest",
-        params={"content": content, "source": source, "priority": priority},
-    )
-    _ensure_ok(resp)
-    data = resp.json()
-    return f"queued {data.get('job_id', '')[:8]} (depth={data.get('queue_depth', 0)})"
-
-
-@mcp.tool()
-async def search_facts(query: str) -> str:
-    resp = await http_client.get("/query", params={"q": query})
-    _ensure_ok(resp)
-    data = resp.json()
-    results = data.get("results", [])
-    if not results:
-        return f"no results for {query!r}"
-
-    lines = [f"results for {query!r}:"]
-    for item in results[:5]:
-        entity = item.get("entity", "unknown")
-        lines.append(f"- {entity}")
-        for fact in item.get("facts", [])[:4]:
-            rel = fact.get("rel_type", "RELATED_TO")
-            target = fact.get("target_name", "?")
-            lines.append(f"  {rel} -> {target}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_nodes(query: str, node_type: str = "", limit: int = 20) -> str:
-    """Search Neo4j nodes by name and optional type via the /entities endpoint.
-
-    Returns a newline-delimited list of matching entity names (and types).
-    Falls back to the /query response if /entities is unavailable.
-
-    Args:
-        query:     Substring to match against entity names (case-insensitive).
-        node_type: Optional entity type filter, e.g. 'Person' or 'Technology'.
-        limit:     Maximum number of results to return (default 20, max 50).
-    """
-    effective_limit = max(1, min(int(limit), 50))
-
-    # Build request parameters for GET /entities.
-    params: dict = {"limit": effective_limit, "offset": 0}
-    if node_type:
-        params["type"] = node_type
-
+def _probe_server_capabilities(base_url: str, api_key: str) -> set[str]:
     try:
-        resp = await http_client.get("/entities", params=params)
+        with httpx.Client(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=_PROBE_TIMEOUT,
+        ) as client:
+            response = client.get("/health")
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        log.debug("MCP capability probe failed for %s: %s", base_url, exc)
+        return set()
+
+    raw_capabilities = payload.get("graph_capabilities", [])
+    if not isinstance(raw_capabilities, list):
+        return set()
+    return {str(item).strip() for item in raw_capabilities if str(item).strip()}
+
+
+def _build_server(base_url: str, api_key: str, capabilities: set[str] | None = None) -> FastMCP:
+    if FastMCP is None:
+        raise RuntimeError(
+            "MCP dependency is not installed. Install the MCP extra before running the adapter."
+        )
+
+    detected_capabilities = capabilities if capabilities is not None else _probe_server_capabilities(base_url, api_key)
+    show_audit_tools = "audit" in detected_capabilities
+    show_training_tools = "training" in detected_capabilities
+
+    http_client: httpx.AsyncClient | None = None
+
+    @asynccontextmanager
+    async def app_lifespan(_server: FastMCP):
+        nonlocal http_client
+        http_client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=45.0,
+        )
+        try:
+            yield
+        finally:
+            await http_client.aclose()
+
+    mcp = FastMCP("mollygraph", lifespan=app_lifespan)
+
+    def _client() -> httpx.AsyncClient:
+        if http_client is None:
+            raise RuntimeError("MollyGraph MCP HTTP client is not initialized")
+        return http_client
+
+    def _ensure_ok(resp: httpx.Response) -> None:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:400]}")
+
+    @mcp.tool()
+    async def add_episode(content: str, source: str = "mcp", priority: int = 1) -> str:
+        resp = await _client().post(
+            "/ingest",
+            params={"content": content, "source": source, "priority": priority},
+        )
+        _ensure_ok(resp)
+        data = resp.json()
+        return f"queued {data.get('job_id', '')[:8]} (depth={data.get('queue_depth', 0)})"
+
+    @mcp.tool()
+    async def search_facts(query: str) -> str:
+        resp = await _client().get("/query", params={"q": query})
+        _ensure_ok(resp)
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return f"no results for {query!r}"
+
+        lines = [f"results for {query!r}:"]
+        for item in results[:5]:
+            entity = item.get("entity", "unknown")
+            lines.append(f"- {entity}")
+            for fact in item.get("facts", [])[:4]:
+                rel = fact.get("rel_type", "RELATED_TO")
+                target = fact.get("target_name", "?")
+                lines.append(f"  {rel} -> {target}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def search_nodes(query: str, node_type: str = "", limit: int = 20) -> str:
+        """Search graph entities by name and optional type via the /entities endpoint."""
+        effective_limit = max(1, min(int(limit), 50))
+        params: dict[str, object] = {"limit": effective_limit, "offset": 0}
+        if node_type:
+            params["type"] = node_type
+
+        resp = await _client().get("/entities", params=params)
         _ensure_ok(resp)
         data = resp.json()
         entities: list[dict] = data.get("entities", [])
 
-        # Filter by name substring (server returns all of a given type;
-        # we narrow down client-side so the limit is applied after filtering).
         query_lower = query.strip().lower()
         matches: list[str] = []
         for ent in entities:
@@ -99,8 +125,8 @@ async def search_nodes(query: str, node_type: str = "", limit: int = 20) -> str:
                 continue
             if query_lower and query_lower not in name.lower():
                 continue
-            etype = str(ent.get("entity_type") or "").strip()
-            matches.append(f"{name} [{etype}]" if etype else name)
+            entity_type = str(ent.get("entity_type") or "").strip()
+            matches.append(f"{name} [{entity_type}]" if entity_type else name)
             if len(matches) >= effective_limit:
                 break
 
@@ -108,127 +134,108 @@ async def search_nodes(query: str, node_type: str = "", limit: int = 20) -> str:
             return "\n".join(matches)
         return f"no entities matched {query!r}" + (f" (type={node_type!r})" if node_type else "")
 
-    except Exception:
-        # Graceful fallback: attempt /query if /entities is not yet available.
-        try:
-            resp = await http_client.get("/query", params={"q": query})
+    @mcp.tool()
+    async def get_entity_context(name: str) -> str:
+        resp = await _client().get(f"/entity/{name}")
+        if resp.status_code == 404:
+            return f"entity {name!r} not found"
+        _ensure_ok(resp)
+
+        data = resp.json()
+        facts = data.get("facts", [])
+        context = data.get("context", {})
+        lines = [f"entity: {name}", "facts:"]
+        for fact in facts[:10]:
+            lines.append(f"- {fact.get('rel_type', 'RELATED_TO')} -> {fact.get('target_name', '?')}")
+
+        direct = context.get("direct_connections", []) if isinstance(context, dict) else []
+        if direct:
+            lines.append("direct:")
+            for row in direct[:8]:
+                lines.append(f"- {row.get('rel_type', 'RELATED_TO')} {row.get('target_name', '?')}")
+
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_queue_status() -> str:
+        resp = await _client().get("/stats")
+        _ensure_ok(resp)
+        data = resp.json()
+        queue = data.get("queue", {})
+        vector = data.get("vector_store", {})
+        return (
+            f"pending={queue.get('pending', 0)} "
+            f"processing={queue.get('processing', 0)} "
+            f"vector={vector}"
+        )
+
+    @mcp.tool()
+    async def delete_entity(name: str) -> str:
+        """Delete an entity by name from the graph and the vector store."""
+        resp = await _client().request("DELETE", f"/entity/{name}")
+        if resp.status_code == 404:
+            return f"entity {name!r} not found"
+        _ensure_ok(resp)
+        data = resp.json()
+        return (
+            f"deleted entity={data.get('entity')} "
+            f"relationships_removed={data.get('relationships_removed', 0)} "
+            f"vector_removed={data.get('vector_removed', False)}"
+        )
+
+    @mcp.tool()
+    async def prune_entities(names: list[str]) -> str:
+        """Bulk delete entities by name from the graph and the vector store."""
+        resp = await _client().post("/entities/prune", json={"names": names})
+        _ensure_ok(resp)
+        data = resp.json()
+        return (
+            f"pruned={data.get('pruned', 0)} "
+            f"vectors_removed={data.get('vectors_removed', 0)} "
+            f"entities={data.get('entities', [])}"
+        )
+
+    if show_audit_tools:
+        @mcp.tool()
+        async def run_audit(limit: int = 500, dry_run: bool = False, schedule: str = "nightly") -> str:
+            resp = await _client().post(
+                "/audit",
+                json={
+                    "limit": max(1, int(limit)),
+                    "dry_run": bool(dry_run),
+                    "schedule": schedule,
+                },
+            )
             _ensure_ok(resp)
             data = resp.json()
-            names: list[str] = []
-            for item in data.get("results", []):
-                name = str(item.get("entity") or "").strip()
-                if name:
-                    names.append(name)
-            if names:
-                return "\n".join(names[:effective_limit])
-        except Exception:
-            pass
-        return f"no entities matched {query!r}"
+            return (
+                f"audit status={data.get('status', 'ok')} "
+                f"scanned={data.get('relationships_scanned', 0)} "
+                f"verified={data.get('verified', 0)} "
+                f"autofixed={data.get('auto_fixed', 0)}"
+            )
+
+    if show_training_tools:
+        @mcp.tool()
+        async def get_training_status() -> str:
+            resp = await _client().get("/train/status")
+            _ensure_ok(resp)
+            data = resp.json().get("gliner", {})
+            return (
+                f"examples={data.get('examples_accumulated', 0)} "
+                f"last={data.get('last_finetune_at', '') or data.get('last_finetune', '')} "
+                f"status={data.get('last_cycle_status', '')}"
+            )
+
+    return mcp
 
 
-@mcp.tool()
-async def get_entity_context(name: str) -> str:
-    resp = await http_client.get(f"/entity/{name}")
-    if resp.status_code == 404:
-        return f"entity {name!r} not found"
-    _ensure_ok(resp)
-
-    data = resp.json()
-    facts = data.get("facts", [])
-    context = data.get("context", {})
-    lines = [f"entity: {name}", "facts:"]
-    for fact in facts[:10]:
-        lines.append(f"- {fact.get('rel_type', 'RELATED_TO')} -> {fact.get('target_name', '?')}")
-
-    direct = context.get("direct_connections", []) if isinstance(context, dict) else []
-    if direct:
-        lines.append("direct:")
-        for row in direct[:8]:
-            lines.append(f"- {row.get('rel_type', 'RELATED_TO')} {row.get('target_name', '?')}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def get_queue_status() -> str:
-    resp = await http_client.get("/stats")
-    _ensure_ok(resp)
-    data = resp.json()
-    queue = data.get("queue", {})
-    vector = data.get("vector_store", {})
-    return (
-        f"pending={queue.get('pending', 0)} "
-        f"processing={queue.get('processing', 0)} "
-        f"vector={vector}"
-    )
-
-
-@mcp.tool()
-async def delete_entity(name: str) -> str:
-    """Delete an entity by name from Neo4j and the vector store.
-
-    All relationships attached to the entity are also removed (DETACH DELETE).
-    """
-    resp = await http_client.request("DELETE", f"/entity/{name}")
-    if resp.status_code == 404:
-        return f"entity {name!r} not found"
-    _ensure_ok(resp)
-    data = resp.json()
-    return (
-        f"deleted entity={data.get('entity')} "
-        f"relationships_removed={data.get('relationships_removed', 0)} "
-        f"vector_removed={data.get('vector_removed', False)}"
-    )
-
-
-@mcp.tool()
-async def prune_entities(names: list[str]) -> str:
-    """Bulk delete entities by name from Neo4j and the vector store.
-
-    Pass a list of entity names; each is removed along with all its relationships.
-    """
-    resp = await http_client.post("/entities/prune", json={"names": names})
-    _ensure_ok(resp)
-    data = resp.json()
-    pruned = data.get("pruned", 0)
-    entities = data.get("entities", [])
-    vectors_removed = data.get("vectors_removed", 0)
-    return (
-        f"pruned={pruned} vectors_removed={vectors_removed} entities={entities}"
-    )
-
-
-@mcp.tool()
-async def run_audit(limit: int = 500, dry_run: bool = False, schedule: str = "nightly") -> str:
-    resp = await http_client.post(
-        "/audit",
-        json={
-            "limit": max(1, int(limit)),
-            "dry_run": bool(dry_run),
-            "schedule": schedule,
-        },
-    )
-    _ensure_ok(resp)
-    data = resp.json()
-    return (
-        f"audit status={data.get('status', 'ok')} "
-        f"scanned={data.get('relationships_scanned', 0)} "
-        f"verified={data.get('verified', 0)} "
-        f"autofixed={data.get('auto_fixed', 0)}"
-    )
-
-
-@mcp.tool()
-async def get_training_status() -> str:
-    resp = await http_client.get("/train/status")
-    _ensure_ok(resp)
-    data = resp.json().get("gliner", {})
-    return (
-        f"examples={data.get('examples_accumulated', 0)} "
-        f"last={data.get('last_finetune_at', '') or data.get('last_finetune', '')} "
-        f"status={data.get('last_cycle_status', '')}"
-    )
+mcp = _build_server(MOLLYGRAPH_URL, API_KEY) if FastMCP is not None else None
 
 
 if __name__ == "__main__":
+    if mcp is None:
+        raise RuntimeError(
+            "MCP dependency is not installed. Install the MCP extra before running the adapter."
+        )
     mcp.run(transport="stdio")

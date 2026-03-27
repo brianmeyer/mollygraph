@@ -1,16 +1,87 @@
-"""Shared runtime accessor for the active BiTemporalGraph instance."""
+"""Shared runtime accessor for the active graph backend instance."""
 from __future__ import annotations
 
 import threading
 
 import config
-from memory.graph import BiTemporalGraph
+from memory.graph import BiTemporalGraph, GraphBackend, LadybugGraph
 
-_GRAPH_INSTANCE: BiTemporalGraph | None = None
+_GRAPH_INSTANCE: GraphBackend | None = None
 _GRAPH_LOCK = threading.Lock()
 
+_GRAPH_CAPABILITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "core_memory": (
+        "upsert_entity",
+        "upsert_relationship",
+        "create_episode",
+        "get_current_facts",
+        "get_entity_context",
+    ),
+    "decisions": ("create_decision", "list_decisions", "get_decision"),
+    "audit": (
+        "get_relationships_for_audit",
+        "get_audit_coverage_metrics",
+        "set_relationship_audit_status",
+        "reclassify_relationship",
+        "delete_specific_relationship",
+    ),
+    "maintenance": (
+        "run_strength_decay_sync",
+        "delete_orphan_entities_sync",
+        "delete_self_referencing_rels",
+    ),
+}
 
-def set_graph_instance(graph: BiTemporalGraph | None) -> None:
+
+def create_graph_instance() -> GraphBackend:
+    backend = (config.GRAPH_BACKEND or "neo4j").strip().lower()
+    if backend == "ladybug":
+        return LadybugGraph(config.LADYBUG_GRAPH_DB_PATH)
+    return BiTemporalGraph(
+        config.NEO4J_URI,
+        config.NEO4J_USER,
+        config.NEO4J_PASSWORD,
+    )
+
+
+def get_graph_backend_name(graph: GraphBackend | object | None = None) -> str:
+    if isinstance(graph, LadybugGraph):
+        return "ladybug"
+    if isinstance(graph, BiTemporalGraph):
+        return "neo4j"
+    return (config.GRAPH_BACKEND or "neo4j").strip().lower()
+
+
+def graph_supports_capability(capability: str, graph: GraphBackend | object | None = None) -> bool:
+    required = _GRAPH_CAPABILITY_REQUIREMENTS.get(capability)
+    if required and graph is not None:
+        return all(callable(getattr(graph, name, None)) for name in required)
+
+    backend = get_graph_backend_name(graph)
+    if capability == "training":
+        return backend == "neo4j" or bool(getattr(graph, "driver", None))
+    if capability in {"audit", "maintenance"}:
+        return backend == "neo4j"
+    if capability == "decisions":
+        return backend == "neo4j" or (
+            graph is not None
+            and all(
+                callable(getattr(graph, name, None))
+                for name in _GRAPH_CAPABILITY_REQUIREMENTS["decisions"]
+            )
+        )
+    return True
+
+
+def get_graph_capabilities(graph: GraphBackend | object | None = None) -> list[str]:
+    capabilities = ["core_memory"]
+    for capability in ("decisions", "audit", "maintenance", "training"):
+        if graph_supports_capability(capability, graph):
+            capabilities.append(capability)
+    return capabilities
+
+
+def set_graph_instance(graph: GraphBackend | None) -> None:
     """Register or clear the process-wide graph instance."""
     global _GRAPH_INSTANCE
     with _GRAPH_LOCK:
@@ -25,12 +96,12 @@ def set_graph_instance(graph: BiTemporalGraph | None) -> None:
             pass
 
 
-def get_graph_instance() -> BiTemporalGraph | None:
+def get_graph_instance() -> GraphBackend | None:
     """Return the current graph instance when initialized."""
     return _GRAPH_INSTANCE
 
 
-def require_graph_instance() -> BiTemporalGraph:
+def require_graph_instance() -> GraphBackend:
     """Return the active graph instance, lazily initializing if needed.
 
     Uses double-checked locking to avoid creating duplicate instances.
@@ -46,11 +117,7 @@ def require_graph_instance() -> BiTemporalGraph:
             # Another thread beat us here.
             return _GRAPH_INSTANCE
 
-        new_instance = BiTemporalGraph(
-            config.NEO4J_URI,
-            config.NEO4J_USER,
-            config.NEO4J_PASSWORD,
-        )
+        new_instance = create_graph_instance()
         # Capture any previous instance to close *outside* the lock (mirrors
         # set_graph_instance() logic and avoids potential re-entrancy issues).
         previous = _GRAPH_INSTANCE

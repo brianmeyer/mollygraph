@@ -8,10 +8,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from runtime_graph import get_graph_instance
+from runtime_graph import get_graph_backend_name, graph_supports_capability
+
+import config
 
 from api.deps import require_runtime_ready, verify_api_key
 
-router = APIRouter()
+router = APIRouter(include_in_schema=config.GRAPH_BACKEND == "neo4j")
+
+
+def _require_decision_support(graph: Any) -> None:
+    if graph_supports_capability("decisions", graph):
+        return
+    backend = get_graph_backend_name(graph)
+    raise HTTPException(
+        status_code=501,
+        detail=f"Decision traces are not supported on graph backend '{backend}'",
+    )
 
 
 class CreateDecisionRequest(BaseModel):
@@ -51,6 +64,7 @@ async def create_decision(
 ) -> dict[str, Any]:
     require_runtime_ready()
     graph = get_graph_instance()
+    _require_decision_support(graph)
     try:
         return graph.create_decision(
             decision=body.decision,
@@ -80,6 +94,7 @@ async def list_decisions(
 ) -> dict[str, Any]:
     require_runtime_ready()
     graph = get_graph_instance()
+    _require_decision_support(graph)
     items = graph.list_decisions(q=q, decided_by=decided_by, limit=limit)
     return {
         "items": items,
@@ -95,6 +110,7 @@ async def get_decision(
 ) -> dict[str, Any]:
     require_runtime_ready()
     graph = get_graph_instance()
+    _require_decision_support(graph)
     row = graph.get_decision(decision_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Decision '{decision_id}' not found")

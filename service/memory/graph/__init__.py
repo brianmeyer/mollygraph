@@ -1,4 +1,4 @@
-"""Unified Neo4j graph module with bi-temporal tracking and legacy helpers."""
+"""Unified graph module exposing both Neo4j and Ladybug backends."""
 from __future__ import annotations
 
 import hashlib
@@ -29,6 +29,10 @@ from .constants import (
     recency_score,
 )
 from .core import BiTemporalGraph
+from .ladybug import LadybugGraph
+
+GraphBackend = BiTemporalGraph | LadybugGraph
 
 # Preserve the legacy module path for reflection/pickling compatibility.
 BiTemporalGraph.__module__ = __name__
+LadybugGraph.__module__ = __name__

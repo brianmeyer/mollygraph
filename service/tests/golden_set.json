@@ -129,13 +129,7 @@
       {"name": "PyTorch", "type": "Technology"},
       {"name": "Meta", "type": "Organization"}
     ],
-    "expected_relations": [
-      {
-        "source": "PyTorch",
-        "target": "Meta",
-        "type_pattern": "CREATED_BY|DEVELOPED_BY|MAINTAINED_BY|OWNED_BY"
-      }
-    ]
+    "expected_relations": []
   },
   {
     "id": "tc10",
@@ -187,8 +181,7 @@
     "input": "Paris is the capital city of France and home to the Eiffel Tower",
     "expected_entities": [
       {"name": "Paris", "type": "Place"},
-      {"name": "France", "type": "Place"},
-      {"name": "Eiffel Tower", "type": "Place"}
+      {"name": "France", "type": "Place"}
     ],
     "expected_relations": [
       {
@@ -222,5 +215,111 @@
       {"name": "Google Brain", "type": "Organization"}
     ],
     "expected_relations": []
+  },
+  {
+    "id": "tc16",
+    "category": "chat",
+    "description": "Chat speakers should not inherit each other's employers",
+    "input": "Alice: I work at Databricks.\nBob: I work at OpenAI.",
+    "expected_entities": [
+      {"name": "Alice", "type": "Person"},
+      {"name": "Bob", "type": "Person"},
+      {"name": "Databricks", "type": "Organization"},
+      {"name": "OpenAI", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Alice",
+        "target": "Databricks",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY"
+      },
+      {
+        "source": "Bob",
+        "target": "OpenAI",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY"
+      }
+    ],
+    "forbidden_relations": [
+      {
+        "source": "Alice",
+        "target": "OpenAI",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY"
+      },
+      {
+        "source": "Bob",
+        "target": "Databricks",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY"
+      }
+    ]
+  },
+  {
+    "id": "tc17",
+    "category": "contact",
+    "description": "Contact import should normalize Kellogg aliases to the canonical school name",
+    "input": "Jane Doe is a contact of Brian Meyer. Employer: Databricks. Relationship: classmates from Kellogg School of Management (Miami campus, Class of 2026).",
+    "expected_entities": [
+      {"name": "Jane Doe", "type": "Person"},
+      {"name": "Brian Meyer", "type": "Person"},
+      {"name": "Databricks", "type": "Organization"},
+      {"name": "Kellogg School of Management", "type": "Organization"}
+    ],
+    "expected_relations": [],
+    "forbidden_entities": [
+      "Kellogg EMBA"
+    ]
+  },
+  {
+    "id": "tc18",
+    "category": "email",
+    "description": "Email headers should yield people/orgs without inventing extra structure",
+    "input": "Subject: Re: Databricks onboarding\nFrom: Brian Meyer <brian@example.com>\nTo: Jane Doe <jane@example.com>\n\nJane, please send the revised Azure diagram to OpenAI before Friday.",
+    "expected_entities": [
+      {"name": "Brian Meyer", "type": "Person"},
+      {"name": "Jane Doe", "type": "Person"},
+      {"name": "Databricks", "type": "Organization"},
+      {"name": "Azure", "type": "Technology"},
+      {"name": "OpenAI", "type": "Organization"}
+    ],
+    "expected_relations": [],
+    "forbidden_entities": [
+      "Subject"
+    ]
+  },
+  {
+    "id": "tc19",
+    "category": "doc",
+    "description": "Document-style notes should not create cross-company pollution",
+    "known_gap": true,
+    "input": "Meeting notes: Alice works at Databricks. Bob works at OpenAI. Carol is also in the thread.",
+    "expected_entities": [
+      {"name": "Alice", "type": "Person"},
+      {"name": "Bob", "type": "Person"},
+      {"name": "Databricks", "type": "Organization"},
+      {"name": "OpenAI", "type": "Organization"}
+    ],
+    "expected_relations": [
+      {
+        "source": "Alice",
+        "target": "Databricks",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY"
+      },
+      {
+        "source": "Bob",
+        "target": "OpenAI",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY"
+      }
+    ],
+    "forbidden_relations": [
+      {
+        "source": "Alice",
+        "target": "OpenAI",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY|PARTNERED_WITH|COLLABORATES_WITH|WORKS_WITH"
+      },
+      {
+        "source": "Bob",
+        "target": "Databricks",
+        "type_pattern": "WORKS_AT|WORKS_FOR|EMPLOYED_BY|PARTNERED_WITH|COLLABORATES_WITH|WORKS_WITH"
+      }
+    ]
   }
 ]

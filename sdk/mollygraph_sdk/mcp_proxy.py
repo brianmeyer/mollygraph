@@ -12,12 +12,37 @@ try:
 except Exception:  # pragma: no cover - optional dependency path
     FastMCP = None
 
+_PROBE_TIMEOUT = httpx.Timeout(3.0, connect=1.5)
+
+
+def _probe_server_capabilities(base_url: str, api_key: str) -> set[str]:
+    try:
+        with httpx.Client(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=_PROBE_TIMEOUT,
+        ) as client:
+            response = client.get("/health")
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return set()
+
+    raw_capabilities = payload.get("graph_capabilities", [])
+    if not isinstance(raw_capabilities, list):
+        return set()
+    return {str(item).strip() for item in raw_capabilities if str(item).strip()}
+
 
 def _build_server(base_url: str, api_key: str):
     if FastMCP is None:
         raise RuntimeError(
             "MCP dependency is not installed. Install with: pip install 'mollygraph-sdk[mcp]'"
         )
+
+    detected_capabilities = _probe_server_capabilities(base_url, api_key)
+    show_audit_tools = "audit" in detected_capabilities
+    show_training_tools = "training" in detected_capabilities
 
     http_client: httpx.AsyncClient | None = None
 
@@ -75,19 +100,32 @@ def _build_server(base_url: str, api_key: str):
         return "\n".join(lines)
 
     @mcp.tool()
-    async def search_nodes(query: str, limit: int = 20) -> str:
-        resp = await _client().get("/query", params={"q": query})
+    async def search_nodes(query: str, node_type: str = "", limit: int = 20) -> str:
+        effective_limit = max(1, min(int(limit), 50))
+        params: dict[str, object] = {"limit": effective_limit, "offset": 0}
+        if node_type:
+            params["type"] = node_type
+
+        resp = await _client().get("/entities", params=params)
         _ensure_ok(resp)
         data = resp.json()
-        names: list[str] = []
-        for item in data.get("results", []):
-            name = str(item.get("entity") or "").strip()
-            if name:
-                names.append(name)
+        entities: list[dict] = data.get("entities", [])
+        query_lower = query.strip().lower()
+        matches: list[str] = []
+        for ent in entities:
+            name = str(ent.get("name") or "").strip()
+            if not name:
+                continue
+            if query_lower and query_lower not in name.lower():
+                continue
+            entity_type = str(ent.get("entity_type") or "").strip()
+            matches.append(f"{name} [{entity_type}]" if entity_type else name)
+            if len(matches) >= effective_limit:
+                break
 
-        if not names:
-            return f"no entities matched {query!r}"
-        return "\n".join(names[: max(1, limit)])
+        if matches:
+            return "\n".join(matches)
+        return f"no entities matched {query!r}" + (f" (type={node_type!r})" if node_type else "")
 
     @mcp.tool()
     async def get_entity_context(name: str) -> str:
@@ -125,34 +163,60 @@ def _build_server(base_url: str, api_key: str):
         )
 
     @mcp.tool()
-    async def run_audit(limit: int = 500, dry_run: bool = False, schedule: str = "nightly") -> str:
-        resp = await _client().post(
-            "/audit",
-            json={
-                "limit": max(1, int(limit)),
-                "dry_run": bool(dry_run),
-                "schedule": schedule,
-            },
-        )
+    async def delete_entity(name: str) -> str:
+        resp = await _client().request("DELETE", f"/entity/{name}")
+        if resp.status_code == 404:
+            return f"entity {name!r} not found"
         _ensure_ok(resp)
         data = resp.json()
         return (
-            f"audit status={data.get('status', 'ok')} "
-            f"scanned={data.get('relationships_scanned', 0)} "
-            f"verified={data.get('verified', 0)} "
-            f"autofixed={data.get('auto_fixed', 0)}"
+            f"deleted entity={data.get('entity')} "
+            f"relationships_removed={data.get('relationships_removed', 0)} "
+            f"vector_removed={data.get('vector_removed', False)}"
         )
 
     @mcp.tool()
-    async def get_training_status() -> str:
-        resp = await _client().get("/train/status")
+    async def prune_entities(names: list[str]) -> str:
+        resp = await _client().post("/entities/prune", json={"names": names})
         _ensure_ok(resp)
-        data = resp.json().get("gliner", {})
+        data = resp.json()
         return (
-            f"examples={data.get('examples_accumulated', 0)} "
-            f"last={data.get('last_finetune_at', '') or data.get('last_finetune', '')} "
-            f"status={data.get('last_cycle_status', '')}"
+            f"pruned={data.get('pruned', 0)} "
+            f"vectors_removed={data.get('vectors_removed', 0)} "
+            f"entities={data.get('entities', [])}"
         )
+
+    if show_audit_tools:
+        @mcp.tool()
+        async def run_audit(limit: int = 500, dry_run: bool = False, schedule: str = "nightly") -> str:
+            resp = await _client().post(
+                "/audit",
+                json={
+                    "limit": max(1, int(limit)),
+                    "dry_run": bool(dry_run),
+                    "schedule": schedule,
+                },
+            )
+            _ensure_ok(resp)
+            data = resp.json()
+            return (
+                f"audit status={data.get('status', 'ok')} "
+                f"scanned={data.get('relationships_scanned', 0)} "
+                f"verified={data.get('verified', 0)} "
+                f"autofixed={data.get('auto_fixed', 0)}"
+            )
+
+    if show_training_tools:
+        @mcp.tool()
+        async def get_training_status() -> str:
+            resp = await _client().get("/train/status")
+            _ensure_ok(resp)
+            data = resp.json().get("gliner", {})
+            return (
+                f"examples={data.get('examples_accumulated', 0)} "
+                f"last={data.get('last_finetune_at', '') or data.get('last_finetune', '')} "
+                f"status={data.get('last_cycle_status', '')}"
+            )
 
     return mcp
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 import time
 from datetime import datetime, UTC
@@ -14,7 +15,6 @@ import config
 from extraction.pipeline import ExtractionPipeline
 from metrics.retrieval_quality import compute_retrieval_quality
 from metrics.stats_logger import log_retrieval
-from query.graph_reranker import graph_rerank
 from runtime_graph import get_graph_instance
 from runtime_vector_store import get_vector_store_instance
 
@@ -29,10 +29,132 @@ from api.deps import (
 log = logging.getLogger("mollygraph")
 router = APIRouter()
 
+_REL_INTENT_KEYWORDS: dict[str, list[str]] = {
+    "WORKS_ON": ["work", "working", "develop", "build", "building"],
+    "WORKS_AT": ["work", "employed", "job", "company", "at"],
+    "KNOWS": ["know", "friend", "colleague", "contact"],
+    "USES": ["use", "using", "uses", "tool", "with"],
+    "LOCATED_IN": ["located", "lives", "in", "city", "country"],
+    "DISCUSSED_WITH": ["discuss", "talked", "meeting", "with"],
+    "INTERESTED_IN": ["interest", "interested", "likes", "hobby"],
+    "CREATED": ["create", "created", "made", "built", "founded"],
+    "MANAGES": ["manage", "manages", "lead", "leads"],
+    "DEPENDS_ON": ["depend", "depends", "require", "requires"],
+    "RELATED_TO": ["related", "about"],
+    "MENTIONS": ["mention", "about"],
+    "ATTENDS": ["attend", "attends", "going to"],
+    "COLLABORATES_WITH": ["collaborate", "partner", "together"],
+    "MENTORED_BY": ["mentor", "mentored", "teaches"],
+    "REPORTS_TO": ["report", "reports to", "under"],
+    "ALUMNI_OF": ["alumni", "graduated", "went to"],
+    "STUDIED_AT": ["study", "studied", "school", "university"],
+}
+
+_NAME_MATCH_BOOST = 1.5
+_REL_RELEVANCE_BOOST = 0.05
+_REL_RELEVANCE_MAX = 0.10
+
 
 class _PostQueryBody(BaseModel):
     q: str
     limit: int = Field(default=5, ge=1, le=50)
+
+
+def _extract_query_verbs(query: str) -> list[str]:
+    words = [word for word in "".join(ch if ch.isalpha() else " " for ch in query.lower()).split() if word]
+    bigrams = [f"{words[i]} {words[i + 1]}" for i in range(len(words) - 1)]
+    return words + bigrams
+
+
+def _rel_relevance_boost(facts: list[dict[str, Any]], query_verbs: list[str]) -> float:
+    boost = 0.0
+    seen_rel_types: set[str] = set()
+    for fact in facts:
+        rel_type = str(fact.get("relation_type") or fact.get("type") or "").upper().replace(" ", "_")
+        if not rel_type or rel_type in seen_rel_types:
+            continue
+        seen_rel_types.add(rel_type)
+        for keyword in _REL_INTENT_KEYWORDS.get(rel_type, []):
+            if keyword in query_verbs:
+                boost += _REL_RELEVANCE_BOOST
+                break
+    return min(boost, _REL_RELEVANCE_MAX)
+
+
+def _graph_rerank_results(
+    graph: Any,
+    results: list[dict[str, Any]],
+    query: str,
+    query_entities: list[str],
+) -> list[dict[str, Any]]:
+    if not results:
+        return results
+
+    neighbor_weight = config.MOLLYGRAPH_RERANK_NEIGHBOR_WEIGHT
+    strength_weight = config.MOLLYGRAPH_RERANK_STRENGTH_WEIGHT
+    path_bonus = config.MOLLYGRAPH_RERANK_PATH_BONUS
+    query_verbs = _extract_query_verbs(query)
+    query_lower = query.lower()
+
+    seen: dict[str, dict[str, Any]] = {}
+    for result in results:
+        key = result["entity"].lower()
+        if key not in seen:
+            seen[key] = dict(result)
+            seen[key].setdefault("score", 0.5)
+        else:
+            existing = seen[key]
+            if existing.get("retrieval_source", "") != result.get("retrieval_source", ""):
+                existing["retrieval_source"] = "combined"
+            existing["score"] = max(
+                float(existing.get("score") or 0.5),
+                float(result.get("score") or 0.5),
+            )
+            merged_facts: dict[str, Any] = {}
+            for fact in (existing.get("facts") or []) + (result.get("facts") or []):
+                fkey = f"{fact.get('relation_type', '')}/{fact.get('target', '')}/{fact.get('source', '')}"
+                if fkey not in merged_facts:
+                    merged_facts[fkey] = fact
+            existing["facts"] = list(merged_facts.values())
+
+    deduped = list(seen.values())
+    for item in deduped:
+        entity_name = str(item.get("entity") or "").strip()
+        if not entity_name:
+            continue
+
+        base_score = float(item.get("score") or 0.5)
+        facts = item.get("facts") or []
+
+        name_lower = entity_name.lower()
+        name_match = name_lower in query_lower or any(
+            part in query_lower for part in name_lower.split() if len(part) > 2
+        )
+        neighbor_count, avg_strength = graph.get_neighborhood_stats(entity_name)
+        graph_score = base_score * (
+            1.0
+            + math.log(1 + neighbor_count) * neighbor_weight
+            + avg_strength * strength_weight
+        )
+
+        max_path_boost = 0.0
+        for q_entity in query_entities[:3]:
+            if q_entity.lower() == name_lower:
+                continue
+            dist = graph.get_path_distance(q_entity, entity_name)
+            if dist is not None and dist <= 2:
+                max_path_boost = max(max_path_boost, path_bonus * (3 - dist))
+        graph_score += max_path_boost
+        graph_score += _rel_relevance_boost(facts, query_verbs)
+        if name_match:
+            graph_score += _NAME_MATCH_BOOST
+
+        item["graph_score"] = round(graph_score, 6)
+        item["graph_neighbor_count"] = neighbor_count
+        item["graph_avg_strength"] = round(avg_strength, 4)
+        item["graph_name_match"] = name_match
+
+    return sorted(deduped, key=lambda x: x.get("graph_score", 0.0), reverse=True)
 
 
 async def _run_query(q: str, result_limit: int = 5) -> QueryResponse:
@@ -72,27 +194,18 @@ async def _run_query(q: str, result_limit: int = 5) -> QueryResponse:
         if not _graph_results:
             _fuzzy_start = time.perf_counter()
             try:
-                with graph.driver.session() as _session:
-                    for entity_name in entities[:5]:
-                        _contains_q = entity_name.lower()
-                        _rows = _session.run(
-                            "MATCH (e:Entity) WHERE toLower(e.name) CONTAINS $q "
-                            "RETURN e.name AS name LIMIT 5",
-                            q=_contains_q,
-                        )
-                        for _row in _rows:
-                            _name = str(_row.get("name") or "").strip()
-                            if _name:
-                                _facts = graph.get_current_facts(_name)
-                                if _facts:
-                                    _graph_results.append({
-                                        "entity": _name,
-                                        "facts": _facts[:10],
-                                        "match": "fuzzy_contains",
-                                        "retrieval_source": "graph_fuzzy",
-                                    })
-                        if _graph_results:
-                            break
+                for entity_name in entities[:5]:
+                    for _name in graph.find_entities_containing(entity_name, limit=5):
+                        _facts = graph.get_current_facts(_name)
+                        if _facts:
+                            _graph_results.append({
+                                "entity": _name,
+                                "facts": _facts[:10],
+                                "match": "fuzzy_contains",
+                                "retrieval_source": "graph_fuzzy",
+                            })
+                    if _graph_results:
+                        break
             except Exception:
                 log.debug("Fuzzy CONTAINS fallback failed", exc_info=True)
             _fuzzy_ms = (time.perf_counter() - _fuzzy_start) * 1000
@@ -173,18 +286,18 @@ async def _run_query(q: str, result_limit: int = 5) -> QueryResponse:
     else:
         retrieval_source = "none"
 
-    # ── Optional graph-aware reranker (graph_reranker.py) ─────────────────────
+    # ── Optional graph-aware reranker ────────────────────────────────────────
     graph_reranked = False
     graph_rerank_ms = 0.0
     if getattr(config, "GRAPH_RERANK_ENABLED", False) and len(results) > 1:
         _gr_start = time.perf_counter()
         try:
             reranked_results = await asyncio.to_thread(
-                graph_rerank,
+                _graph_rerank_results,
+                graph,
                 results,
                 q,
                 entities,
-                graph.driver,
             )
             if reranked_results:
                 results = reranked_results[:result_limit]

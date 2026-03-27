@@ -1,10 +1,10 @@
 """Extraction pipeline for MollyGraph v1.
 
-This implementation is OpenClaw-first:
+This implementation is local-first:
 - Uses local GLiNER2 extractor (memory.extractor)
-- Writes entities/relationships into bi-temporal Neo4j graph
+- Writes entities/relationships into the active graph backend
 - Emits suggestion signals for unknown relationship types
-- Indexes entities in vector store (Zvec preferred)
+- Indexes entities in the configured vector store
 """
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _detect_fanout_pollution = None  # type: ignore
 from memory.models import Entity, Episode, ExtractionJob, Relationship
-from memory.graph import BiTemporalGraph
 from memory.vector_store import VectorStore
 from memory import extractor as gliner_extractor
 from memory.graph_suggestions import log_relationship_fallback
@@ -322,7 +321,7 @@ class ExtractionPipeline:
             cls._ingestion_counters["total_fallback_relationships"] += fallback_count
             cls._schedule_ingestion_counters_persist_locked()
 
-    def __init__(self, graph: BiTemporalGraph, vector_store: VectorStore):
+    def __init__(self, graph: Any, vector_store: VectorStore):
         self.graph = graph
         self.vector_store = vector_store
         self._glirel_enrichment = GLiRELEnrichment()
@@ -347,6 +346,9 @@ class ExtractionPipeline:
         related_entities: list[str],
     ) -> dict[str, Any] | None:
         if not bool(getattr(service_config, "DECISION_TRACES_INGEST_ENABLED", False)):
+            return None
+        if not callable(getattr(self.graph, "create_decision", None)):
+            log.info("decision_trace skipped: graph backend does not support decisions")
             return None
 
         # Lazy import: only load decision_traces module when feature is enabled
@@ -437,17 +439,7 @@ class ExtractionPipeline:
         without creating silent duplicates.
         """
         try:
-            with self.graph.driver.session() as session:
-                session.run(
-                    """
-                    MATCH (ep:Episode {id: $episode_id})
-                    SET ep.incomplete = true,
-                        ep.incomplete_reason = $reason,
-                        ep.incomplete_at = datetime()
-                    """,
-                    episode_id=episode_id,
-                    reason=reason[:500],
-                )
+            self.graph.mark_episode_incomplete(episode_id, reason=reason)
             log.info("Marked episode %s as incomplete (mid-job failure)", episode_id)
         except Exception:
             log.warning(
@@ -464,32 +456,7 @@ class ExtractionPipeline:
         MENTIONS edges to the entities that were written this job.
         """
         try:
-            with self.graph.driver.session() as session:
-                session.run(
-                    """
-                    MATCH (ep:Episode {id: $episode_id})
-                    SET ep.incomplete = false,
-                        ep.incomplete_reason = null,
-                        ep.entities_extracted = $entity_names
-                    """,
-                    episode_id=episode_id,
-                    entity_names=entity_names,
-                )
-                if entity_names:
-                    session.run(
-                        """
-                        MATCH (ep:Episode {id: $episode_id})
-                        UNWIND $entities AS entity_name
-                        MATCH (e:Entity)
-                        WHERE toLower(e.name) = toLower(entity_name)
-                           OR any(alias IN coalesce(e.aliases, []) WHERE toLower(alias) = toLower(entity_name))
-                        MERGE (ep)-[:MENTIONS]->(e)
-                        SET e.last_seen = datetime(),
-                            e.last_mentioned = datetime()
-                        """,
-                        episode_id=episode_id,
-                        entities=entity_names,
-                    )
+            self.graph.finalize_episode(episode_id, entity_names)
             log.debug("Finalized episode %s (%d entities)", episode_id, len(entity_names))
         except Exception:
             log.warning(
@@ -601,16 +568,7 @@ class ExtractionPipeline:
                     new_entity_count += 1
                     # Tag new entity nodes with first_seen metadata (non-destructive)
                     try:
-                        with self.graph.driver.session() as _s:
-                            _s.run(
-                                """
-                                MATCH (e:Entity {id: $entity_id})
-                                SET e.first_seen_source = coalesce(e.first_seen_source, $source),
-                                    e.first_seen_at = coalesce(e.first_seen_at, datetime())
-                                """,
-                                entity_id=entity_id,
-                                source=ingest_source,
-                            )
+                        self.graph.tag_entity_first_seen(entity_id, ingest_source)
                     except Exception:
                         log.debug(
                             "first_seen tagging failed for entity %s", entity.name, exc_info=True
@@ -1846,6 +1804,10 @@ class ExtractionPipeline:
         tier = tier.strip()
 
         if tier == "hash":
+            if getattr(service_config, "STRICT_AI", False):
+                raise RuntimeError(
+                    "STRICT_AI blocks hash embeddings; configure a non-hash embedding provider."
+                )
             cls._embedding_model = "hash"
             cls._embedding_active_tier = "hash"
             return True
@@ -1854,7 +1816,7 @@ class ExtractionPipeline:
             model_name = (
                 getattr(service_config, "EMBEDDING_ST_MODEL", "").strip()
                 or getattr(service_config, "EMBEDDING_MODEL", "").strip()
-                or "google/embeddinggemma-300m"
+                or getattr(service_config, "DEFAULT_LOCAL_EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-s")
             )
             try:
                 from sentence_transformers import SentenceTransformer
@@ -1929,20 +1891,36 @@ class ExtractionPipeline:
     @classmethod
     def _get_embedding_model(cls):
         """Return active embedding model, loading via tier chain when necessary."""
+        legacy_backend = getattr(service_config, "EMBEDDING_BACKEND", "").strip().lower()
+        normalized_legacy_backend = "sentence-transformers" if legacy_backend in {"st", "sentence-transformers"} else legacy_backend
+        active_tier = (cls._embedding_active_tier or "").strip().lower()
+        normalized_active_tier = "sentence-transformers" if active_tier in {"st", "sentence-transformers"} else active_tier
+
+        if legacy_backend and cls._embedding_model is not None and normalized_active_tier != normalized_legacy_backend:
+            cls.invalidate_embedding_cache()
+
+        if cls._embedding_model == "hash" and getattr(service_config, "STRICT_AI", False):
+            raise RuntimeError(
+                "STRICT_AI blocks hash embeddings; configure a non-hash embedding provider."
+            )
+
         if cls._embedding_model is not None:
             return cls._embedding_model
 
-        if getattr(service_config, "TEST_MODE", False):
+        # Legacy single-backend override: MOLLYGRAPH_EMBEDDING_BACKEND non-empty
+        if legacy_backend:
+            if cls._try_load_tier(legacy_backend):
+                return cls._embedding_model
+            if getattr(service_config, "STRICT_AI", False):
+                raise RuntimeError(
+                    f"STRICT_AI blocks hash fallback after EMBEDDING_BACKEND={legacy_backend!r} failed."
+                )
+            log.warning("Legacy EMBEDDING_BACKEND=%r failed — falling back to hash", legacy_backend)
             cls._embedding_model = "hash"
             cls._embedding_active_tier = "hash"
             return cls._embedding_model
 
-        # Legacy single-backend override: MOLLYGRAPH_EMBEDDING_BACKEND non-empty
-        legacy_backend = getattr(service_config, "EMBEDDING_BACKEND", "").strip().lower()
-        if legacy_backend:
-            if cls._try_load_tier(legacy_backend):
-                return cls._embedding_model
-            log.warning("Legacy EMBEDDING_BACKEND=%r failed — falling back to hash", legacy_backend)
+        if getattr(service_config, "TEST_MODE", False) and not getattr(service_config, "STRICT_AI", False):
             cls._embedding_model = "hash"
             cls._embedding_active_tier = "hash"
             return cls._embedding_model
@@ -1950,7 +1928,7 @@ class ExtractionPipeline:
         # Tier chain: walk in order, skip already-failed tiers
         tier_order = getattr(
             service_config, "EMBEDDING_TIER_ORDER",
-            ["sentence-transformers", "ollama", "cloud", "hash"],
+            ["sentence-transformers", "ollama", "hash"],
         )
         for tier in tier_order:
             tier = tier.strip()
@@ -1960,6 +1938,11 @@ class ExtractionPipeline:
                 return cls._embedding_model
             cls._embedding_failed_tiers.add(tier)
 
+        if getattr(service_config, "STRICT_AI", False):
+            raise RuntimeError(
+                "STRICT_AI blocks hash embeddings and no configured embedding tier loaded successfully."
+            )
+
         # Absolute last resort
         log.warning("All embedding tiers failed — using hash")
         cls._embedding_model = "hash"
@@ -1967,7 +1950,12 @@ class ExtractionPipeline:
         return cls._embedding_model
 
     @classmethod
-    def _text_embedding(cls, text: str, dim: int = 768, _depth: int = 0) -> list[float]:
+    def _text_embedding(
+        cls,
+        text: str,
+        dim: int = getattr(service_config, "EMBEDDING_VECTOR_DIMENSION", 384),
+        _depth: int = 0,
+    ) -> list[float]:
         """Embed text using the configured tier chain (sentence-transformers / ollama / cloud / hash).
 
         ``_depth`` is an internal recursion guard — callers should not pass it.
@@ -1977,7 +1965,7 @@ class ExtractionPipeline:
         tier_order = getattr(
             service_config,
             "EMBEDDING_TIER_ORDER",
-            ["sentence-transformers", "ollama", "cloud", "hash"],
+            ["sentence-transformers", "ollama", "hash"],
         )
         if _depth > len(tier_order):
             raise RuntimeError(

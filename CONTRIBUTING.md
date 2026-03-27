@@ -1,31 +1,47 @@
 # Contributing
 
+Use [docs/DOCS_MAP.md](/Users/brianmeyer/mollygraph/docs/DOCS_MAP.md) first so you know which markdown files are current and which are experimental plans.
+
 ## Setup
 
-1. Create env and install deps:
+1. Install dependencies:
+
 ```bash
 ./scripts/install.sh
 ```
-2. Configure env:
+
+This creates `service/.venv` and bootstraps `service/.env` from the example file if needed.
+
+2. Configure the service if you want to change defaults:
+
 ```bash
-cp .env.example .env
+$EDITOR service/.env
 ```
-3. Start Neo4j:
-```bash
-docker compose -f docker-compose.neo4j.yml up -d
-```
-4. Start service:
+
+3. Start the default local-first stack:
+
 ```bash
 ./scripts/start.sh
 ```
 
+Neo4j is optional now. It is only needed if you are explicitly working on legacy or experimental surfaces that still depend on the old backend.
+
 ## Test
 
-Use the runtime venv (Python 3.12):
+Use the project service venv when possible:
 
 ```bash
-MOLLYGRAPH_TEST_MODE=1 ~/.graph-memory/venv/bin/pytest -q -m smoke
-MOLLYGRAPH_TEST_MODE=1 ~/.graph-memory/venv/bin/pytest -q -m integration
+service/.venv/bin/python -m pytest -q
+```
+
+That root command now runs both `tests/` and `service/tests/`.
+
+Useful focused runs:
+
+```bash
+service/.venv/bin/python -m pytest service/tests/test_ladybug_core_flow.py -q
+service/.venv/bin/python -m pytest service/tests/test_graph_quality.py -q
+service/.venv/bin/python -m pytest service/tests/test_ladybug_graph.py service/tests/test_ladybug_vector_backend.py -q
 ```
 
 Run startup script preflight checks:
@@ -49,6 +65,7 @@ Default local key: `dev-key-change-in-production`.
 
 ## Scope rules
 
-- Keep graph writes deterministic.
-- Keep audit fallback order configurable in `/Users/brianmeyer/mollygraph/service/config.py`.
-- Do not introduce cloud-only runtime dependencies for core ingestion.
+- Keep the default runtime local-first.
+- Keep the core product path small: ingest, query, entity context, cleanup, health, and stats.
+- Treat audit, training, decision traces, and extra enrichment layers as optional unless the task is explicitly about them.
+- Do not reintroduce cloud-only requirements into the default product path.

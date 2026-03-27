@@ -12,6 +12,7 @@ import importlib.util
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ _PROVIDER_ALIASES = {
     "local": "ollama",
 }
 
-_DEFAULT_HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+_DEFAULT_HF_MODEL = str(getattr(config, "DEFAULT_LOCAL_EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-s"))
 _DEFAULT_OLLAMA_MODEL = "nomic-embed-text"
 
 _REGISTRY_LOCK = threading.Lock()
@@ -74,19 +75,14 @@ def _dedupe_models(items: list[str]) -> list[str]:
 
 
 def _default_registry() -> dict[str, Any]:
-    hf_model = str(getattr(config, "EMBEDDING_MODEL", "") or _DEFAULT_HF_MODEL).strip() or _DEFAULT_HF_MODEL
+    hf_model = str(
+        getattr(config, "EMBEDDING_ST_MODEL", "")
+        or getattr(config, "EMBEDDING_MODEL", "")
+        or _DEFAULT_HF_MODEL
+    ).strip() or _DEFAULT_HF_MODEL
     ollama_model = str(getattr(config, "OLLAMA_EMBED_MODEL", "") or _DEFAULT_OLLAMA_MODEL).strip() or _DEFAULT_OLLAMA_MODEL
-
-    backend_raw = str(getattr(config, "EMBEDDING_BACKEND", "hash") or "hash").strip().lower()
-    backend = _PROVIDER_ALIASES.get(backend_raw, backend_raw)
-    if backend not in SUPPORTED_PROVIDERS:
-        backend = "hash"
-
-    active_model = ""
-    if backend == "huggingface":
-        active_model = hf_model
-    elif backend == "ollama":
-        active_model = ollama_model
+    backend = "huggingface"
+    active_model = hf_model
 
     return {
         "active_provider": backend,
@@ -146,6 +142,7 @@ def _apply_runtime_config(registry: dict[str, Any]) -> None:
 
     # Set per-provider model names (these are harmless — just model paths)
     if hf_models:
+        config.EMBEDDING_ST_MODEL = hf_models[0]
         config.EMBEDDING_MODEL = hf_models[0]
     if ollama_models:
         config.OLLAMA_EMBED_MODEL = ollama_models[0]
@@ -314,6 +311,13 @@ def _probe_ollama_models(timeout_seconds: float = 2.0) -> dict[str, Any]:
         return {"reachable": False, "available_models": [], "error": str(exc)}
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ValueError):
+        return sys.modules.get(module_name) is not None
+
+
 def get_embedding_status() -> dict[str, Any]:
     registry = get_embedding_registry()
     active_provider = str(registry.get("active_provider") or "hash")
@@ -323,7 +327,7 @@ def get_embedding_status() -> dict[str, Any]:
     hf_models = [str(m) for m in models.get("huggingface", [])]
     ollama_models = [str(m) for m in models.get("ollama", [])]
 
-    hf_available = importlib.util.find_spec("sentence_transformers") is not None
+    hf_available = _module_available("sentence_transformers")
     ollama_probe = _probe_ollama_models()
     ollama_available_models = [str(m) for m in ollama_probe.get("available_models", [])]
     ollama_reachable = bool(ollama_probe.get("reachable"))

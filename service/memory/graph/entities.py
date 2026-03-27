@@ -39,6 +39,28 @@ class EntityMixin:
             return True
         return stripped.lower() in ENTITY_BLOCKLIST
 
+    def get_entity_id_by_name(self, name: str) -> str | None:
+        """Resolve an entity's stable graph id by name or alias."""
+        normalized = self._normalize_name(name)
+        if not normalized:
+            return None
+
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) = $name
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
+                RETURN e.id AS id
+                LIMIT 1
+                """,
+                name=normalized,
+            ).single()
+        if not record:
+            return None
+        entity_id = str(record.get("id") or "").strip()
+        return entity_id or None
+
     def find_matching_entity(
         self,
         name: str,
@@ -354,6 +376,49 @@ class EntityMixin:
             ).single()
         return bool(record and int(record["deleted"]) > 0)
 
+    def get_entity_delete_summary(self, name: str) -> Dict[str, Any] | None:
+        """Return the entity id and relationship count needed for delete flows."""
+        normalized = self._normalize_name(name)
+        if not normalized:
+            return None
+
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) = $name
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
+                OPTIONAL MATCH (e)-[r]-()
+                RETURN coalesce(e.id, toLower(e.name)) AS entity_id,
+                       count(r) AS relationship_count
+                LIMIT 1
+                """,
+                name=normalized,
+            ).single()
+        if not record or record.get("entity_id") is None:
+            return None
+        return {
+            "entity_id": str(record.get("entity_id") or "").strip(),
+            "relationship_count": int(record.get("relationship_count") or 0),
+        }
+
+    def list_orphan_entity_names(self) -> List[str]:
+        """Return entity names with no relationships attached."""
+        with self.driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE NOT (e)--()
+                RETURN e.name AS name
+                ORDER BY e.name ASC
+                """
+            )
+            return [
+                str(row.get("name") or "").strip()
+                for row in rows
+                if str(row.get("name") or "").strip()
+            ]
+
     def delete_blocklisted_entities(self, blocklist: set[str] | None = None) -> int:
         names = [n.lower() for n in (blocklist or ENTITY_BLOCKLIST)]
         if not names:
@@ -462,6 +527,23 @@ class EntityMixin:
                 name=name.strip(),
             ).single()
         return bool(record and int(record["updated"]) > 0)
+
+    def tag_entity_first_seen(self, entity_id: str, source: str) -> bool:
+        """Populate first-seen metadata for newly created entities."""
+        if not entity_id:
+            return False
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity {id: $entity_id})
+                SET e.first_seen_source = coalesce(e.first_seen_source, $source),
+                    e.first_seen_at = coalesce(e.first_seen_at, datetime())
+                RETURN count(e) AS updated
+                """,
+                entity_id=entity_id,
+                source=str(source or "").strip() or "manual",
+            ).single()
+        return bool(record and int(record["updated"] or 0) > 0)
 
     def list_entities_for_embedding(self, limit: int = 5000) -> List[Dict[str, Any]]:
         """Return entity rows suitable for vector reindexing."""

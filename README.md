@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">🧠 MollyGraph</h1>
-  <p align="center"><strong>Self-improving knowledge graph for AI agents.</strong></p>
+  <p align="center"><strong>Local-first graph memory for AI agents.</strong></p>
 </p>
 
 <p align="center">
@@ -9,20 +9,20 @@
 
 ---
 
-Most agent memory is a vector store with a wrapper. Same extraction quality forever. No structure. No relationships. No learning.
+Most agent memory is a vector store with a wrapper. Same extraction quality forever. No structure. No relationships. No local-first story.
 
-MollyGraph builds a **knowledge graph that improves its own extraction model**. Ingest text → extract entities and relationships → fine-tune the extractor on your data → deploy only if it beats the current model. The graph gets smarter the more you use it.
+MollyGraph is a **local graph + vector memory core** for AI agents. Ingest text -> extract entities and relationships with GLiNER2 -> store them locally in Ladybug -> serve them through MCP, HTTP, and the SDK.
 
 ---
 
 ## What Makes This Different
 
-- **Self-improving extraction** — GLiNER2 fine-tunes itself via LoRA on your real graph data. Candidate models must win an A/B benchmark to deploy. No manual labeling.
-- **Speaker-anchored ingestion** — Each message processed individually with the speaker as anchor entity. Per-source confidence thresholds prevent chat noise from polluting the graph.
-- **Parallel retrieval** — Graph exact-match and vector similarity run simultaneously. Results merge and dedup. Each catches what the other misses.
-- **LLM audit chain** — Relationships reviewed by Kimi k2.5 (instant) → Gemini Flash → deterministic rules. Verdicts: verify, reclassify, quarantine, delete.
-- **Three-layer NER** — GLiNER2 → spaCy enrichment → GLiREL relation extraction with synonym maps.
-- **100% env-var config** — Swap embedding models, audit providers, confidence thresholds, everything. No code changes.
+- **Local-first memory core** — Embedded Ladybug graph storage plus local vector storage by default. No mandatory database daemon for the main path.
+- **GLiNER2-first extraction** — The default product path is built around local structured extraction, not cloud reasoning.
+- **Speaker-anchored ingestion** — Each message is processed individually with the speaker as anchor entity, which is the main defense against bad chat graphs.
+- **Parallel retrieval** — Graph exact-match and vector similarity run together, then merge into one response.
+- **Simple local embeddings** — Default embedder is `Snowflake/snowflake-arctic-embed-s`, with `nomic-embed-text` via Ollama as the optional local alternative.
+- **Experimental features still available** — audit chains, GLiREL, training loops, and decision traces are being kept behind explicit flags instead of defining the core product.
 
 ---
 
@@ -31,12 +31,20 @@ MollyGraph builds a **knowledge graph that improves its own extraction model**. 
 ```bash
 git clone https://github.com/brianmeyer/mollygraph.git
 cd mollygraph
-cp .env.example .env    # edit with your Neo4j creds
-docker compose -f docker-compose.neo4j.yml up -d
-./scripts/install.sh && ./scripts/start.sh
+./scripts/install.sh
+./scripts/start.sh
 ```
 
 API at `http://127.0.0.1:7422`. Auth: `Bearer dev-key-change-in-production`.
+
+`./scripts/install.sh` creates `service/.env` from `service/.env.example` if it does not exist yet, and installs the runtime into `service/.venv`.
+
+Default local stack:
+- `MOLLYGRAPH_GRAPH_BACKEND=ladybug`
+- `MOLLYGRAPH_VECTOR_BACKEND=ladybug`
+- `MOLLYGRAPH_EMBEDDING_ST_MODEL=Snowflake/snowflake-arctic-embed-s`
+
+Neo4j is still available for legacy and experimental workflows, but it is no longer the intended default.
 
 ---
 
@@ -46,26 +54,23 @@ API at `http://127.0.0.1:7422`. Auth: `Bearer dev-key-change-in-production`.
   ingest text
        │
        ▼
-  Speaker-anchored extraction (GLiNER2 + spaCy + GLiREL)
-  Per-source confidence gates (chat: 0.55, email: 0.45)
+  Speaker-anchored extraction (GLiNER2)
+  Per-source confidence gates
        │
-       ├──▶ Neo4j graph + Jina v5-nano vectors
-       └──▶ Training examples accumulated
-                    │
-              (threshold reached)
-                    ▼
-              LoRA fine-tune → A/B benchmark → deploy if wins
+       ├──▶ Ladybug graph
+       ├──▶ Ladybug vector index
+       └──▶ MCP / HTTP / SDK query surface
 ```
 
-**Query path:** graph exact + vector similarity fire in parallel → merge → rerank → serve.
+**Default query path:** graph exact + vector similarity fire in parallel -> merge -> serve.
 
-**Audit path:** LLM reviews relationships with original context snippets → verify/reclassify/quarantine/delete.
+**Experimental path:** audit, training, decision traces, and extra enrichment layers are still present, but they are not part of the default stripped-down runtime.
 
 ---
 
 ## MCP Integration
 
-Works with Claude, OpenClaw, Cursor, or any MCP client.
+Works with Claude, OpenClaw, Cursor, Ollama-adjacent local agents, or any MCP client.
 
 ```json
 {
@@ -78,7 +83,9 @@ Works with Claude, OpenClaw, Cursor, or any MCP client.
 }
 ```
 
-**9 tools:** `add_episode` · `search_facts` · `search_nodes` · `get_entity_context` · `delete_entity` · `prune_entities` · `run_audit` · `get_training_status` · `get_queue_status`
+Core tools: `add_episode` · `search_facts` · `search_nodes` · `get_entity_context` · `delete_entity` · `prune_entities` · `get_queue_status`
+
+Legacy tools like audit and training remain available only when the active backend supports them.
 
 ---
 
@@ -108,51 +115,55 @@ result = client.query("What do we know about Sarah?")
 | `/entity/{name}` | GET | Entity context (2-hop neighborhood) |
 | `/entity/{name}` | DELETE | Delete entity + relationships |
 | `/entities/prune` | POST | Bulk prune + orphan detection |
-| `/audit/run` | POST | Trigger LLM audit |
-| `/training/status` | GET | LoRA pipeline status |
 | `/metrics/dashboard` | GET | Unified health JSON |
-| `/maintenance/nightly` | POST | Full maintenance cycle |
+| `/stats` | GET | Graph/vector/runtime stats |
+
+Neo4j-oriented endpoints like audit, training, and the legacy maintenance cycle remain in the codebase but are intentionally gated when the Ladybug backend is active.
 
 ---
 
 ## Configuration
 
-100% env-var driven. See `.env.example` for all options. Key settings:
+100% env-var driven. See [service/.env.example](/Users/brianmeyer/mollygraph/service/.env.example) for all options. Key settings:
 
 ```env
+# Local-first defaults
+MOLLYGRAPH_GRAPH_BACKEND=ladybug
+MOLLYGRAPH_VECTOR_BACKEND=ladybug
+MOLLYGRAPH_EMBEDDING_ST_MODEL=Snowflake/snowflake-arctic-embed-s
+
+# Optional local alternate
+MOLLYGRAPH_EMBEDDING_OLLAMA_MODEL=nomic-embed-text
+
 # Extraction confidence (per source)
 MOLLYGRAPH_EXTRACTION_CONFIDENCE_SESSION=0.55
 MOLLYGRAPH_EXTRACTION_CONFIDENCE_EMAIL=0.45
 MOLLYGRAPH_EXTRACTION_CONFIDENCE_DEFAULT=0.4
 
-# LLM audit tiers
-MOLLYGRAPH_AUDIT_PROVIDER_TIERS=primary,fallback,deterministic
-MOLLYGRAPH_AUDIT_TIER_PRIMARY=moonshot        # Kimi k2.5 instant
-MOLLYGRAPH_AUDIT_TIER_FALLBACK=gemini         # Gemini 2.5 Flash
-
-# Embeddings (swappable, tiered fallback)
-MOLLYGRAPH_EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-nano
+# Neo4j remains available for legacy/full workflows
+# NEO4J_URI=bolt://localhost:7687
 ```
 
 ---
 
 ## Roadmap
 
-The authoritative roadmap now lives in:
-- `service/BACKLOG.md` (unified P0/P1/P2 priorities)
-- `service/DECISION_TRACES_PLAN.md` (Decision Traces phases)
+The authoritative roadmap lives in `service/BACKLOG.md`.
+`service/DECISION_TRACES_PLAN.md` is a later-phase experimental plan, not part of the default product path.
 
 **Top priorities right now:**
-- Pre-write semantic relation gate (soft, schema-aware) to prevent nonsense edges before write
-- Source-routed specialized extraction pipeline (contacts/chat/email have different error profiles)
-- Risk-weighted audit selection for high-impact relation types
-- Local-first audit model reliability (Ollama structured JSON path)
-- Decision Traces as first-class graph objects
+- Finish the Ladybug local core for the default ingest/query/vector path
+- Keep the default runtime small and trustworthy for non-developers
+- Harden MCP, HTTP, and SDK behavior around the simplified memory core
+- Add source-routed extraction where it improves graph quality without re-complexifying the product
+- Keep advanced audit/training/decision-trace work clearly optional
 
 **Current feature status:**
-- Graph-aware reranking (`GRAPH_RERANK_ENABLED`) — available and in use
-- Jina cross-encoder reranker (`MOLLYGRAPH_RERANKER_ENABLED`) — available, typically enabled at larger scale
-- Nightly audit + LoRA training loop — active
+- Ladybug graph backend — active default
+- Ladybug vector backend — active
+- GLiNER2 local extraction — active
+- Snowflake local embeddings — active default
+- Audit, training, and decision surfaces — legacy/experimental, being gated behind backend capability
 
 ---
 
@@ -163,5 +174,5 @@ MIT
 ---
 
 <p align="center">
-  <strong>Memory that learns. Not memory that stores.</strong>
+  <strong>Structured local memory for agents.</strong>
 </p>

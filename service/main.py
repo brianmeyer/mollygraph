@@ -21,12 +21,17 @@ from extractor_registry import initialize_extractor_registry
 from extractor_schema_registry import initialize_extractor_schema_registry
 from extraction.pipeline import ExtractionPipeline
 from extraction.queue import ExtractionQueue, QueueWorker
-from memory.graph import BiTemporalGraph
 from memory import extractor as memory_extractor
 from memory.graph_suggestions import init_adopted_schema
 from memory.models import ExtractionJob
 from memory.vector_store import VectorStore
-from runtime_graph import set_graph_instance
+from runtime_graph import (
+    create_graph_instance,
+    get_graph_backend_name,
+    get_graph_capabilities,
+    graph_supports_capability,
+    set_graph_instance,
+)
 from runtime_pipeline import set_pipeline_instance
 from runtime_queue import set_queue_instance, get_queue_instance
 from runtime_state import set_service_started_at
@@ -184,8 +189,13 @@ async def lifespan(_app: FastAPI):
     log.info("Starting MollyGraph service")
     init_adopted_schema()
 
-    graph = BiTemporalGraph(config.NEO4J_URI, config.NEO4J_USER, config.NEO4J_PASSWORD)
+    graph = create_graph_instance()
     set_graph_instance(graph)
+    log.info(
+        "Graph backend ready: %s capabilities=%s",
+        get_graph_backend_name(graph),
+        ",".join(get_graph_capabilities(graph)),
+    )
     try:
         vector_store = VectorStore(backend=config.VECTOR_BACKEND)
     except Exception:
@@ -206,10 +216,7 @@ async def lifespan(_app: FastAPI):
 
     # Reconcile incomplete episodes from a previous crash.
     try:
-        with graph.driver.session() as _s:
-            _incomplete = _s.run(
-                "MATCH (ep:Episode {incomplete: true}) RETURN count(ep) AS n"
-            ).single()["n"]
+        _incomplete = graph.incomplete_episode_count()
         if _incomplete:
             log.warning("Startup: %d incomplete episode(s) found from prior crash", _incomplete)
         else:
@@ -222,9 +229,9 @@ async def lifespan(_app: FastAPI):
         vs_stats = vector_store.get_stats() if vector_store else {}
         vs_count = vs_stats.get("entities", 0)
         if vs_count == 0 and graph is not None:
-            neo4j_count = len(graph.list_entities_for_embedding(limit=1))
-            if neo4j_count > 0:
-                log.info("Zvec empty but Neo4j has entities — triggering startup reindex")
+            graph_count = len(graph.list_entities_for_embedding(limit=1))
+            if graph_count > 0:
+                log.info("Vector store empty but graph has entities — triggering startup reindex")
                 from api.deps import _reindex_embeddings_sync
                 reindex_result = _reindex_embeddings_sync(limit=5000, dry_run=False)
                 log.info(
@@ -258,6 +265,10 @@ async def lifespan(_app: FastAPI):
 
 
 app.router.lifespan_context = lifespan
+
+
+def _should_include_decision_routes() -> bool:
+    return graph_supports_capability("decisions")
 
 
 @app.exception_handler(Exception)
@@ -356,6 +367,8 @@ async def health() -> dict[str, Any]:
         "version": "1.0.0",
         "port": config.PORT,
         "test_mode": config.TEST_MODE,
+        "graph_backend": config.GRAPH_BACKEND,
+        "graph_capabilities": get_graph_capabilities(),
         "queue_pending": queue_pending,
         "queue_processing": queue_processing,
         "queue_stuck": queue_stuck,
@@ -372,12 +385,14 @@ async def health() -> dict[str, Any]:
 from api import query as _query_module
 from api import ingest as _ingest_module
 from api import admin as _admin_module
-from api import decisions as _decisions_module
 
 app.include_router(_query_module.router)
 app.include_router(_ingest_module.router)
 app.include_router(_admin_module.router)
-app.include_router(_decisions_module.router)
+if _should_include_decision_routes():
+    from api import decisions as _decisions_module
+
+    app.include_router(_decisions_module.router)
 
 
 if __name__ == "__main__":

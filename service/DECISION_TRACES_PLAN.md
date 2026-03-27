@@ -1,32 +1,37 @@
-# Decision Traces — MollyGraph Context Graph Extension
+# Decision Traces — Later-Phase Context Graph Extension
+
+Status:
+- experimental, later-phase plan
+- not part of the default Ladybug local memory core
+- current service behavior keeps decision traces gated or disabled on the default backend
 
 ## Inspiration
 [Foundation Capital: Context Graphs — AI's Trillion-Dollar Opportunity](https://foundationcapital.com/context-graphs-ais-trillion-dollar-opportunity/)
 
-**Core thesis:** The next systems of record won't store objects (like Salesforce/Workday) — they'll store *decisions*. Who decided what, why, what alternatives existed, what precedent was cited, and what happened as a result.
+**Core thesis:** MollyGraph can eventually store decisions as first-class graph data, but the default product stays focused on local memory, retrieval, and extraction.
 
 ## What MollyGraph Has Today
 
 | Capability | Status |
 |---|---|
-| Entities connected over time | ✅ Bi-temporal graph (Neo4j) |
+| Entities connected over time | ✅ graph backend with temporal metadata |
 | Episodes (what was ingested) | ✅ Episode nodes with temporal metadata |
-| Self-improving extraction | ✅ LoRA training loop + GLiREL |
+| Local structured extraction | ✅ GLiNER2 default path |
 | Parallel retrieval | ✅ Graph + vector search |
 | Cross-system ingestion | ✅ Email, conversations, calendar |
-| Audit trail for schema changes | ✅ Adoption pipeline with gates |
+| Audit trail for schema changes | ✅ Optional adoption pipeline with gates |
 
 ## What's Missing: Decision Traces
 
-Episodes capture *what* was ingested but not *why decisions were made*. A decision trace is a first-class node type that captures:
+Episodes capture *what* was ingested but not *why decisions were made*. A decision trace is a future node type that could capture:
 
 ```
 DecisionTrace {
   id: uuid
   timestamp: datetime
-  decision: "Switched embedding model from embeddingGemma to Jina v5-nano"
-  reasoning: "71.0 vs 62 MTEB, smaller params, 8192 context, newer"
-  alternatives_considered: ["nomic-embed-text", "BAAI/bge-m3", "keep embeddingGemma"]
+  decision: "Switched embedding model to Snowflake Arctic Embed S"
+  reasoning: "ungated, local-first, simpler runtime defaults"
+  alternatives_considered: ["nomic-embed-text", "BAAI/bge-small-en-v1.5", "keep current model"]
   inputs: ["MTEB benchmarks", "model size constraints", "Mac Mini M4 16GB"]
   outcome: "Reindexed 903 entities, 0 failures"
   decided_by: "Brian"  
@@ -37,14 +42,12 @@ DecisionTrace {
 }
 ```
 
-## Implementation Plan
+## Later-Phase Plan
 
 ### Phase 1: Decision Node Type (1 day)
-- Add `Decision` node type to Neo4j schema
-- Properties: `decision`, `reasoning`, `alternatives`, `inputs`, `outcome`, `decided_by`, `timestamp`
-- Relationships: `DECIDED_BY` (→ Person), `RELATES_TO` (→ Entity), `PRECEDED_BY` (→ Decision), `SOURCED_FROM` (→ Episode)
-- API: `POST /decisions` to create, `GET /decisions` to query
-- MCP tool: `record_decision`, `query_decisions`
+- Add a `Decision` node type to the graph backend only when the later-phase work starts
+- Keep the schema intentionally small at first: `decision`, `reasoning`, `alternatives`, `inputs`, `outcome`, `decided_by`, `timestamp`
+- Add API and MCP surfaces only if the feature earns a dedicated delivery slice
 
 ### Phase 2: Auto-Detection from Conversations (3 days)
 - When ingesting conversation transcripts, detect decision moments:
@@ -52,19 +55,17 @@ DecisionTrace {
   - "I decided to..."
   - "We should use X instead of Y"
   - "Approved" / "Let's do it" / "Ship it"
-- Use the audit LLM to classify: "Is this text recording a decision? If so, extract: decision, reasoning, alternatives"
+- Use a classifier only if the decision feature is worth the added complexity
 - Create Decision nodes alongside regular entity/relationship extraction
 
 ### Phase 3: Precedent Search (2 days)  
 - When a new decision is being made, search for similar past decisions
-- Vector similarity on decision text + graph traversal on related entities
-- "Last time we changed embedding models, we did X and it took Y"
-- Surface in retrieval results: "Related precedent: [decision]"
+- Use vector similarity on decision text plus graph traversal on related entities
+- Surface a related precedent only when it adds clear value
 
 ### Phase 4: Decision Audit Trail (1 day)
-- The audit pipeline already tracks schema changes — extend to track all Decision nodes
-- Weekly summary: "5 decisions recorded this week, 2 with precedent matches"
-- Flag decisions that contradict previous decisions on the same topic
+- Extend the audit pipeline only if decision traces become a maintained feature
+- Weekly summaries and contradiction flags are optional follow-ons, not part of the default path
 
 ## What This Enables
 
@@ -81,7 +82,7 @@ No open-source graph memory system has decision traces:
 - **LightRAG**: Static extraction, no temporal or decision layer
 - **Tiny-GraphRAG**: GLiNER+GLiREL extraction, no decision concept
 
-MollyGraph with decision traces = **the self-improving context graph for AI agents**.
+Decision traces are one possible differentiator for MollyGraph, but they do not define the default product.
 
 ## Open Questions
 - Should decisions be extracted from ALL sources or only conversations?

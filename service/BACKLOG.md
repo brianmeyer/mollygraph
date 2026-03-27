@@ -1,134 +1,94 @@
-# MollyGraph Backlog (Unified)
+# MollyGraph Service Backlog
 
-Last updated: 2026-02-26
+Last updated: 2026-03-27
 
 Status legend:
+
 - ✅ Done
 - 🔄 In progress
 - 🧪 Implemented, needs hardening
-- ⏸️ Parked
 - 📝 Planned
+- ⏸️ Parked / later-phase
 
----
+Use [docs/DOCS_MAP.md](/Users/brianmeyer/mollygraph/docs/DOCS_MAP.md) before treating any markdown file as current.
 
-## Completed Recently (Do not re-open unless broken)
+## Default local core
 
-- ✅ Graphiti-style speaker-anchored extraction (per-message processing, speaker flow API→queue→pipeline)
-- ✅ Per-source confidence thresholds (chat/email/default)
-- ✅ Graph purge + old noisy training data purge
-- ✅ Reset to base GLiNER2 after noisy LoRA data reset
-- ✅ Contact ingestion overhaul: NLP reformatter for `contacts_json`
-- ✅ Direct contact NER training generator (`contact-ner-*.jsonl`)
-- ✅ Graph-aware reranker enabled and tuned (direct name-match fix)
-- ✅ Nightly audit + LoRA pipeline operational
-- ✅ Automated pre-train rebalance (class-cap + target-label upsampling) with run artifacts
-- ✅ Below-threshold promotion diagnostics (`<run_id>-diagnostics.json`) + metadata path
-- ✅ Contact re-ingestion completed; training examples rebuilt from real contacts
+This is the product MollyGraph is building now:
 
----
+- local-first graph memory for agents
+- Ladybug graph backend
+- Ladybug vector backend
+- GLiNER2 extraction
+- local embeddings by default
+- MCP, HTTP, and SDK as the agent-facing surface
 
-## P0 — Correctness / Data Quality
+Everything else is secondary to this core. Audit chains, training loops, decision traces, GLiREL, and spaCy remain available as later-phase capabilities, but they are not required for the default runtime.
 
-### 1) Pre-write semantic relation gate (soft, schema-aware) — ✅
-- **Implemented** in `extraction/relation_gate.py` + integrated in `extraction/pipeline.py`.
-- Scores every candidate by `(head_type, rel_type, tail_type, source, confidence)`.
-- Action policy: **allow** → write normally; **quarantine** → write with `audit_status='quarantined'` + emit audit-bus + suggestion signal; **skip** → emit suggestion signal only (never silently drops).
-- Feature flag: `MOLLYGRAPH_RELATION_SOFT_GATE_ENABLED=true` (default on).
-- Threshold env vars: `RELATION_GATE_ALLOW_THRESHOLD`, `RELATION_GATE_QUARANTINE_THRESHOLD`, `RELATION_GATE_HIGH_CONF_OVERRIDE`.
-- 25 unit + regression tests in `tests/test_relation_gate.py` — all pass.
+## Completed recently
 
-### 2) Contact relation constraints by source priors — ✅ (bundled with P0-1)
-- contacts_json source priors implemented inside the soft gate.
-- Boosted rels: `CONTACT_OF / WORKS_AT / LOCATED_IN / MEMBER_OF / CLASSMATE_OF` (+30% plausibility multiplier).
-- Down-weighted rels: `CHILD_OF / REPORTS_TO / MENTORED_BY / MENTORS / MANAGES` (×0.55 multiplier, unless extractor confidence ≥ 0.85 → quarantine instead of skip).
-- Soft (multiplicative) — not a hard stoplist; evolution/suggestion path preserved.
+- ✅ Snowflake local embedder is the default local path
+- ✅ Ladybug vector backend landed and tested
+- ✅ Ladybug graph backend landed and tested
+- ✅ runtime graph selection via `MOLLYGRAPH_GRAPH_BACKEND`
+- ✅ capability-aware `501` responses for unsupported legacy surfaces
+- ✅ default OpenAPI cleanup: legacy aliases removed, experimental surface hidden by default
+- ✅ Ladybug core-flow API harness covering ingest -> process -> graph/vector write -> query/stats
+- ✅ root README rewritten around the local-first product story
 
-### 3) Audit selection risk weighting — 📝
-- Prioritize risky/high-impact relation labels vs random slices.
-- Source: `AUDIT_QA.md`, `AUDIT_PM.md`
+## P0 — Finish the default local core
 
-### 4) Ontology consistency checks (school/cohort/campus/person roles) — 📝
-- Periodic graph consistency job + auto-correct suggestions.
-- Source: `mollygraph-architecture-v2.md`, `AUDIT_ARCHITECT.md`
+### 1) Local runtime install and test harness — 🔄
+- Keep the default setup boring and dependable for non-developers.
+- Normalize the expected Python/runtime path.
+- Reduce environment surprises between scripts, docs, and tests.
 
----
+### 2) Shared Ladybug runtime owner — 📝
+- Decide whether graph and vector should keep separate `.lbug` files or move to one shared Ladybug-backed runtime owner.
+- Keep the safe split until the migration story is explicit.
 
-## P1 — Specialized Model Pipeline
+### 3) Core API / MCP / SDK surface hardening — 🔄
+- Keep the default surface focused on ingest, query, entity context, cleanup, health, and stats.
+- Continue trimming legacy aliases and hiding unsupported experimental routes from the default docs.
+- Keep MCP tools aligned with the runtime capability set.
 
-### 5) Source-routed extraction pipeline — 🔄
-- Route extractor strategy by source type (contacts/chat/email/docs).
-- Keep base GLiNER2+GLiREL, add per-source model/config routing.
-- Source: `mollygraph-extraction-quality.md` (P7), `mollygraph-master-plan.md`
+### 4) Source-routed extraction for the highest-value sources — 📝
+- Start with `contacts_json` and other sources that clearly improve graph quality without re-expanding the whole product surface.
 
-### 6) Specialized relation plausibility layer (post-extractor) — 📝
-- Lightweight classifier/reranker for semantic plausibility of relation candidates.
-- Source: `AUDIT_DEVELOPER.md`, `AUDIT_ARCHITECT.md`
+### 5) Graph quality regression coverage — 🔄
+- Keep the golden-set and core-flow harnesses growing so cleanup does not recreate bad graphs.
 
-### 7) Local-first audit model track (Ollama) — 🔄
-- Move from Moonshot dependency toward reliable local structured verdicts.
-- Current state: Moonshot primary, Gemini fallback; local JSON reliability unresolved.
+## P1 — Make the local product easier to operate
 
----
+### 6) Backup / export / restore story — 📝
+- Make local data ownership clearer.
+- Define how users can back up or rebuild their local memory safely.
 
-## P1 — Training & Audit Reliability
+### 7) Query ergonomics — 📝
+- Improve browse/list/search ergonomics without exploding the API surface.
+- Keep the default user story simple for agents and non-developers.
 
-### 8) Pre-training quality gate robustness — ✅
-- Added deterministic pre-train rebalance before split generation in `evolution/gliner_training.py`.
-- Added configurable dominant-class cap (`WORKS_AT`) + target-label upsampling knobs.
-- Added rebalance provenance artifact per run (`training/runs/<run_id>-rebalance.json`).
-- Added below-threshold diagnostics artifact (`training/runs/<run_id>-diagnostics.json`) with per-type deltas and recommendations.
-- Source: `evolution/gliner_training.py`, `AUDIT_QA.md`
+### 8) Docs and repo cleanup — 🔄
+- Keep the current markdown set aligned with the Ladybug-first product story.
+- Remove or rewrite docs that drift back toward the old Neo4j/audit-heavy framing.
 
-### 9) Audit state concurrency + durability hardening — 📝
-- Locking + atomic write + crash-safe recovery.
-- Source: `AUDIT_ARCHITECT.md`, `AUDIT_QA.md`
+## P2 — Experimental or later-phase work
 
-### 10) Auto-delete blast-radius controls — 🧪
-- Cap exists conceptually; verify and enforce strict per-cycle safety policy.
-- Source: `AUDIT_QA.md`
+### 9) Local audit model track — ⏸️
+- Later-phase only.
 
----
+### 10) GLiNER training loops — ⏸️
+- Preserve the work, but keep it out of the base product.
 
-## P2 — Retrieval / Product / Ops
+### 11) Decision traces — ⏸️
+- Later-phase differentiator.
+- See `service/DECISION_TRACES_PLAN.md`.
 
-### 11) Retrieval instrumentation v2 — 📝
-- Better attribution for graph_exact/vector/merged/reranked lift.
+### 12) GLiREL, spaCy, and extra enrichment layers — ⏸️
+- Optional quality layers, not required for the default product.
 
-### 12) Reranker stack progression — 🔄
-- Graph-aware reranker is live.
-- Next: robust blended policy with Jina cross-encoder at larger scale.
+## Next execution items
 
-### 13) Decision Traces — 🔄
-- Planned major differentiator. Implement per `DECISION_TRACES_PLAN.md` phases 1–4.
-
-### 14) API ergonomics — 📝
-- Versioned API (`/v1`), pagination, browse/list endpoints.
-
-### 15) Reliability test coverage — 📝
-- Expand unit/integration tests for extraction/audit/training/vector sync.
-
-### 16) Operational observability — 📝
-- External alerting for worker death, rollback, audit failures, queue anomalies.
-
-### 17) Infra health decision framework (deterministic-first) — ✅
-- Implemented `maintenance/infra_health.py` with deterministic policy outputs:
-  `healthy | optimize | refresh_embeddings | reindex_embeddings | rebuild_vectors`.
-- Added env-driven thresholds (`MOLLYGRAPH_INFRA_*`) with safe defaults.
-- Added endpoint: `POST /maintenance/infra-health/evaluate` (dry-run + optional advisory).
-- Nightly pipeline now emits infra health snapshot in nightly run payload.
-- `POST /maintenance/reconcile-vectors` now supports guarded `mode=rebuild` fallback path.
-
----
-
-## Parked (Intentional)
-
-- ⏸️ Hard deterministic stoplists/content classifiers as primary guardrail.
-- Rationale: brittle across domains; prefer soft semantic gating + audit loop.
-
----
-
-## Next 3 Execution Items
-
-1. ~~Implement pre-write semantic relation gate in `extraction/pipeline.py` (P0)~~ ✅ Done
-2. Add risk-weighted audit selection for high-risk relation labels (P0 #3)
-3. Implement first source router slice for `contacts_json` relation policy (P1 #5)
+1. Finish the docs/markdown cleanup so the repo tells one coherent story.
+2. Keep trimming the default API and MCP surface around the local core.
+3. Decide the next Ladybug storage step: shared runtime owner or keep the safe split longer.

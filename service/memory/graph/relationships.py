@@ -607,3 +607,25 @@ class RelationshipMixin:
                 tail=tail,
             ).single()
         return bool(record and int(record["deleted"]) > 0)
+
+    def delete_relationships_between(self, head: str, tail: str, rel_type: str | None = None) -> int:
+        """Delete all relationships between two entities, optionally by type."""
+        if rel_type:
+            normalized_type = self._normalize_rel_type(rel_type)
+            if not self._is_valid_rel_type(normalized_type):
+                return 0
+            query = f"""
+                MATCH (h:Entity {{name: $head}})-[r:`{normalized_type}`]-(t:Entity {{name: $tail}})
+                DELETE r
+                RETURN count(r) AS deleted
+                """
+        else:
+            query = """
+                MATCH (h:Entity {name: $head})-[r]-(t:Entity {name: $tail})
+                DELETE r
+                RETURN count(r) AS deleted
+                """
+
+        with self.driver.session() as session:
+            record = session.run(query, head=head, tail=tail).single()
+        return int(record["deleted"]) if record else 0

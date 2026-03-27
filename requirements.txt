@@ -2,6 +2,7 @@ fastapi==0.115.*
 uvicorn[standard]==0.32.*
 mcp
 neo4j==5.*
+real-ladybug==0.15.2
 httpx==0.28.*
 pydantic==2.*
 python-dotenv==1.*

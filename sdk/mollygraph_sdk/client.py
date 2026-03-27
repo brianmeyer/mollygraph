@@ -38,19 +38,6 @@ class MollyGraphClient:
         resp.raise_for_status()
         return resp.json()
 
-    def run_audit(self, limit: int = 500, dry_run: bool = False, schedule: str = "nightly") -> dict[str, Any]:
-        resp = self._client.post(
-            "/audit",
-            json={"limit": limit, "dry_run": dry_run, "schedule": schedule},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    def train_gliner(self, force: bool = False) -> dict[str, Any]:
-        resp = self._client.post("/train/gliner", json={"force": force})
-        resp.raise_for_status()
-        return resp.json()
-
     def get_embedding_config(self) -> dict[str, Any]:
         resp = self._client.get("/embeddings/config")
         resp.raise_for_status()

@@ -8,17 +8,39 @@ AUTH_HEADERS = {"Authorization": "Bearer dev-key-change-in-production"}
 pytestmark = pytest.mark.integration
 
 
-def test_openapi_includes_canonical_and_legacy_paths(client) -> None:
+def test_openapi_includes_current_core_paths_and_hides_legacy_defaults(client) -> None:
     response = client.get("/openapi.json")
     assert response.status_code == 200
     paths = set(response.json()["paths"].keys())
-    expected = {
+
+    expected_core = {
         "/health",
         "/stats",
         "/ingest",
-        "/extract",
         "/entity/{name}",
+        "/entities",
+        "/entities/prune",
         "/query",
+        "/relationship",
+        "/embeddings/config",
+        "/embeddings/status",
+        "/embeddings/models",
+        "/embeddings/reindex",
+        "/metrics/dashboard",
+        "/metrics/retrieval",
+        "/metrics/retrieval/trend",
+        "/metrics/schema-drift",
+        "/metrics/sources",
+        "/metrics/summary",
+        "/maintenance/infra-health/evaluate",
+        "/maintenance/quality-check",
+        "/maintenance/reconcile-vectors",
+        "/maintenance/refresh-embeddings",
+    }
+    assert expected_core.issubset(paths)
+
+    hidden_or_removed = {
+        "/extract",
         "/audit",
         "/audit/run",
         "/maintenance/audit",
@@ -28,10 +50,6 @@ def test_openapi_includes_canonical_and_legacy_paths(client) -> None:
         "/training/gliner",
         "/train/status",
         "/training/status",
-        "/embeddings/config",
-        "/embeddings/status",
-        "/embeddings/models",
-        "/embeddings/reindex",
         "/extractors/config",
         "/extractors/status",
         "/extractors/schema",
@@ -40,26 +58,21 @@ def test_openapi_includes_canonical_and_legacy_paths(client) -> None:
         "/extractors/schema/upload",
         "/extractors/prefetch",
         "/maintenance/run",
+        "/maintenance/nightly",
     }
-    assert expected.issubset(paths)
+    assert hidden_or_removed.isdisjoint(paths)
 
 
 def test_protected_routes_require_bearer_auth(client) -> None:
     protected_routes = [
         ("GET", "/stats", {}),
         ("POST", "/ingest", {"params": {"content": "test", "source": "manual", "priority": 1}}),
-        ("POST", "/extract", {"params": {"content": "test", "source": "manual", "priority": 1}}),
         ("GET", "/entity/Brian", {}),
         ("GET", "/query", {"params": {"q": "What about Brian?"}}),
         ("POST", "/audit", {"json": {"limit": 25, "dry_run": True, "schedule": "nightly"}}),
-        ("POST", "/audit/run", {"json": {"limit": 25, "dry_run": True, "schedule": "nightly"}}),
-        ("POST", "/maintenance/audit", {"json": {"limit": 25, "dry_run": True, "schedule": "nightly"}}),
         ("GET", "/suggestions/digest", {}),
-        ("GET", "/suggestions_digest", {}),
         ("POST", "/train/gliner", {"json": {"force": True}}),
-        ("POST", "/training/gliner", {"json": {"force": True}}),
         ("GET", "/train/status", {}),
-        ("GET", "/training/status", {}),
         ("GET", "/embeddings/config", {}),
         ("GET", "/embeddings/status", {}),
         ("POST", "/embeddings/config", {"json": {"provider": "hash"}}),
@@ -91,68 +104,80 @@ def test_protected_routes_require_bearer_auth(client) -> None:
         resp = client.request(method, route, **kwargs)
         assert resp.status_code == 401, f"{method} {route} should require auth"
 
+    removed_aliases = [
+        ("POST", "/extract", {"params": {"content": "test", "source": "manual", "priority": 1}}),
+        ("POST", "/audit/run", {"json": {"limit": 25, "dry_run": True, "schedule": "nightly"}}),
+        ("POST", "/maintenance/audit", {"json": {"limit": 25, "dry_run": True, "schedule": "nightly"}}),
+        ("GET", "/suggestions_digest", {}),
+        ("POST", "/training/gliner", {"json": {"force": True}}),
+        ("GET", "/training/status", {}),
+    ]
+    for method, route, kwargs in removed_aliases:
+        resp = client.request(method, route, **kwargs)
+        assert resp.status_code == 404, f"{method} {route} should stay removed"
 
-def test_ingest_and_extract_aliases_queue_jobs(client) -> None:
-    canonical = client.post(
+
+def test_canonical_ingest_queues_job_and_legacy_extract_alias_is_removed(client) -> None:
+    response = client.post(
         "/ingest",
         params={"content": "Brian works at Databricks.", "source": "manual", "priority": 1},
         headers=AUTH_HEADERS,
     )
+
     alias = client.post(
         "/extract",
         params={"content": "Brian uses Python.", "source": "manual", "priority": 1},
         headers=AUTH_HEADERS,
     )
 
-    assert canonical.status_code == 200
-    assert alias.status_code == 200
-    assert canonical.json()["status"] == alias.json()["status"] == "queued"
-    assert canonical.json()["job_id"] != alias.json()["job_id"]
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    assert response.json()["job_id"]
+    assert alias.status_code == 404
 
 
-def test_audit_aliases_match_canonical_shape(client) -> None:
+def test_audit_route_is_hidden_and_aliases_are_removed(client) -> None:
     payload = {"limit": 25, "dry_run": True, "schedule": "nightly"}
     canonical = client.post("/audit", json=payload, headers=AUTH_HEADERS)
     action_alias = client.post("/audit/run", json=payload, headers=AUTH_HEADERS)
     legacy_alias = client.post("/maintenance/audit", json=payload, headers=AUTH_HEADERS)
 
-    for resp in (canonical, action_alias, legacy_alias):
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "ok"
-        assert body["relationships_scanned"] == 25
+    assert canonical.status_code in {501, 503}
+    assert canonical.json()["detail"]
+    assert action_alias.status_code == 404
+    assert legacy_alias.status_code == 404
 
 
-def test_suggestions_digest_aliases_match(client) -> None:
+def test_suggestions_digest_canonical_shape_and_legacy_alias_removal(client) -> None:
     canonical = client.get("/suggestions/digest", headers=AUTH_HEADERS)
     alias = client.get("/suggestions_digest", headers=AUTH_HEADERS)
 
     assert canonical.status_code == 200
-    assert alias.status_code == 200
-    assert canonical.json()["digest"] == alias.json()["digest"] == "1 suggestion"
-    assert canonical.json()["has_suggestions"] is True
-    assert alias.json()["has_suggestions"] is True
+    body = canonical.json()
+    assert "digest" in body
+    assert isinstance(body["has_suggestions"], bool)
+    assert "timestamp" in body
+    assert alias.status_code == 404
 
 
-def test_training_aliases_match(client) -> None:
+def test_training_endpoints_reflect_experimental_ladybug_status(client) -> None:
     train_canonical = client.post("/train/gliner", json={"force": True}, headers=AUTH_HEADERS)
     train_alias = client.post("/training/gliner", json={"force": True}, headers=AUTH_HEADERS)
     status_canonical = client.get("/train/status", headers=AUTH_HEADERS)
     status_alias = client.get("/training/status", headers=AUTH_HEADERS)
 
-    assert train_canonical.status_code == 200
-    assert train_alias.status_code == 200
-    assert train_canonical.json()["status"] == "finetune_triggered"
-    assert train_alias.json()["status"] == "finetune_triggered"
+    assert train_canonical.status_code in {501, 503}
+    assert train_canonical.json()["detail"]
+    assert train_alias.status_code == 404
     assert status_canonical.status_code == 200
-    assert status_alias.status_code == 200
-    assert status_canonical.json()["gliner"] == status_alias.json()["gliner"]
+    assert "gliner" in status_canonical.json()
+    assert status_alias.status_code == 404
 
 
-def test_maintenance_run_contract(client) -> None:
+def test_maintenance_run_is_not_supported_on_ladybug_default(client) -> None:
     response = client.post("/maintenance/run", headers=AUTH_HEADERS)
-    assert response.status_code == 200
-    assert response.json()["status"] == "maintenance_triggered"
+    assert response.status_code in {501, 503}
+    assert response.json()["detail"]
 
 
 def test_embedding_model_registry_supports_huggingface_and_ollama(client) -> None:

@@ -1,7 +1,8 @@
 """
 Vector Store - Pluggable implementation
-Supports: sqlite-vec, Zvec
+Supports: Ladybug, sqlite-vec, Zvec
 """
+import json
 import os
 import math
 import threading
@@ -14,6 +15,24 @@ import logging
 import config as service_config
 
 log = logging.getLogger(__name__)
+
+LEGACY_VECTOR_DIMENSION = 768
+
+
+def _default_vector_dimension() -> int:
+    value = getattr(service_config, "EMBEDDING_VECTOR_DIMENSION", 384)
+    try:
+        return max(1, int(value))
+    except Exception:
+        return 384
+
+
+def _coerce_embedding_dimension(vec: List[float], target_dim: int) -> list[float]:
+    target_dim = max(1, int(target_dim))
+    values = [float(v) for v in vec[:target_dim]]
+    if len(values) < target_dim:
+        values.extend([0.0] * (target_dim - len(values)))
+    return values
 
 # Try to import Zvec
 try:
@@ -41,6 +60,15 @@ except ImportError:
     HAVE_ZVEC = False
     zvec = None
     log.info("Zvec not available")
+
+try:
+    import real_ladybug as ladybug
+    HAVE_LADYBUG = True
+    log.info("Ladybug available")
+except ImportError:
+    HAVE_LADYBUG = False
+    ladybug = None
+    log.info("Ladybug not available")
 
 
 class VectorStoreBackend(ABC):
@@ -87,6 +115,377 @@ class VectorStoreBackend(ABC):
         pass
 
 
+class LadybugVectorBackend(VectorStoreBackend):
+    """Ladybug-backed embedded vector store."""
+
+    TABLE_NAME = "MemoryVector"
+    INDEX_NAME = "memory_vector_idx"
+
+    def __init__(self, db_path: str | Path | None = None):
+        self.db_path = (
+            Path(db_path).expanduser()
+            if db_path is not None
+            else service_config.LADYBUG_DB_PATH
+        )
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._degraded_reason: str | None = None
+        self.embedding_dimension = self._resolve_embedding_dimension()
+        self.db = None
+        self.conn = None
+        self._init_database()
+
+    @property
+    def degraded(self) -> bool:
+        return self.conn is None
+
+    def _meta_path(self) -> Path:
+        return Path(f"{self.db_path}.vector_meta.json")
+
+    def _resolve_embedding_dimension(self) -> int:
+        meta_path = self._meta_path()
+        if meta_path.exists():
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                value = payload.get("embedding_dimension")
+                if value is not None:
+                    return max(1, int(value))
+            except Exception:
+                pass
+        return _default_vector_dimension()
+
+    def _persist_embedding_dimension(self) -> None:
+        payload = {
+            "embedding_dimension": self.embedding_dimension,
+        }
+        try:
+            tmp = self._meta_path().with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(self._meta_path())
+        except OSError:
+            log.debug("Unable to persist Ladybug embedding metadata", exc_info=True)
+
+    def _init_database(self) -> None:
+        try:
+            self.db = ladybug.Database(str(self.db_path))
+            self.conn = ladybug.Connection(self.db)
+            try:
+                self.conn.execute("INSTALL vector;")
+            except Exception:
+                log.debug("Ladybug vector extension install skipped", exc_info=True)
+            self.conn.execute("LOAD vector;")
+            self._ensure_schema()
+            self._ensure_index()
+            self._persist_embedding_dimension()
+        except Exception as exc:
+            self._degraded_reason = str(exc)
+            self.db = None
+            self.conn = None
+            log.error("Failed to initialize Ladybug vector backend", exc_info=True)
+
+    def _ensure_schema(self) -> None:
+        self.conn.execute(
+            f"""
+            CREATE NODE TABLE IF NOT EXISTS {self.TABLE_NAME}(
+                entity_id STRING PRIMARY KEY,
+                name STRING,
+                entity_type STRING,
+                content STRING,
+                confidence DOUBLE,
+                embedding FLOAT[{self.embedding_dimension}]
+            );
+            """
+        )
+
+    def _index_exists(self) -> bool:
+        try:
+            result = self.conn.execute(
+                "CALL SHOW_INDEXES() RETURN table_name, index_name, property_names"
+            )
+            rows = result.rows_as_dict().get_all()
+        except Exception:
+            return False
+
+        for row in rows:
+            if row.get("table_name") != self.TABLE_NAME:
+                continue
+            if row.get("index_name") != self.INDEX_NAME:
+                continue
+            properties = row.get("property_names") or []
+            if "embedding" in properties:
+                return True
+        return False
+
+    def _ensure_index(self) -> None:
+        if self._index_exists():
+            return
+        self.conn.execute(
+            f"""
+            CALL CREATE_VECTOR_INDEX(
+                '{self.TABLE_NAME}',
+                '{self.INDEX_NAME}',
+                'embedding',
+                metric := 'cosine'
+            );
+            """
+        )
+
+    def _entity_exists(self, entity_id: str) -> bool:
+        result = self.conn.execute(
+            f"""
+            MATCH (v:{self.TABLE_NAME} {{entity_id: $entity_id}})
+            RETURN count(v) AS existing;
+            """,
+            {"entity_id": entity_id},
+        )
+        rows = result.rows_as_dict().get_all()
+        return bool(rows and int(rows[0].get("existing") or 0) > 0)
+
+    def add_entity(self, entity_id: str, name: str, entity_type: str,
+                   dense_embedding: List[float], content: str, confidence: float = 1.0):
+        if self.conn is None:
+            log.error("Ladybug degraded — add_entity(%s) is a no-op", entity_id)
+            return
+
+        dense_embedding = _coerce_embedding_dimension(
+            dense_embedding,
+            self.embedding_dimension,
+        )
+        params = {
+            "entity_id": entity_id,
+            "name": name,
+            "entity_type": entity_type,
+            "content": content,
+            "confidence": float(confidence),
+            "embedding": dense_embedding,
+        }
+        with self._lock:
+            self.conn.execute(
+                f"""
+                MATCH (v:{self.TABLE_NAME} {{entity_id: $entity_id}})
+                DELETE v;
+                """,
+                {"entity_id": entity_id},
+            )
+            self.conn.execute(
+                f"""
+                CREATE (v:{self.TABLE_NAME} {{
+                    entity_id: $entity_id,
+                    name: $name,
+                    entity_type: $entity_type,
+                    content: $content,
+                    confidence: $confidence,
+                    embedding: $embedding
+                }});
+                """,
+                params,
+            )
+
+    def remove_entity(self, entity_id: str) -> bool:
+        if self.conn is None:
+            return False
+
+        with self._lock:
+            exists = self._entity_exists(entity_id)
+            if not exists:
+                return False
+            self.conn.execute(
+                f"""
+                MATCH (v:{self.TABLE_NAME} {{entity_id: $entity_id}})
+                DELETE v;
+                """,
+                {"entity_id": entity_id},
+            )
+        return True
+
+    def update_entity(self, entity_id: str, name: str, entity_type: str,
+                      dense_embedding: List[float], content: str,
+                      confidence: float = 1.0) -> None:
+        self.add_entity(
+            entity_id,
+            name,
+            entity_type,
+            dense_embedding,
+            content,
+            confidence,
+        )
+
+    def list_all_entity_ids(self) -> Optional[List[str]]:
+        if self.conn is None:
+            return None
+        with self._lock:
+            result = self.conn.execute(
+                f"""
+                MATCH (v:{self.TABLE_NAME})
+                RETURN v.entity_id AS entity_id
+                ORDER BY v.entity_id;
+                """
+            )
+            rows = result.rows_as_dict().get_all()
+        return [str(row.get("entity_id") or "").strip() for row in rows if row.get("entity_id")]
+
+    def similarity_search(self, query_embedding: List[float], top_k: int = 10,
+                          entity_type: Optional[str] = None) -> List[Dict]:
+        if self.conn is None:
+            log.error("Ladybug degraded — similarity_search returning empty")
+            return []
+
+        query_embedding = _coerce_embedding_dimension(
+            query_embedding,
+            self.embedding_dimension,
+        )
+        search_limit = max(1, int(top_k))
+        params = {
+            "query_vector": query_embedding,
+            "limit": search_limit if entity_type is None else max(search_limit * 4, search_limit),
+        }
+
+        if entity_type:
+            params["entity_type"] = entity_type
+            query = f"""
+                CALL QUERY_VECTOR_INDEX(
+                    '{self.TABLE_NAME}',
+                    '{self.INDEX_NAME}',
+                    $query_vector,
+                    $limit
+                )
+                WITH node, distance
+                WHERE node.entity_type = $entity_type
+                RETURN node.entity_id AS entity_id,
+                       node.name AS name,
+                       node.entity_type AS entity_type,
+                       distance
+                ORDER BY distance;
+            """
+        else:
+            query = f"""
+                CALL QUERY_VECTOR_INDEX(
+                    '{self.TABLE_NAME}',
+                    '{self.INDEX_NAME}',
+                    $query_vector,
+                    $limit
+                )
+                RETURN node.entity_id AS entity_id,
+                       node.name AS name,
+                       node.entity_type AS entity_type,
+                       distance
+                ORDER BY distance;
+            """
+
+        with self._lock:
+            result = self.conn.execute(query, params)
+            rows = result.rows_as_dict().get_all()
+
+        output = []
+        for row in rows[:search_limit]:
+            distance = float(row.get("distance") or 0.0)
+            output.append(
+                {
+                    "entity_id": str(row.get("entity_id") or ""),
+                    "name": str(row.get("name") or ""),
+                    "entity_type": str(row.get("entity_type") or ""),
+                    "score": math.exp(-max(0.0, distance)),
+                }
+            )
+        return output
+
+    def keyword_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        if self.conn is None:
+            return []
+        if not query.strip():
+            return []
+        with self._lock:
+            result = self.conn.execute(
+                f"""
+                MATCH (v:{self.TABLE_NAME})
+                WHERE toLower(v.name) CONTAINS toLower($query)
+                   OR toLower(v.content) CONTAINS toLower($query)
+                RETURN v.entity_id AS entity_id,
+                       v.name AS name,
+                       v.entity_type AS entity_type,
+                       CASE
+                           WHEN toLower(v.name) = toLower($query) THEN 1.0
+                           WHEN toLower(v.name) CONTAINS toLower($query) THEN 0.9
+                           ELSE 0.7
+                       END AS score
+                ORDER BY score DESC, v.name ASC
+                LIMIT $limit;
+                """,
+                {"query": query, "limit": max(1, int(top_k))},
+            )
+            rows = result.rows_as_dict().get_all()
+        return [
+            {
+                "entity_id": str(row.get("entity_id") or ""),
+                "name": str(row.get("name") or ""),
+                "entity_type": str(row.get("entity_type") or ""),
+                "score": float(row.get("score") or 0.0),
+            }
+            for row in rows
+        ]
+
+    def hybrid_search(self, query_embedding: List[float], query_text: str,
+                      top_k: int = 10, dense_weight: float = 0.7) -> List[Dict]:
+        dense_results = self.similarity_search(query_embedding, top_k=top_k * 2)
+        sparse_results = self.keyword_search(query_text, top_k=top_k * 2)
+
+        combined = {}
+        for row in dense_results:
+            combined[row["entity_id"]] = {
+                **row,
+                "dense_score": row["score"],
+                "sparse_score": 0.0,
+            }
+        for row in sparse_results:
+            if row["entity_id"] in combined:
+                combined[row["entity_id"]]["sparse_score"] = row["score"]
+            else:
+                combined[row["entity_id"]] = {
+                    **row,
+                    "dense_score": 0.0,
+                    "sparse_score": row["score"],
+                }
+
+        for row in combined.values():
+            row["score"] = dense_weight * row["dense_score"] + (1.0 - dense_weight) * row["sparse_score"]
+
+        return sorted(combined.values(), key=lambda row: row["score"], reverse=True)[:top_k]
+
+    def flush(self):
+        """Ladybug writes synchronously for this backend; nothing to flush."""
+        return None
+
+    def optimize(self) -> dict:
+        return {"status": "not_applicable", "backend": "ladybug"}
+
+    def get_stats(self) -> Dict:
+        if self.conn is None:
+            return {
+                "entities": 0,
+                "backend": "ladybug",
+                "degraded": True,
+                "reason": self._degraded_reason or "connection unavailable",
+            }
+        with self._lock:
+            result = self.conn.execute(
+                f"MATCH (v:{self.TABLE_NAME}) RETURN count(v) AS entities;"
+            )
+            rows = result.rows_as_dict().get_all()
+            entity_count = int(rows[0].get("entities") or 0) if rows else 0
+            index_present = self._index_exists()
+        db_size_mb = self.db_path.stat().st_size / (1024 * 1024) if self.db_path.exists() else 0.0
+        return {
+            "entities": entity_count,
+            "backend": "ladybug",
+            "db_size_mb": db_size_mb,
+            "embedding_dimension": self.embedding_dimension,
+            "vector_index_present": index_present,
+        }
+
+
 class SqliteVecBackend(VectorStoreBackend):
     """sqlite-vec implementation."""
     
@@ -103,6 +502,7 @@ class SqliteVecBackend(VectorStoreBackend):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.np = np
         self._lock = threading.Lock()
+        self.embedding_dimension = self._resolve_embedding_dimension()
         
         self.db = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.db.enable_load_extension(True)
@@ -110,15 +510,38 @@ class SqliteVecBackend(VectorStoreBackend):
         self.db.enable_load_extension(False)
         
         self._init_tables()
+
+    def _resolve_embedding_dimension(self) -> int:
+        if not self.db_path.exists():
+            return _default_vector_dimension()
+        try:
+            import sqlite3
+
+            probe = sqlite3.connect(str(self.db_path))
+            try:
+                cursor = probe.execute(
+                    "SELECT value FROM vector_meta WHERE key = ?",
+                    ("embedding_dimension",),
+                )
+                row = cursor.fetchone()
+                if row and str(row[0]).strip():
+                    return max(1, int(row[0]))
+            finally:
+                probe.close()
+        except Exception:
+            pass
+        return LEGACY_VECTOR_DIMENSION
     
     def _init_tables(self):
         with self._lock:
-            self.db.execute("""
+            self.db.execute(
+                f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS dense_vectors USING vec0(
                     entity_id TEXT PRIMARY KEY,
-                    embedding FLOAT[768]
+                    embedding FLOAT[{self.embedding_dimension}]
                 )
-            """)
+                """
+            )
             self.db.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS sparse_vectors USING fts5(
                     entity_id, content, tokenize='porter'
@@ -130,11 +553,22 @@ class SqliteVecBackend(VectorStoreBackend):
                     name TEXT, entity_type TEXT, confidence REAL, last_updated TEXT
                 )
             """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS vector_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            self.db.execute(
+                "INSERT OR REPLACE INTO vector_meta (key, value) VALUES (?, ?)",
+                ("embedding_dimension", str(self.embedding_dimension)),
+            )
             self.db.commit()
     
     def add_entity(self, entity_id: str, name: str, entity_type: str,
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
         from datetime import datetime, UTC
+        dense_embedding = _coerce_embedding_dimension(dense_embedding, self.embedding_dimension)
         
         with self._lock:
             self.db.execute(
@@ -155,7 +589,10 @@ class SqliteVecBackend(VectorStoreBackend):
     
     def similarity_search(self, query_embedding: List[float], top_k: int = 10,
                           entity_type: Optional[str] = None) -> List[Dict]:
-        query_vec = self.np.array(query_embedding, dtype=self.np.float32)
+        query_vec = self.np.array(
+            _coerce_embedding_dimension(query_embedding, self.embedding_dimension),
+            dtype=self.np.float32,
+        )
         
         # sqlite-vec requires k = ? constraint for KNN
         with self._lock:
@@ -245,7 +682,8 @@ class SqliteVecBackend(VectorStoreBackend):
             cursor = self.db.execute("SELECT COUNT(*) FROM sparse_vectors")
             sparse_count = cursor.fetchone()[0]
         return {"dense_vectors": dense_count, "sparse_vectors": sparse_count,
-                "db_size_mb": self.db_path.stat().st_size / (1024 * 1024)}
+                "db_size_mb": self.db_path.stat().st_size / (1024 * 1024),
+                "embedding_dimension": self.embedding_dimension}
 
 
 class ZvecBackend(VectorStoreBackend):
@@ -299,9 +737,38 @@ class ZvecBackend(VectorStoreBackend):
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.np = np
+        self.embedding_dimension = self._resolve_embedding_dimension()
 
         # Create or open collection
         self._init_collection()
+
+    def _meta_path(self) -> Path:
+        return self.db_path / "vector_meta.json"
+
+    def _resolve_embedding_dimension(self) -> int:
+        meta_path = self._meta_path()
+        if meta_path.exists():
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                value = payload.get("embedding_dimension")
+                if value is not None:
+                    return max(1, int(value))
+            except Exception:
+                pass
+        if self.db_path.exists():
+            return LEGACY_VECTOR_DIMENSION
+        return _default_vector_dimension()
+
+    def _persist_embedding_dimension(self) -> None:
+        payload = {
+            "embedding_dimension": self.embedding_dimension,
+        }
+        try:
+            tmp = self._meta_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+            tmp.replace(self._meta_path())
+        except OSError:
+            log.debug("Unable to persist Zvec embedding metadata", exc_info=True)
     
     def _init_collection(self):
         """Initialize Zvec collection with proper schema."""
@@ -366,6 +833,7 @@ class ZvecBackend(VectorStoreBackend):
                         "but search results will still be correct.",
                         opt_exc,
                     )
+                self._persist_embedding_dimension()
             except RuntimeError as exc:
                 # Don't destroy the data — run degraded instead
                 log.error(
@@ -396,9 +864,9 @@ class ZvecBackend(VectorStoreBackend):
                     zvec.FieldSchema("confidence", zvec.DataType.FLOAT, nullable=True),
                 ],
                 vectors=zvec.VectorSchema(
-                    "embedding", 
-                    zvec.DataType.VECTOR_FP32, 
-                    dimension=768, 
+                    "embedding",
+                    zvec.DataType.VECTOR_FP32,
+                    dimension=self.embedding_dimension,
                     index_param=hnsw_param
                 )
             )
@@ -414,6 +882,7 @@ class ZvecBackend(VectorStoreBackend):
                 option
             )
             log.info(f"Created new Zvec collection: {self.db_path}")
+            self._persist_embedding_dimension()
     
     def add_entity(self, entity_id: str, name: str, entity_type: str,
                    dense_embedding: List[float], content: str, confidence: float = 1.0):
@@ -421,6 +890,7 @@ class ZvecBackend(VectorStoreBackend):
         if self.collection is None:
             log.error("Zvec degraded — add_entity(%s) is a no-op; vector store is unavailable", entity_id)
             return
+        dense_embedding = _coerce_embedding_dimension(dense_embedding, self.embedding_dimension)
         doc = zvec.Doc(
             id=entity_id,
             vectors={"embedding": dense_embedding},
@@ -455,6 +925,7 @@ class ZvecBackend(VectorStoreBackend):
         if self.collection is None:
             log.error("Zvec degraded — similarity_search returning empty; vector store is unavailable")
             return []
+        query_embedding = _coerce_embedding_dimension(query_embedding, self.embedding_dimension)
         # Build filter if entity_type specified
         filter_expr = None
         if entity_type:
@@ -606,6 +1077,7 @@ class ZvecBackend(VectorStoreBackend):
             "entities": int(entities or 0),
             "backend": "zvec",
             "index_completeness": completeness_safe,
+            "embedding_dimension": self.embedding_dimension,
         }
 
 
@@ -617,16 +1089,23 @@ class VectorStore:
         Initialize vector store.
         
         Args:
-            backend: 'auto', 'zvec', or 'sqlite-vec'. Auto picks best available.
+            backend: 'auto', 'ladybug', 'zvec', or 'sqlite-vec'. Auto picks best available.
         """
         if backend is None or backend == "auto":
-            backend = "zvec" if HAVE_ZVEC else "sqlite-vec"
-        
-        if backend == "zvec":
+            if HAVE_LADYBUG:
+                backend = "ladybug"
+            else:
+                backend = "zvec" if HAVE_ZVEC else "sqlite-vec"
+
+        if backend == "ladybug":
+            if not HAVE_LADYBUG:
+                raise ImportError("Ladybug not available. Install: pip install real-ladybug")
+            self.backend = LadybugVectorBackend(**kwargs)
+        elif backend == "zvec":
             if not HAVE_ZVEC:
                 raise ImportError("Zvec not available. Install: pip install zvec")
             self.backend = ZvecBackend(**kwargs)
-        elif backend == "sqlite-vec":
+        elif backend in {"sqlite-vec", "sqlite_vec"}:
             self.backend = SqliteVecBackend(**kwargs)
         else:
             raise ValueError(f"Unknown backend: {backend}")
@@ -712,9 +1191,17 @@ class VectorStore:
 
     def is_degraded(self) -> bool:
         """Return True if the backend is in degraded mode (e.g. Zvec collection failed to open)."""
+        if getattr(self.backend, "degraded", False):
+            return True
         if isinstance(self.backend, ZvecBackend):
             return self.backend.collection is None
         return False
+
+    def optimize(self, *args, **kwargs) -> dict:
+        """Run backend-specific maintenance when supported."""
+        if hasattr(self.backend, "optimize"):
+            return self.backend.optimize(*args, **kwargs)
+        return {"status": "not_applicable", "backend": self.backend.__class__.__name__}
 
     def zvec_optimize(self, concurrency: int = 0) -> dict:
         """Trigger Zvec segment compaction and HNSW index rebuild (no-op for non-Zvec backends).
@@ -729,9 +1216,7 @@ class VectorStore:
         Returns:
             dict with ``status`` and ``index_completeness_after``.
         """
-        if isinstance(self.backend, ZvecBackend):
-            return self.backend.optimize(concurrency=concurrency)
-        return {"status": "not_applicable", "backend": self.backend.__class__.__name__}
+        return self.optimize(concurrency=concurrency)
 
     def get_segment_health(self) -> dict:
         """Return Zvec segment index completeness metrics (empty dict for non-Zvec backends).

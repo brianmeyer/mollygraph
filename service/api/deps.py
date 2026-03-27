@@ -222,7 +222,9 @@ def _active_embedding_info() -> tuple[str, str]:
     if tier in ("sentence-transformers", "st"):
         return (
             "sentence-transformers",
-            config.EMBEDDING_ST_MODEL or config.EMBEDDING_MODEL or "google/embeddinggemma-300m",
+            config.EMBEDDING_ST_MODEL
+            or config.EMBEDDING_MODEL
+            or config.DEFAULT_LOCAL_EMBEDDING_MODEL,
         )
     if tier == "ollama":
         return ("ollama", config.EMBEDDING_OLLAMA_MODEL or config.OLLAMA_EMBED_MODEL or "nomic-embed-text")
@@ -232,10 +234,15 @@ def _active_embedding_info() -> tuple[str, str]:
         return ("hash", "")
     backend = (config.EMBEDDING_BACKEND or "").strip().lower()
     if backend in ("huggingface", "sentence-transformers", "st", "hf"):
-        return ("sentence-transformers", config.EMBEDDING_ST_MODEL or config.EMBEDDING_MODEL or "")
+        return (
+            "sentence-transformers",
+            config.EMBEDDING_ST_MODEL
+            or config.EMBEDDING_MODEL
+            or config.DEFAULT_LOCAL_EMBEDDING_MODEL,
+        )
     if backend == "ollama":
         return ("ollama", config.OLLAMA_EMBED_MODEL or "")
-    return ("unknown", "")
+    return ("sentence-transformers", config.DEFAULT_LOCAL_EMBEDDING_MODEL)
 
 
 def _reindex_embeddings_sync(limit: int, dry_run: bool) -> dict[str, Any]:
@@ -308,20 +315,9 @@ async def _delete_entity_and_vector(name: str) -> tuple[bool, bool]:
 
     entity_id: str | None = None
     try:
-        with graph.driver.session() as _session:
-            rec = _session.run(
-                """
-                MATCH (e:Entity)
-                WHERE toLower(e.name) = $name
-                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
-                RETURN coalesce(e.id, toLower(e.name)) AS entity_id
-                """,
-                name=name.lower(),
-            ).single()
-        if rec:
-            entity_id = str(rec["entity_id"])
+        entity_id = graph.get_entity_id_by_name(name)
     except Exception:
-        pass
+        log.debug("_delete_entity_and_vector: entity id lookup failed for %s", name, exc_info=True)
 
     neo4j_deleted = await asyncio.to_thread(graph.delete_entity, name)
     vector_deleted = False

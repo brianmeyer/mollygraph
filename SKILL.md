@@ -1,25 +1,44 @@
 # MollyGraph Skill
 
-**Name:** mollygraph  
-**Description:** Bi-temporal knowledge graph with local-first entity extraction  
-**Version:** 2.0.0
+**Name:** `mollygraph`  
+**Description:** Local-first graph memory for AI agents  
+**Version:** `3.0.0`
 
 ## Overview
 
-MollyGraph is a local knowledge graph system using:
-- **Neo4j** for graph storage (bi-temporal relationships)
-- **Zvec** for vector similarity search (Alibaba, embedded)
-- **GLiNER2** for entity/relationship extraction (local, no API cost)
-- **SQLite** for async job queue
+MollyGraph's default product path is now:
+
+- `Ladybug` for local graph storage
+- `Ladybug` for local vector storage
+- `GLiNER2` for entity and relation extraction
+- `Snowflake/snowflake-arctic-embed-s` for default local embeddings
+- `SQLite` for the async extraction queue
+- `HTTP + MCP + Python SDK` for the user-facing surface
+
+Neo4j, audit flows, training loops, and decision traces still exist as experimental or legacy surfaces, but they are not the default runtime.
 
 ## Installation
 
 ```bash
 cd /Users/brianmeyer/mollygraph
-./scripts/install.sh   # runtime venv at ~/.graph-memory/venv (Python 3.12)
-./scripts/start.sh     # HTTP API on port 7422
-MOLLYGRAPH_SPACY_ENRICHMENT=true ~/.graph-memory/venv/bin/python service/mcp_server.py  # optional MCP on 7423
+./scripts/install.sh
+cp service/.env.example service/.env
+./scripts/start.sh
 ```
+
+This starts the HTTP API on port `7422`. The default API key is `dev-key-change-in-production`.
+
+## Default Runtime
+
+The intended local-first defaults are:
+
+```env
+MOLLYGRAPH_GRAPH_BACKEND=ladybug
+MOLLYGRAPH_VECTOR_BACKEND=ladybug
+MOLLYGRAPH_EMBEDDING_ST_MODEL=Snowflake/snowflake-arctic-embed-s
+```
+
+Graph and vector currently use separate Ladybug database files by default while the shared-runtime refactor continues.
 
 ## MCP Integration
 
@@ -29,68 +48,68 @@ Add to your MCP client config:
 {
   "mcpServers": {
     "mollygraph": {
-      "command": "python3",
+      "command": "mollygraph-mcp",
       "args": [
-        "/Users/brianmeyer/mollygraph/service/mcp_server.py"
-      ],
-      "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_PASSWORD": "mollygraph"
-      }
+        "--base-url",
+        "http://127.0.0.1:7422",
+        "--api-key",
+        "dev-key-change-in-production"
+      ]
     }
   }
 }
 ```
 
-## MCP Tools
+## Default MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `add_episode` | Queue text for entity extraction |
-| `search_facts` | Search relationships in graph |
-| `search_nodes` | Find entities by name |
-| `get_entity_context` | Get entity with 2-hop context |
-| `get_queue_status` | Check extraction queue |
-| `run_audit` | Run nightly/weekly graph audit |
-| `get_training_status` | Get GLiNER training status |
+| `add_episode` | Queue text for extraction |
+| `search_facts` | Search merged graph and memory facts |
+| `search_nodes` | Find graph entities by name |
+| `get_entity_context` | Get entity context and neighborhood |
+| `get_queue_status` | Check extraction queue health |
+| `delete_entity` | Remove an entity from graph and vector storage |
+| `prune_entities` | Clean up entities in bulk |
 
-## HTTP API (Alternative)
+Experimental tools like audit and training are only exposed when the configured backend supports them.
 
-If MCP is unavailable, use direct HTTP:
+## HTTP API
 
-```bash
-# Health
-curl http://localhost:7422/health
+Core endpoints:
 
-# Ingest (auth required)
-curl -X POST -H "Authorization: Bearer dev-key-change-in-production" \
-  "http://localhost:7422/ingest?content=Text&source=manual&priority=0"
-
-# Query (auth required)
-curl -H "Authorization: Bearer dev-key-change-in-production" \
-  "http://localhost:7422/entity/Brian%20Meyer"
-```
+- `GET /health`
+- `GET /stats`
+- `POST /ingest`
+- `GET /query`
+- `POST /query`
+- `GET /entity/{name}`
+- `DELETE /entity/{name}`
+- `POST /entities/prune`
 
 ## Authentication
 
-Default API key: `dev-key-change-in-production`  
-Set via env: `MOLLYGRAPH_API_KEY=your-key`
+Protected endpoints require:
 
-## Ports
+```text
+Authorization: Bearer dev-key-change-in-production
+```
 
-- HTTP API: `7422`
-- MCP SSE: `7423` (if running mcp_server.py separately)
+Override with `MOLLYGRAPH_API_KEY`.
 
 ## Data Storage
 
-- Graph: Neo4j (Docker, port 7687)
-- Vectors: Zvec (embedded, `~/.graph-memory/zvec_collection`)
-- Queue: SQLite (`~/.graph-memory/extraction_queue.db`)
+- Graph: `Ladybug` (`~/.graph-memory/graph.lbug` by default)
+- Vectors: `Ladybug` (`~/.graph-memory/vectors.lbug` by default)
+- Queue: `SQLite` (`~/.graph-memory/extraction_queue.db`)
 
 ## Architecture
 
-```
-User Input → Queue (SQLite) → Worker → GLiNER2 Extraction → Neo4j + Zvec
-                ↑                                              ↓
-         Async Processing                              Query/Retrieval
+```text
+User Input
+  -> Queue (SQLite)
+  -> GLiNER2 extraction
+  -> Speaker anchoring + relation gate
+  -> Ladybug graph + Ladybug vector
+  -> MCP / HTTP / SDK query surface
 ```

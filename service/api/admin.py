@@ -53,6 +53,7 @@ from metrics.stats_logger import (
     get_summary,
 )
 from runtime_graph import get_graph_instance
+from runtime_graph import get_graph_backend_name, graph_supports_capability
 from runtime_pipeline import get_pipeline_instance
 from runtime_queue import get_queue_instance
 from runtime_state import record_nightly_result, get_nightly_results, get_service_started_at
@@ -85,6 +86,16 @@ from api.deps import (
 
 log = logging.getLogger("mollygraph")
 router = APIRouter()
+_SHOW_EXPERIMENTAL_API_DOCS = config.GRAPH_BACKEND == "neo4j"
+
+
+def _require_graph_capability(capability: str, graph: Any | None, message: str) -> None:
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    if graph_supports_capability(capability, graph):
+        return
+    backend = get_graph_backend_name(graph)
+    raise HTTPException(status_code=501, detail=f"{message} on graph backend '{backend}'")
 
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
@@ -113,10 +124,7 @@ async def stats(_api_key: str = Depends(verify_api_key)) -> StatsResponse:
         except Exception:
             log.debug("Graph summary unavailable", exc_info=True)
         try:
-            with graph.driver.session() as _s:
-                incomplete_episodes = _s.run(
-                    "MATCH (ep:Episode {incomplete: true}) RETURN count(ep) AS n"
-                ).single()["n"]
+            incomplete_episodes = graph.incomplete_episode_count()
         except Exception:
             log.debug("Incomplete episode count unavailable", exc_info=True)
 
@@ -173,9 +181,7 @@ async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[
     if graph is not None:
         try:
             current_rel_types = graph.get_relationship_type_distribution()
-            with graph.driver.session() as s:
-                rows = s.run("MATCH (e:Entity) RETURN e.entity_type AS t, count(*) AS c").data()
-                current_entity_types = {r["t"] or "Unknown": r["c"] for r in rows}
+            current_entity_types = graph.get_entity_type_distribution()
         except Exception:
             pass
 
@@ -251,7 +257,7 @@ async def metrics_schema_drift(_api_key: str = Depends(verify_api_key)) -> dict[
     }
 
 
-@router.get("/metrics/model-health")
+@router.get("/metrics/model-health", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     try:
         return model_health_monitor.check_health()
@@ -259,7 +265,7 @@ async def metrics_model_health(_api_key: str = Depends(verify_api_key)) -> dict[
         raise HTTPException(status_code=500, detail=f"model_health_error: {exc}") from exc
 
 
-@router.get("/metrics/nightly")
+@router.get("/metrics/nightly", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def metrics_nightly(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     """Return nightly pipeline run history (success/failure per run)."""
     results = get_nightly_results()
@@ -364,7 +370,7 @@ async def metrics_retrieval_trend(
     }
 
 
-@router.get("/metrics/evolution")
+@router.get("/metrics/evolution", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def metrics_evolution(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     """Comprehensive self-evolution metrics."""
     require_runtime_ready()
@@ -618,7 +624,7 @@ async def metrics_dashboard(_api_key: str = Depends(verify_api_key)) -> dict[str
 
 # ── Model health ───────────────────────────────────────────────────────────────
 
-@router.get("/model-health/status")
+@router.get("/model-health/status", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def model_health_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     try:
         return model_health_monitor.get_status()
@@ -628,13 +634,16 @@ async def model_health_status(_api_key: str = Depends(verify_api_key)) -> dict[s
 
 # ── Audit ──────────────────────────────────────────────────────────────────────
 
-@router.post("/audit", operation_id="post_audit")
-@router.post("/audit/run", operation_id="post_audit_run_legacy")
-@router.post("/maintenance/audit", operation_id="post_maintenance_audit_legacy")
+@router.post("/audit", operation_id="post_audit", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def audit(req: AuditRequest, _api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     schedule = (req.schedule or "nightly").strip().lower()
     if schedule not in {"nightly", "weekly"}:
         raise HTTPException(status_code=400, detail="schedule must be 'nightly' or 'weekly'")
+    _require_graph_capability(
+        "audit",
+        get_graph_instance(),
+        "Relationship audit is not supported",
+    )
     return await run_llm_audit(
         limit=req.limit,
         dry_run=req.dry_run,
@@ -643,7 +652,11 @@ async def audit(req: AuditRequest, _api_key: str = Depends(verify_api_key)) -> d
     )
 
 
-@router.get("/audit/signals/stats", operation_id="get_audit_signals_stats")
+@router.get(
+    "/audit/signals/stats",
+    operation_id="get_audit_signals_stats",
+    include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS,
+)
 async def audit_signals_stats(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     from audit.signals import get_signal_counts, SIGNAL_TYPES
     counts = get_signal_counts()
@@ -659,8 +672,11 @@ async def audit_signals_stats(_api_key: str = Depends(verify_api_key)) -> dict[s
 
 # ── Suggestions ────────────────────────────────────────────────────────────────
 
-@router.get("/suggestions/digest", operation_id="get_suggestions_digest")
-@router.get("/suggestions_digest", operation_id="get_suggestions_digest_legacy")
+@router.get(
+    "/suggestions/digest",
+    operation_id="get_suggestions_digest",
+    include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS,
+)
 async def suggestions_digest(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     digest = build_suggestion_digest()
     return {
@@ -672,23 +688,39 @@ async def suggestions_digest(_api_key: str = Depends(verify_api_key)) -> dict[st
 
 # ── Training ───────────────────────────────────────────────────────────────────
 
-@router.post("/train/gliner", operation_id="post_train_gliner")
-@router.post("/training/gliner", operation_id="post_training_gliner_legacy")
+@router.post(
+    "/train/gliner",
+    operation_id="post_train_gliner",
+    include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS,
+)
 async def train_gliner(req: TrainRequest, _api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
+    _require_graph_capability(
+        "training",
+        get_graph_instance(),
+        "GLiNER self-training is not supported",
+    )
     return await run_gliner_finetune_pipeline(force=req.force)
 
 
-@router.get("/train/status", operation_id="get_train_status")
-@router.get("/training/status", operation_id="get_training_status_legacy")
+@router.get(
+    "/train/status",
+    operation_id="get_train_status",
+    include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS,
+)
 async def train_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return {"gliner": get_gliner_stats()}
 
 
-@router.get("/training/runs")
+@router.get("/training/runs", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def training_runs(
     limit: int = 20,
     _api_key: str = Depends(verify_api_key),
 ) -> dict[str, Any]:
+    _require_graph_capability(
+        "training",
+        get_graph_instance(),
+        "GLiNER training history is not supported",
+    )
     try:
         svc = GLiNERTrainingService()
         runs = await asyncio.to_thread(svc.list_training_runs, limit)
@@ -754,22 +786,22 @@ async def reindex_embeddings(
 
 # ── Extractors ─────────────────────────────────────────────────────────────────
 
-@router.get("/extractors/config")
+@router.get("/extractors/config", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def extractors_config(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return get_extractor_registry()
 
 
-@router.get("/extractors/status")
+@router.get("/extractors/status", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def extractors_status(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return get_extractor_status()
 
 
-@router.get("/extractors/schema")
+@router.get("/extractors/schema", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def extractors_schema(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     return get_extractor_schema_status(include_schema=True)
 
 
-@router.get("/extractors/schema/presets")
+@router.get("/extractors/schema/presets", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def extractors_schema_presets(
     include_schema: bool = False,
     _api_key: str = Depends(verify_api_key),
@@ -777,7 +809,7 @@ async def extractors_schema_presets(
     return get_extractor_schema_presets(include_schema=include_schema)
 
 
-@router.post("/extractors/schema")
+@router.post("/extractors/schema", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def set_extractors_schema(
     req: ExtractorSchemaConfigRequest,
     _api_key: str = Depends(verify_api_key),
@@ -790,7 +822,7 @@ async def set_extractors_schema(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/extractors/schema/upload")
+@router.post("/extractors/schema/upload", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def upload_extractors_schema(
     req: ExtractorSchemaUploadRequest,
     _api_key: str = Depends(verify_api_key),
@@ -807,7 +839,7 @@ async def upload_extractors_schema(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/extractors/config")
+@router.post("/extractors/config", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def set_extractors_config(
     req: ExtractorConfigRequest,
     _api_key: str = Depends(verify_api_key),
@@ -820,7 +852,7 @@ async def set_extractors_config(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/extractors/models")
+@router.post("/extractors/models", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def add_extractors_model(
     req: ExtractorModelRequest,
     _api_key: str = Depends(verify_api_key),
@@ -839,7 +871,7 @@ async def add_extractors_model(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/extractors/prefetch")
+@router.post("/extractors/prefetch", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def prefetch_extractor_model(
     req: ExtractorPrefetchRequest,
     _api_key: str = Depends(verify_api_key),
@@ -859,16 +891,25 @@ async def prefetch_extractor_model(
 
 # ── Maintenance ────────────────────────────────────────────────────────────────
 
-@router.post("/maintenance/run")
+@router.post("/maintenance/run", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def trigger_maintenance(
     background_tasks: BackgroundTasks,
     _api_key: str = Depends(verify_api_key),
 ) -> dict[str, Any]:
+    _require_graph_capability(
+        "maintenance",
+        get_graph_instance(),
+        "The maintenance cycle is not supported",
+    )
     background_tasks.add_task(run_maintenance_cycle)
     return {"status": "maintenance_triggered", "timestamp": datetime.now(UTC).isoformat()}
 
 
-@router.post("/maintenance/backfill-temporal", operation_id="post_maintenance_backfill_temporal")
+@router.post(
+    "/maintenance/backfill-temporal",
+    operation_id="post_maintenance_backfill_temporal",
+    include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS,
+)
 async def backfill_temporal_properties(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     require_runtime_ready()
     graph = get_graph_instance()
@@ -959,36 +1000,22 @@ async def reconcile_vectors(
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
 
-            # Best-effort full re-embed from Neo4j (fallback path for zvec where full vector ID listing is unavailable)
-            reindexed = 0
-            failed = 0
-            for row in neo4j_rows:
-                entity_id = str(row.get("entity_id") or "").strip()
-                name = str(row.get("name") or "").strip()
-                if not entity_id or not name:
-                    failed += 1
-                    continue
-                try:
-                    await asyncio.to_thread(
-                        vector_store.add_entity,
-                        entity_id,
-                        name,
-                        str(row.get("entity_type") or "Concept"),
-                        str(row.get("content") or name),
-                    )
-                    reindexed += 1
-                except Exception:
-                    failed += 1
-            optimize_result = await asyncio.to_thread(vector_store.optimize)
+            from api.deps import _reindex_embeddings_sync
+
+            reindex_result = await asyncio.to_thread(
+                _reindex_embeddings_sync,
+                len(neo4j_rows),
+                False,
+            )
             return {
                 "status": "ok",
                 "mode": "rebuild",
                 "deterministic_decision": evaluation.final_action.value,
                 "reasons": evaluation.reasons,
                 "neo4j_entities": len(neo4j_ids),
-                "reindexed": reindexed,
-                "failed": failed,
-                "optimize": _json_safe(optimize_result),
+                "reindexed": reindex_result.get("reindexed", 0),
+                "failed": reindex_result.get("failed", 0),
+                "reindex": _json_safe(reindex_result),
                 "timestamp": datetime.now(UTC).isoformat(),
             }
 
@@ -999,7 +1026,7 @@ async def reconcile_vectors(
                 "status": "partial",
                 "mode": "orphan_cleanup",
                 "message": (
-                    "Active vector backend does not support listing all entity ids (zvec limitation). "
+                    "Active vector backend does not support listing all entity ids. "
                     "Use mode=rebuild as a fallback path when infra-health allows it."
                 ),
                 "neo4j_entities": len(neo4j_ids),
@@ -1080,7 +1107,7 @@ async def maintenance_quality_check(_api_key: str = Depends(verify_api_key)) -> 
     }
 
 
-@router.post("/maintenance/cleanup-training-data")
+@router.post("/maintenance/cleanup-training-data", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def cleanup_training_data(_api_key: str = Depends(verify_api_key)) -> dict[str, Any]:
     try:
         result = await cleanup_stale_gliner_training_examples()
@@ -1090,7 +1117,7 @@ async def cleanup_training_data(_api_key: str = Depends(verify_api_key)) -> dict
         raise HTTPException(status_code=500, detail=f"cleanup_error: {exc}") from exc
 
 
-@router.post("/maintenance/nightly")
+@router.post("/maintenance/nightly", include_in_schema=_SHOW_EXPERIMENTAL_API_DOCS)
 async def trigger_nightly_maintenance(
     background_tasks: BackgroundTasks,
     _api_key: str = Depends(verify_api_key),

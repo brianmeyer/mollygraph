@@ -79,60 +79,26 @@ def _extract_query_verbs(query: str) -> list[str]:
 
 
 def _get_neighborhood_stats(
-    driver: Any,  # neo4j Driver
+    graph: Any,
     entity_name: str,
 ) -> tuple[int, float]:
     """Return (neighbor_count, avg_strength) for entity's 1-hop neighborhood."""
     try:
-        with driver.session() as session:
-            rec = session.run(
-                """
-                MATCH (e:Entity)
-                WHERE toLower(e.name) = $name
-                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
-                OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
-                RETURN count(DISTINCT neighbor) AS neighbor_count,
-                       avg(coalesce(r.strength, r.confidence, 0.5)) AS avg_strength
-                """,
-                name=entity_name.lower(),
-            ).single()
-        if rec is None:
-            return 0, 0.0
-        n = int(rec["neighbor_count"] or 0)
-        s = float(rec["avg_strength"] or 0.0)
-        return n, s
+        return graph.get_neighborhood_stats(entity_name)
     except Exception as exc:
         log.debug("neighborhood_stats failed for %r: %s", entity_name, exc)
         return 0, 0.0
 
 
 def _get_path_distance(
-    driver: Any,
+    graph: Any,
     from_name: str,
     to_name: str,
     max_hops: int = 2,
 ) -> int | None:
     """Return shortest path length (1 or 2 hops) or None if unreachable."""
     try:
-        with driver.session() as session:
-            rec = session.run(
-                f"""
-                MATCH p = shortestPath(
-                    (a:Entity)-[*1..{max_hops}]-(b:Entity)
-                )
-                WHERE (toLower(a.name) = $from_name
-                    OR ANY(al IN coalesce(a.aliases, []) WHERE toLower(al) = $from_name))
-                  AND (toLower(b.name) = $to_name
-                    OR ANY(bl IN coalesce(b.aliases, []) WHERE toLower(bl) = $to_name))
-                RETURN length(p) AS dist
-                LIMIT 1
-                """,
-                from_name=from_name.lower(),
-                to_name=to_name.lower(),
-            ).single()
-        if rec is None:
-            return None
-        return int(rec["dist"])
+        return graph.get_path_distance(from_name, to_name, max_hops=max_hops)
     except Exception as exc:
         log.debug("path_distance failed %r→%r: %s", from_name, to_name, exc)
         return None
@@ -216,7 +182,7 @@ def graph_rerank(
     results: list[dict[str, Any]],
     query: str,
     query_entities: list[str],
-    driver: Any,  # neo4j Driver
+    graph: Any,
 ) -> list[dict[str, Any]]:
     """Merge, deduplicate, and rerank query results using graph signals.
 
@@ -225,7 +191,8 @@ def graph_rerank(
             Each has keys: entity, facts, score (optional), retrieval_source.
         query: raw query string (for intent/verb matching).
         query_entities: entities extracted from the query (for path bonus).
-        driver: live neo4j Driver instance.
+        graph: graph abstraction exposing `query_entity()` and
+            `get_entity_context()`.
 
     Returns:
         Reranked list of result dicts, each with 'graph_score' and
@@ -296,7 +263,7 @@ def graph_rerank(
         name_match_additive = _NAME_MATCH_BOOST if name_match else 0.0
 
         # 2b. Neighborhood score
-        neighbor_count, avg_strength = _get_neighborhood_stats(driver, entity_name)
+        neighbor_count, avg_strength = _get_neighborhood_stats(graph, entity_name)
         neighborhood_boost = (
             math.log(1 + neighbor_count) * neighbor_weight
             + avg_strength * strength_weight
@@ -308,7 +275,7 @@ def graph_rerank(
         for q_entity in query_entities[:3]:  # limit to top 3 query entities
             if q_entity.lower() == entity_name.lower():
                 continue
-            dist = _get_path_distance(driver, q_entity, entity_name)
+            dist = _get_path_distance(graph, q_entity, entity_name)
             if dist is not None and dist <= 2:
                 # 1-hop: +2*PATH_BONUS, 2-hop: +1*PATH_BONUS
                 hops_bonus = path_bonus * (3 - dist)  # dist=1→2x, dist=2→1x

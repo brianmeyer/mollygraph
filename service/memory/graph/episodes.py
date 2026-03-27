@@ -9,6 +9,57 @@ from memory.models import Episode
 
 
 class EpisodeMixin:
+    def mark_episode_incomplete(self, episode_id: str, reason: str = "") -> bool:
+        """Mark an episode as incomplete after a partial-write failure."""
+        if not episode_id:
+            return False
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (ep:Episode {id: $episode_id})
+                SET ep.incomplete = true,
+                    ep.incomplete_reason = $reason,
+                    ep.incomplete_at = datetime()
+                RETURN count(ep) AS updated
+                """,
+                episode_id=episode_id,
+                reason=reason[:500],
+            ).single()
+        return bool(record and int(record["updated"] or 0) > 0)
+
+    def finalize_episode(self, episode_id: str, entity_names: list[str]) -> bool:
+        """Mark a pre-created episode complete and wire its MENTIONS edges."""
+        if not episode_id:
+            return False
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (ep:Episode {id: $episode_id})
+                SET ep.incomplete = false,
+                    ep.incomplete_reason = null,
+                    ep.entities_extracted = $entity_names
+                RETURN count(ep) AS updated
+                """,
+                episode_id=episode_id,
+                entity_names=entity_names,
+            ).single()
+            if entity_names:
+                session.run(
+                    """
+                    MATCH (ep:Episode {id: $episode_id})
+                    UNWIND $entities AS entity_name
+                    MATCH (e:Entity)
+                    WHERE toLower(e.name) = toLower(entity_name)
+                       OR any(alias IN coalesce(e.aliases, []) WHERE toLower(alias) = toLower(entity_name))
+                    MERGE (ep)-[:MENTIONS]->(e)
+                    SET e.last_seen = datetime(),
+                        e.last_mentioned = datetime()
+                    """,
+                    episode_id=episode_id,
+                    entities=entity_names,
+                )
+        return bool(record and int(record["updated"] or 0) > 0)
+
     def _create_legacy_episode(
         self,
         content_preview: str,

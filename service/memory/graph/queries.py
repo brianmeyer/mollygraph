@@ -6,6 +6,146 @@ from typing import Any, Dict, List, Optional
 
 
 class QueryMixin:
+    def list_entities_page(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        entity_type: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return a paginated entity list and total count."""
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+
+        if entity_type:
+            cypher = (
+                "MATCH (e:Entity) WHERE e.entity_type = $entity_type "
+                "RETURN e.name AS name, e.entity_type AS entity_type, "
+                "e.confidence AS confidence, e.id AS id "
+                "ORDER BY e.name ASC SKIP $offset LIMIT $limit"
+            )
+            count_cypher = "MATCH (e:Entity) WHERE e.entity_type = $entity_type RETURN count(e) AS total"
+            params: dict[str, Any] = {
+                "entity_type": entity_type,
+                "limit": safe_limit,
+                "offset": safe_offset,
+            }
+            count_params: dict[str, Any] = {"entity_type": entity_type}
+        else:
+            cypher = (
+                "MATCH (e:Entity) "
+                "RETURN e.name AS name, e.entity_type AS entity_type, "
+                "e.confidence AS confidence, e.id AS id "
+                "ORDER BY e.name ASC SKIP $offset LIMIT $limit"
+            )
+            count_cypher = "MATCH (e:Entity) RETURN count(e) AS total"
+            params = {"limit": safe_limit, "offset": safe_offset}
+            count_params = {}
+
+        with self.driver.session() as session:
+            rows = session.run(cypher, **params).data()
+            total_record = session.run(count_cypher, **count_params).single()
+        total = int(total_record["total"]) if total_record else 0
+        return [dict(row) for row in rows], total
+
+    def find_entities_containing(self, query: str, limit: int = 5) -> list[str]:
+        """Return entity names whose names or aliases contain the query text."""
+        normalized = self._normalize_name(query)
+        if not normalized:
+            return []
+
+        safe_limit = max(1, int(limit))
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) CONTAINS $q
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) CONTAINS $q)
+                RETURN DISTINCT e.name AS name
+                ORDER BY CASE WHEN toLower(e.name) = $q THEN 0 ELSE 1 END, e.name ASC
+                LIMIT $limit
+                """,
+                q=normalized,
+                limit=safe_limit,
+            )
+            return [
+                str(record["name"]).strip()
+                for record in result
+                if str(record.get("name") or "").strip()
+            ]
+
+    def get_neighborhood_stats(self, entity_name: str) -> tuple[int, float]:
+        """Return the 1-hop neighborhood count and average relationship strength."""
+        normalized = self._normalize_name(entity_name)
+        if not normalized:
+            return 0, 0.0
+
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) = $name
+                   OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = $name)
+                OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
+                RETURN count(DISTINCT neighbor) AS neighbor_count,
+                       avg(coalesce(r.strength, r.confidence, 0.5)) AS avg_strength
+                """,
+                name=normalized,
+            ).single()
+        if record is None:
+            return 0, 0.0
+        return int(record["neighbor_count"] or 0), float(record["avg_strength"] or 0.0)
+
+    def get_path_distance(self, from_name: str, to_name: str, max_hops: int = 2) -> int | None:
+        """Return the shortest path length between two entities, if reachable."""
+        from_normalized = self._normalize_name(from_name)
+        to_normalized = self._normalize_name(to_name)
+        if not from_normalized or not to_normalized:
+            return None
+
+        safe_hops = max(1, int(max_hops))
+        with self.driver.session() as session:
+            record = session.run(
+                f"""
+                MATCH p = shortestPath((a:Entity)-[*1..{safe_hops}]-(b:Entity))
+                WHERE (toLower(a.name) = $from_name
+                    OR ANY(al IN coalesce(a.aliases, []) WHERE toLower(al) = $from_name))
+                  AND (toLower(b.name) = $to_name
+                    OR ANY(bl IN coalesce(b.aliases, []) WHERE toLower(bl) = $to_name))
+                RETURN length(p) AS dist
+                LIMIT 1
+                """,
+                from_name=from_normalized,
+                to_name=to_normalized,
+            ).single()
+        if record is None:
+            return None
+        value = record.get("dist")
+        return int(value) if value is not None else None
+
+    def incomplete_episode_count(self) -> int:
+        """Return the number of episodes still marked incomplete."""
+        with self.driver.session() as session:
+            record = session.run(
+                "MATCH (ep:Episode {incomplete: true}) RETURN count(ep) AS n"
+            ).single()
+        return int(record["n"]) if record else 0
+
+    def get_entity_type_distribution(self) -> dict[str, int]:
+        """Return entity counts grouped by entity_type."""
+        with self.driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (e:Entity)
+                RETURN coalesce(e.entity_type, 'Unknown') AS entity_type,
+                       count(e) AS count
+                """
+            )
+            return {
+                str(row["entity_type"] or "Unknown"): int(row["count"] or 0)
+                for row in rows
+            }
+
     def get_current_facts(self, entity_name: str, as_of: Optional[datetime] = None) -> List[Dict]:
         """
         Get facts about an entity that are valid at a specific time.
