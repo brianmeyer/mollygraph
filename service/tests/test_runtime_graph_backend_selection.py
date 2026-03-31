@@ -17,6 +17,8 @@ def test_require_graph_instance_selects_ladybug_backend(monkeypatch, tmp_path):
     runtime_graph.set_graph_instance(None)
     monkeypatch.setattr(config, "GRAPH_BACKEND", "ladybug")
     monkeypatch.setattr(config, "LADYBUG_GRAPH_DB_PATH", tmp_path / "graph.lbug")
+    monkeypatch.setattr(runtime_graph.config, "GRAPH_BACKEND", "ladybug")
+    monkeypatch.setattr(runtime_graph.config, "LADYBUG_GRAPH_DB_PATH", tmp_path / "graph.lbug")
 
     graph = runtime_graph.require_graph_instance()
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from http import HTTPStatus
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import config
 from api.deps import ErrorResponse, verify_api_key
@@ -157,6 +159,42 @@ def _remove_pid_file() -> None:
         log.warning("Failed to remove PID file %s: %s", _PID_FILE, exc)
 
 
+def _build_operator_advisories(
+    *,
+    queue_pending: int,
+    queue_processing: int,
+    queue_stuck: int,
+    queue_dead: int,
+    queue_max_concurrent: int,
+) -> list[str]:
+    advisories: list[str] = []
+
+    if queue_processing > 0 or queue_pending > 0:
+        advisories.append(
+            "Extraction work is already in flight. Avoid starting another "
+            "MollyGraph or model-heavy local test on this machine until the "
+            "queue drains."
+        )
+    if queue_stuck > 0:
+        advisories.append(
+            f"{queue_stuck} stuck extraction job(s) were detected. Recover or "
+            "clear them before stacking another local run."
+        )
+    if queue_dead > 0:
+        advisories.append(
+            f"{queue_dead} dead extraction job(s) are present. Reconcile them "
+            "before trusting new local test results."
+        )
+    if queue_max_concurrent > 1:
+        advisories.append(
+            f"Queue concurrency is set to {queue_max_concurrent}. For laptop "
+            "safety, keep MOLLYGRAPH_QUEUE_MAX_CONCURRENT=1 unless you really "
+            "want to trade stability for throughput."
+        )
+
+    return advisories
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global _worker_task, _worker_restart_count
@@ -207,11 +245,34 @@ async def lifespan(_app: FastAPI):
 
     queue = ExtractionQueue()
     set_queue_instance(queue)
+    try:
+        recovered_stale_jobs = await asyncio.to_thread(queue.recover_stale_jobs)
+        if recovered_stale_jobs:
+            log.warning(
+                "Startup: recovered %d stale queue job(s) left behind by a prior crash",
+                recovered_stale_jobs,
+            )
+    except Exception:
+        log.warning("Startup stale-queue recovery failed (non-fatal)", exc_info=True)
+
+    startup_advisories = _build_operator_advisories(
+        queue_pending=queue.get_pending_count(),
+        queue_processing=queue.get_processing_count(),
+        queue_stuck=queue.get_stuck_count(),
+        queue_dead=queue.get_dead_count(),
+        queue_max_concurrent=config.QUEUE_MAX_CONCURRENT,
+    )
+    for advisory in startup_advisories:
+        log.warning("Operator advisory: %s", advisory)
 
     async def process_job(job: ExtractionJob) -> ExtractionJob:
         return await pipeline.process_job(job)
 
-    queue_worker = QueueWorker(queue=queue, processor=process_job, max_concurrent=3)
+    queue_worker = QueueWorker(
+        queue=queue,
+        processor=process_job,
+        max_concurrent=config.QUEUE_MAX_CONCURRENT,
+    )
     _worker_task = asyncio.create_task(queue_worker.start())
 
     # Reconcile incomplete episodes from a previous crash.
@@ -285,17 +346,20 @@ async def global_exception_handler(_request: Request, exc: Exception):
     )
 
 
-@app.exception_handler(Exception)
-async def http_exception_handler_compat(_request: Request, exc: Exception):
-    # Import here to avoid circular import at module level
-    from fastapi import HTTPException
-    if not isinstance(exc, HTTPException):
-        raise exc
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler_compat(_request: Request, exc: StarletteHTTPException):
+    detail = str(exc.detail).strip() if exc.detail is not None else ""
+    if not detail:
+        try:
+            detail = HTTPStatus(exc.status_code).phrase
+        except ValueError:
+            detail = "HTTP error"
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
-            error=str(exc.detail),
+            error=detail,
             code=f"HTTP_{exc.status_code}",
+            detail=detail,
             timestamp=datetime.now(UTC).isoformat(),
         ).model_dump(),
     )
@@ -310,6 +374,13 @@ async def health() -> dict[str, Any]:
     queue_processing = await asyncio.to_thread(queue.get_processing_count) if queue else 0
     queue_stuck = await asyncio.to_thread(queue.get_stuck_count) if queue else 0
     queue_dead = await asyncio.to_thread(queue.get_dead_count) if queue else 0
+    operator_advisories = _build_operator_advisories(
+        queue_pending=queue_pending,
+        queue_processing=queue_processing,
+        queue_stuck=queue_stuck,
+        queue_dead=queue_dead,
+        queue_max_concurrent=config.QUEUE_MAX_CONCURRENT,
+    )
 
     from runtime_vector_store import get_vector_store_instance as _gvs
     vector_store = _gvs()
@@ -343,7 +414,11 @@ async def health() -> dict[str, Any]:
                 async def _process(_job: _EJ) -> _EJ:
                     return await _pipeline.process_job(_job)
 
-                _qw = _QW(queue=_queue_local, processor=_process, max_concurrent=3)
+                _qw = _QW(
+                    queue=_queue_local,
+                    processor=_process,
+                    max_concurrent=config.QUEUE_MAX_CONCURRENT,
+                )
                 _worker_task = asyncio.create_task(_qw.start())
                 _worker_restart_count += 1
                 worker_status = "restarting"
@@ -373,6 +448,7 @@ async def health() -> dict[str, Any]:
         "queue_processing": queue_processing,
         "queue_stuck": queue_stuck,
         "queue_dead": queue_dead,
+        "operator_advisories": operator_advisories,
         "vector_stats": vector_store.get_stats() if vector_store else {},
         "vector_degraded": vector_degraded,
         "worker_status": worker_status,

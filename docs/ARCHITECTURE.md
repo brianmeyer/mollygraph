@@ -27,14 +27,14 @@ For product framing, use [README.md](/Users/brianmeyer/mollygraph/README.md). Fo
 6. Entities are embedded and written to the active vector backend.
 7. Query surfaces merge graph lookup and vector similarity results.
 
-## Why the current Ladybug runtime uses two files
+## Why the default Ladybug runtime uses two files
 
 At the moment the graph and vector layers use separate Ladybug database files by default:
 
 - graph: `MOLLYGRAPH_LADYBUG_GRAPH_DB`
 - vector: `MOLLYGRAPH_LADYBUG_VECTOR_DB`
 
-This keeps the runtime simple and safe while we finish the shared-runtime refactor. The long-term goal is a cleaner unified Ladybug-backed memory core, but the current setup is already fully local-first.
+This keeps the runtime simple and predictable. A shared Ladybug runtime may still make sense later, but the current split is already the supported local-first path.
 
 ## Experimental layers
 

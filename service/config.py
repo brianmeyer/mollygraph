@@ -20,6 +20,10 @@ STATE_FILE        = GRAPH_MEMORY_DIR / "state.json"
 QUEUE_DB_PATH     = Path(
     os.environ.get("MOLLYGRAPH_QUEUE_DB", str(GRAPH_MEMORY_DIR / "extraction_queue.db"))
 ).expanduser()
+QUEUE_MAX_CONCURRENT = max(
+    1,
+    int(os.environ.get("MOLLYGRAPH_QUEUE_MAX_CONCURRENT", "1")),
+)
 SQLITE_VEC_DB_PATH = Path(
     os.environ.get("MOLLYGRAPH_SQLITE_VEC_DB", str(GRAPH_MEMORY_DIR / "vectors.db"))
 ).expanduser()

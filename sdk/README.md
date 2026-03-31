@@ -12,13 +12,13 @@ The default product path is a local-first graph memory service:
 ## Install
 
 ```bash
-pip install mollygraph-sdk
+pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk"
 ```
 
-From source:
+The package is currently documented for source installation. If you are working from a local clone, you can also install it from the repo with:
 
 ```bash
-pip install "git+https://github.com/brianmeyer/mollygraph.git#subdirectory=sdk"
+pip install -e sdk
 ```
 
 ## Python SDK quickstart
@@ -43,7 +43,7 @@ client.close()
 Install the MCP extra:
 
 ```bash
-pip install "mollygraph-sdk[mcp]"
+pip install -e "sdk[mcp]"
 ```
 
 Run the MCP server over stdio:
@@ -62,11 +62,11 @@ Default MCP tools:
 - `delete_entity`
 - `prune_entities`
 
-Experimental MCP tools like audit and training are only exposed when the runtime is configured for the older experimental surface.
+Optional audit and training tools are only exposed when the running backend reports support for them.
 
 ## Advanced operations
 
-Embedding-provider switching and reindexing are available, but they are advanced operations rather than the default onboarding path:
+Embedding-provider switching and reindexing are available, but they are operator tasks rather than the default onboarding path:
 
 ```python
 client.get_embedding_config()
@@ -76,4 +76,4 @@ client.set_embedding_provider("sentence-transformers", "Snowflake/snowflake-arct
 client.reindex_embeddings(limit=5000, dry_run=False)
 ```
 
-The recommended path is still the local core: ingest, query, inspect entity context, and keep the runtime healthy. Experimental admin surfaces remain available through the service when you are explicitly working on those flows.
+The recommended path is the local core: ingest, query, inspect entity context, and keep the runtime healthy. Experimental admin surfaces remain available through the service only when you are explicitly working on those flows.

@@ -5,6 +5,7 @@ import sys
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 _HERE = Path(__file__).parent
 _SERVICE_ROOT = _HERE.parent
@@ -46,3 +47,8 @@ def test_default_openapi_shows_core_surface_and_hides_experimental_routes():
     assert "/maintenance/run" not in paths
     assert "/maintenance/nightly" not in paths
     assert "/extractors/config" not in paths
+
+
+def test_main_app_registers_http_exception_handler_separately():
+    assert main.app.exception_handlers[Exception] is main.global_exception_handler
+    assert main.app.exception_handlers[StarletteHTTPException] is main.http_exception_handler_compat

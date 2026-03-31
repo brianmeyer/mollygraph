@@ -168,19 +168,86 @@ class LadybugVectorBackend(VectorStoreBackend):
         except OSError:
             log.debug("Unable to persist Ladybug embedding metadata", exc_info=True)
 
+    def _wal_path(self) -> Path:
+        return Path(f"{self.db_path}.wal")
+
+    def _quarantine_path(self, path: Path, suffix: str) -> Path | None:
+        if not path.exists():
+            return None
+        stamp = int(time.time() * 1000)
+        backup = path.with_name(f"{path.name}.{suffix}-{stamp}")
+        path.replace(backup)
+        return backup
+
+    def _open_database(self) -> None:
+        self.db = ladybug.Database(str(self.db_path))
+        self.conn = ladybug.Connection(self.db)
+        try:
+            self.conn.execute("INSTALL vector;")
+        except Exception:
+            log.debug("Ladybug vector extension install skipped", exc_info=True)
+        self.conn.execute("LOAD vector;")
+        self._ensure_schema()
+        self._ensure_index()
+        self._persist_embedding_dimension()
+
+    def _recover_from_wal_corruption(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        wal_path = self._wal_path()
+        if "wal" not in message and "corrupt" not in message:
+            return False
+        if not wal_path.exists():
+            return False
+
+        try:
+            backup = self._quarantine_path(wal_path, "corrupt")
+            self.db = None
+            self.conn = None
+            self._open_database()
+            log.warning(
+                "Recovered Ladybug vector backend by quarantining corrupt WAL: %s",
+                backup,
+            )
+            self._degraded_reason = None
+            return True
+        except Exception:
+            log.warning("Ladybug WAL recovery failed", exc_info=True)
+            return False
+
+    def _rebuild_empty_store(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        if "wal" not in message and "corrupt" not in message:
+            return False
+        if not self.db_path.exists():
+            return False
+
+        try:
+            backups: list[Path] = []
+            for candidate in [self.db_path, self._wal_path()]:
+                backup = self._quarantine_path(candidate, "rebuild")
+                if backup is not None:
+                    backups.append(backup)
+            self.db = None
+            self.conn = None
+            self._open_database()
+            log.warning(
+                "Rebuilt Ladybug vector backend after corruption; backed up files: %s",
+                ", ".join(str(path) for path in backups) or "(none)",
+            )
+            self._degraded_reason = None
+            return True
+        except Exception:
+            log.warning("Ladybug vector rebuild failed", exc_info=True)
+            return False
+
     def _init_database(self) -> None:
         try:
-            self.db = ladybug.Database(str(self.db_path))
-            self.conn = ladybug.Connection(self.db)
-            try:
-                self.conn.execute("INSTALL vector;")
-            except Exception:
-                log.debug("Ladybug vector extension install skipped", exc_info=True)
-            self.conn.execute("LOAD vector;")
-            self._ensure_schema()
-            self._ensure_index()
-            self._persist_embedding_dimension()
+            self._open_database()
         except Exception as exc:
+            if self._recover_from_wal_corruption(exc):
+                return
+            if self._rebuild_empty_store(exc):
+                return
             self._degraded_reason = str(exc)
             self.db = None
             self.conn = None

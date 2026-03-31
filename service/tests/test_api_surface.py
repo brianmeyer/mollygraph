@@ -41,3 +41,31 @@ def test_default_app_reports_graph_capabilities():
     assert health["graph_backend"] == "ladybug"
     assert "core_memory" in health["graph_capabilities"]
     assert "decisions" not in health["graph_capabilities"]
+
+
+def test_default_app_exposes_operator_advisories_for_busy_queue(monkeypatch):
+    class _BusyQueue:
+        def get_pending_count(self):
+            return 2
+
+        def get_processing_count(self):
+            return 1
+
+        def get_stuck_count(self):
+            return 1
+
+        def get_dead_count(self):
+            return 0
+
+    class _HealthyTask:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(main, "get_queue_instance", lambda: _BusyQueue())
+    monkeypatch.setattr(main, "_worker_task", _HealthyTask())
+    monkeypatch.setattr(main.config, "QUEUE_MAX_CONCURRENT", 1)
+
+    health = main.asyncio.run(main.health())
+
+    assert health["operator_advisories"]
+    assert any("starting another" in advisory.lower() for advisory in health["operator_advisories"])

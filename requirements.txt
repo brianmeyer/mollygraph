@@ -9,12 +9,15 @@ python-dotenv==1.*
 pyyaml==6.*
 gliner2
 glirel
+loguru==0.7.*
 zvec
 sqlite-vec
 numpy
 spacy<3.9
 torch
 transformers
+sentence-transformers
+loguru
 peft
 accelerate
 datasets

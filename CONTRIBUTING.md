@@ -10,7 +10,8 @@ Use [docs/DOCS_MAP.md](/Users/brianmeyer/mollygraph/docs/DOCS_MAP.md) first so y
 ./scripts/install.sh
 ```
 
-This creates `service/.venv` and bootstraps `service/.env` from the example file if needed.
+This creates `service/.venv`, pins it to Python `3.12`, and bootstraps `service/.env` from the example file if needed.
+If `python3.12` is not already installed, the script can use `uv` to provision it.
 
 2. Configure the service if you want to change defaults:
 
@@ -24,17 +25,17 @@ $EDITOR service/.env
 ./scripts/start.sh
 ```
 
-Neo4j is optional now. It is only needed if you are explicitly working on legacy or experimental surfaces that still depend on the old backend.
+Neo4j is optional and only needed if you are explicitly working on legacy or experimental surfaces that still depend on the old backend.
 
 ## Test
 
-Use the project service venv when possible:
+Use the project service venv:
 
 ```bash
 service/.venv/bin/python -m pytest -q
 ```
 
-That root command now runs both `tests/` and `service/tests/`.
+That root command runs both `tests/` and `service/tests/`.
 
 Useful focused runs:
 

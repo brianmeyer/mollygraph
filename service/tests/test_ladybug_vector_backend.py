@@ -244,6 +244,40 @@ def test_ladybug_backend_upsert_replaces_indexed_embeddings(tmp_path):
     assert old_direction[0]["entity_id"] == "e2"
 
 
+def test_ladybug_backend_recovers_from_corrupt_wal(tmp_path):
+    db_path = tmp_path / "recoverable.lbug"
+
+    backend = LadybugVectorBackend(db_path)
+    backend.add_entity(
+        "e1",
+        "Alice",
+        "Person",
+        [1.0, 0.0, 0.0, 0.0],
+        "Alice before restart",
+    )
+    backend.conn.close()
+
+    wal_path = Path(f"{db_path}.wal")
+    wal_path.write_bytes(b"corrupt-wal")
+
+    recovered = LadybugVectorBackend(db_path)
+
+    assert recovered.degraded is False
+    assert not wal_path.exists() or wal_path.read_bytes() != b"corrupt-wal"
+    assert list(tmp_path.glob("recoverable.lbug.wal.corrupt-*"))
+
+    recovered.add_entity(
+        "e2",
+        "Bob",
+        "Person",
+        [0.0, 1.0, 0.0, 0.0],
+        "Bob after recovery",
+    )
+    ids = recovered.list_all_entity_ids()
+    assert ids is not None
+    assert "e2" in ids
+
+
 def test_vector_store_can_select_ladybug_backend(tmp_path):
     store = VectorStore(backend="ladybug", db_path=tmp_path / "wrapper.lbug")
 

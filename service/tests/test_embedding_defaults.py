@@ -45,6 +45,63 @@ def test_embedding_registry_defaults_to_snowflake(monkeypatch):
     assert registry["models"]["ollama"][0] == "nomic-embed-text"
 
 
+def test_sentence_transformer_tier_loads_without_default_task_model_kwargs(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeSentenceTransformer:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        types.SimpleNamespace(SentenceTransformer=_FakeSentenceTransformer),
+    )
+    monkeypatch.setattr(config, "EMBEDDING_ST_MODEL", "", raising=False)
+    monkeypatch.setattr(config, "EMBEDDING_MODEL", "", raising=False)
+    monkeypatch.setattr(ExtractionPipeline, "_embedding_model", None, raising=False)
+    monkeypatch.setattr(ExtractionPipeline, "_embedding_active_tier", None, raising=False)
+    monkeypatch.setattr(ExtractionPipeline, "_embedding_failed_tiers", set(), raising=False)
+
+    assert ExtractionPipeline._try_load_tier("sentence-transformers") is True
+    assert captured["args"] == (config.DEFAULT_LOCAL_EMBEDDING_MODEL,)
+    assert captured["kwargs"] == {"trust_remote_code": True}
+
+
+def test_text_embedding_retries_without_prompt_name_if_model_rejects_it(monkeypatch):
+    class _FakeVector:
+        def __init__(self, values: list[float]):
+            self._values = values
+
+        def tolist(self) -> list[float]:
+            return list(self._values)
+
+    class _FakeModel:
+        def __init__(self):
+            self.calls: list[dict[str, object]] = []
+
+        def encode(self, text: str, **kwargs):
+            self.calls.append({"text": text, **kwargs})
+            if kwargs.get("prompt_name") == "query":
+                raise TypeError("unexpected keyword argument 'prompt_name'")
+            return _FakeVector([0.25, 0.75])
+
+    fake_model = _FakeModel()
+    monkeypatch.setattr(ExtractionPipeline, "_embedding_model", fake_model, raising=False)
+    monkeypatch.setattr(ExtractionPipeline, "_embedding_active_tier", "sentence-transformers", raising=False)
+    monkeypatch.setattr(ExtractionPipeline, "_embedding_failed_tiers", set(), raising=False)
+
+    vec = ExtractionPipeline._text_embedding("Where does Alice work?", prompt_name="query")
+
+    assert vec == [0.25, 0.75]
+    assert fake_model.calls[0]["prompt_name"] == "query"
+    assert fake_model.calls[1] == {
+        "text": "Where does Alice work?",
+        "normalize_embeddings": True,
+    }
+
+
 def test_sqlite_vec_backend_preserves_legacy_dimension_and_normalizes_queries(tmp_path, monkeypatch):
     pytest.importorskip("sqlite_vec")
 

@@ -123,6 +123,32 @@ class ExtractionQueue:
     _STUCK_JOB_TIMEOUT_SECONDS: int = 300   # jobs processing > 5 min are considered stuck
     _MAX_RETRIES: int = 3                    # jobs retried ≥ this many times become 'dead'
 
+    def recover_stale_jobs(self) -> int:
+        """Requeue or dead-letter stale processing jobs left behind by a crash.
+
+        Timestamps are stored as ISO8601 strings with ``T`` separators and
+        timezone offsets, so comparisons must parse them via SQLite's
+        ``datetime()`` helper instead of relying on raw text ordering.
+        """
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = conn.execute(
+                """
+                UPDATE jobs
+                SET status = CASE
+                        WHEN COALESCE(retry_count, 0) + 1 >= ? THEN 'dead'
+                        ELSE 'pending'
+                    END,
+                    retry_count = COALESCE(retry_count, 0) + 1
+                WHERE status = 'processing'
+                  AND started_at IS NOT NULL
+                  AND datetime(started_at) < datetime('now', '-' || ? || ' seconds')
+                """,
+                (self._MAX_RETRIES, self._STUCK_JOB_TIMEOUT_SECONDS),
+            )
+            conn.commit()
+            return int(result.rowcount or 0)
+
     def claim_next(self, timeout: float = 5.0) -> Optional[ExtractionJob]:
         """
         Atomically claim the next pending job.
@@ -135,27 +161,14 @@ class ExtractionQueue:
         """
         with self._get_conn() as conn:
             # ── Step 1: Reset stuck processing jobs ──────────────────────────
-            conn.execute("BEGIN IMMEDIATE")
             try:
-                result = conn.execute("""
-                    UPDATE jobs
-                    SET status = CASE
-                            WHEN COALESCE(retry_count, 0) + 1 >= ? THEN 'dead'
-                            ELSE 'pending'
-                        END,
-                        retry_count = COALESCE(retry_count, 0) + 1
-                    WHERE status = 'processing'
-                      AND started_at IS NOT NULL
-                      AND started_at < datetime('now', '-' || ? || ' seconds')
-                """, (self._MAX_RETRIES, self._STUCK_JOB_TIMEOUT_SECONDS))
-                if result.rowcount:
+                recovered = self.recover_stale_jobs()
+                if recovered:
                     log.warning(
                         "Reset %d stuck processing job(s) (timeout=%ds, max_retries=%d)",
-                        result.rowcount, self._STUCK_JOB_TIMEOUT_SECONDS, self._MAX_RETRIES,
+                        recovered, self._STUCK_JOB_TIMEOUT_SECONDS, self._MAX_RETRIES,
                     )
-                conn.commit()
             except Exception as e:
-                conn.rollback()
                 log.warning("Failed to reset stuck jobs: %s", e)
 
             # ── Step 2: Claim the next pending job ────────────────────────────
@@ -243,7 +256,7 @@ class ExtractionQueue:
                 SELECT COUNT(*) FROM jobs
                 WHERE status = 'processing'
                   AND started_at IS NOT NULL
-                  AND started_at < datetime('now', '-' || ? || ' seconds')
+                  AND datetime(started_at) < datetime('now', '-' || ? || ' seconds')
                 """,
                 (self._STUCK_JOB_TIMEOUT_SECONDS,),
             )
@@ -274,7 +287,8 @@ class ExtractionQueue:
             conn.execute("""
                 DELETE FROM jobs 
                 WHERE status IN ('completed', 'failed')
-                AND completed_at < datetime('now', '-{} days')
+                AND completed_at IS NOT NULL
+                AND datetime(completed_at) < datetime('now', '-{} days')
             """.format(days))
             conn.commit()
             

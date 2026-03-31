@@ -1,16 +1,16 @@
 # Decision Traces — Later-Phase Context Graph Extension
 
 Status:
-- experimental, later-phase plan
+- later-phase plan
 - not part of the default Ladybug local memory core
-- current service behavior keeps decision traces gated or disabled on the default backend
+- service behavior keeps decision traces gated or disabled on the default backend
 
 ## Inspiration
 [Foundation Capital: Context Graphs — AI's Trillion-Dollar Opportunity](https://foundationcapital.com/context-graphs-ais-trillion-dollar-opportunity/)
 
 **Core thesis:** MollyGraph can eventually store decisions as first-class graph data, but the default product stays focused on local memory, retrieval, and extraction.
 
-## What MollyGraph Has Today
+## Current Capabilities
 
 | Capability | Status |
 |---|---|
@@ -21,21 +21,21 @@ Status:
 | Cross-system ingestion | ✅ Email, conversations, calendar |
 | Audit trail for schema changes | ✅ Optional adoption pipeline with gates |
 
-## What's Missing: Decision Traces
+## What Decision Traces Would Add
 
-Episodes capture *what* was ingested but not *why decisions were made*. A decision trace is a future node type that could capture:
+Episodes capture *what* was ingested but not *why decisions were made*. A decision trace could capture:
 
 ```
 DecisionTrace {
   id: uuid
   timestamp: datetime
-  decision: "Switched embedding model to Snowflake Arctic Embed S"
-  reasoning: "ungated, local-first, simpler runtime defaults"
-  alternatives_considered: ["nomic-embed-text", "BAAI/bge-small-en-v1.5", "keep current model"]
-  inputs: ["MTEB benchmarks", "model size constraints", "Mac Mini M4 16GB"]
-  outcome: "Reindexed 903 entities, 0 failures"
-  decided_by: "Brian"  
-  approved_by: "Brian"
+  decision: "Adopt a smaller local embedding model"
+  reasoning: "lower setup friction and more predictable local runtime behavior"
+  alternatives_considered: ["keep the current model", "use an Ollama-only path", "use a larger multilingual model"]
+  inputs: ["local benchmark notes", "hardware limits", "install complexity"]
+  outcome: "embedding backend updated and local index rebuilt"
+  decided_by: "operator"
+  approved_by: "maintainer"
   precedent_cited: null
   source_episode: episode_id
   confidence: 0.95
@@ -55,7 +55,7 @@ DecisionTrace {
   - "I decided to..."
   - "We should use X instead of Y"
   - "Approved" / "Let's do it" / "Ship it"
-- Use a classifier only if the decision feature is worth the added complexity
+- Use a classifier only if the feature is worth the added complexity
 - Create Decision nodes alongside regular entity/relationship extraction
 
 ### Phase 3: Precedent Search (2 days)  
@@ -74,18 +74,20 @@ DecisionTrace {
 3. **Onboarding context** — New team members can see WHY things are the way they are
 4. **Agent autonomy** — AI agent can reference past decisions to make similar ones without asking
 
-## Competitive Edge
+## Positioning Hypothesis
 
-No open-source graph memory system has decision traces:
-- **Mem0**: User preferences only, no decision history
-- **Graphiti**: Temporal knowledge, no decision modeling
-- **LightRAG**: Static extraction, no temporal or decision layer
-- **Tiny-GraphRAG**: GLiNER+GLiREL extraction, no decision concept
+Decision traces could become a meaningful differentiator if MollyGraph eventually treats decisions as first-class graph data instead of only storing facts and episodes.
 
-Decision traces are one possible differentiator for MollyGraph, but they do not define the default product.
+Comparable systems to re-check when this work becomes active:
+- **Mem0**
+- **Graphiti**
+- **LightRAG**
+- **Tiny-GraphRAG**
+
+Re-evaluate the landscape before treating this as a durable differentiator.
 
 ## Open Questions
 - Should decisions be extracted from ALL sources or only conversations?
 - How to handle decisions that get reversed later?
-- Should the audit LLM or a dedicated classifier detect decisions?
+- Should a lightweight classifier or a dedicated extractor detect decisions?
 - What's the minimum viable decision trace? (just decision + timestamp + who?)

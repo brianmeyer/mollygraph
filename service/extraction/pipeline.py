@@ -333,7 +333,7 @@ class ExtractionPipeline:
 
     def vector_search(self, query: str, top_k: int = 10):
         """Proxy to vector store search."""
-        embedding = self._text_embedding(query)
+        embedding = self._text_embedding(query, prompt_name="query")
         return self.vector_store.similarity_search(embedding, top_k=top_k)
 
     async def _maybe_record_decision_trace(
@@ -580,7 +580,10 @@ class ExtractionPipeline:
                 embedding = None  # always bound; stays None if _text_embedding raises
                 _embed_start = time.perf_counter()
                 try:
-                    embedding = self._text_embedding(f"{entity.name} {entity.entity_type} {job.content[:200]}")
+                    embedding = await asyncio.to_thread(
+                        self._text_embedding,
+                        f"{entity.name} {entity.entity_type} {job.content[:200]}",
+                    )
                 except Exception:
                     log.debug(
                         "Embedding failed for entity %s — skipping vector upsert",
@@ -634,9 +637,18 @@ class ExtractionPipeline:
                     # head entity does not match the message speaker.  This is
                     # the primary mitigation for anchor-entity over-attribution.
                     if speaker:
+                        glirel_entity_type_map = {
+                            self._normalize(str(entity.get("text") or entity.get("name") or "").strip()):
+                            str(entity.get("label") or entity.get("entity_type") or "").strip()
+                            for entity in raw_entities
+                            if isinstance(entity, dict)
+                            and str(entity.get("text") or entity.get("name") or "").strip()
+                        }
                         _pre_filter_count = len(glirel_relations)
                         glirel_relations = self._filter_speaker_relations(
-                            glirel_relations, speaker
+                            glirel_relations,
+                            speaker,
+                            entity_type_map=glirel_entity_type_map,
                         )
                         _dropped = _pre_filter_count - len(glirel_relations)
                         if _dropped:
@@ -791,7 +803,10 @@ class ExtractionPipeline:
                 import re as _re
                 _episode_embed_start = time.perf_counter()
                 try:
-                    ep_embedding = self._text_embedding(job.content[:512])
+                    ep_embedding = await asyncio.to_thread(
+                        self._text_embedding,
+                        job.content[:512],
+                    )
                 finally:
                     embedding_time_ms += (time.perf_counter() - _episode_embed_start) * 1000
                 ep_slug = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"ep_{_episode_id}")
@@ -1214,6 +1229,55 @@ class ExtractionPipeline:
             return True
 
         return False
+
+    def _filter_speaker_relations(
+        self,
+        relations: list[dict[str, Any]],
+        speaker: str,
+        entity_type_map: "dict[str, str] | None" = None,
+    ) -> list[dict[str, Any]]:
+        """Filter GLiREL anchor-style relations around the active speaker.
+
+        Rules for employment/hierarchy relations:
+        - First-person or speaker-name heads are normalized to the speaker.
+        - If the speaker appears as the tail, reverse so the speaker is head.
+        - Third-party person facts remain untouched.
+        - Concept/non-person heads are dropped as likely attribution pollution.
+        """
+        speaker_name = speaker.strip()
+        if not speaker_name:
+            return relations
+
+        filtered: list[dict[str, Any]] = []
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+
+            rel_type = str(relation.get("label") or relation.get("rel_type") or "").strip().upper()
+            head = str(relation.get("head") or "").strip()
+            tail = str(relation.get("tail") or "").strip()
+
+            if not head or not tail:
+                continue
+
+            if rel_type not in self._SPEAKER_ANCHOR_REL_TYPES:
+                filtered.append(relation)
+                continue
+
+            if self._speaker_matches_entity(speaker_name, head):
+                if self._speaker_matches_entity(speaker_name, tail):
+                    continue
+                filtered.append({**relation, "head": speaker_name})
+                continue
+
+            if self._speaker_matches_entity(speaker_name, tail):
+                filtered.append({**relation, "head": speaker_name, "tail": head})
+                continue
+
+            if not self._is_concept_entity(head, entity_type_map):
+                filtered.append(relation)
+
+        return filtered
 
     # ── Per-message chunking for GLiREL ──────────────────────────────────────
 
@@ -1823,7 +1887,6 @@ class ExtractionPipeline:
                 cls._embedding_model = SentenceTransformer(
                     model_name,
                     trust_remote_code=True,
-                    model_kwargs={"default_task": "retrieval"},
                 )
                 cls._embedding_active_tier = tier
                 log.info("Embedding tier '%s' loaded: %s", tier, model_name)
@@ -1955,6 +2018,8 @@ class ExtractionPipeline:
         text: str,
         dim: int = getattr(service_config, "EMBEDDING_VECTOR_DIMENSION", 384),
         _depth: int = 0,
+        *,
+        prompt_name: str | None = None,
     ) -> list[float]:
         """Embed text using the configured tier chain (sentence-transformers / ollama / cloud / hash).
 
@@ -1993,7 +2058,7 @@ class ExtractionPipeline:
                 log.warning("Ollama embedding call failed: %s — marking tier failed, trying next", exc)
                 cls._embedding_model = None
                 cls._embedding_failed_tiers.add("ollama")
-                return cls._text_embedding(text, dim, _depth + 1)
+                return cls._text_embedding(text, dim, _depth + 1, prompt_name=prompt_name)
 
         if isinstance(model, str) and model.startswith("cloud:"):
             _, provider, cloud_model = model.split(":", 2)
@@ -2017,12 +2082,24 @@ class ExtractionPipeline:
                 log.warning("Cloud embedding (%s) call failed: %s — marking tier failed, trying next", provider, exc)
                 cls._embedding_model = None
                 cls._embedding_failed_tiers.add("cloud")
-                return cls._text_embedding(text, dim, _depth + 1)
+                return cls._text_embedding(text, dim, _depth + 1, prompt_name=prompt_name)
 
         if model != "hash":
             # sentence-transformers model object
             try:
-                vec = model.encode(text, normalize_embeddings=True).tolist()
+                encode_kwargs: dict[str, Any] = {"normalize_embeddings": True}
+                if prompt_name:
+                    encode_kwargs["prompt_name"] = prompt_name
+                try:
+                    vec = model.encode(text, **encode_kwargs).tolist()
+                except TypeError:
+                    if not prompt_name:
+                        raise
+                    log.info(
+                        "Embedding model rejected prompt_name=%s; retrying without it",
+                        prompt_name,
+                    )
+                    vec = model.encode(text, normalize_embeddings=True).tolist()
                 return vec
             except Exception as exc:
                 log.warning(
@@ -2030,7 +2107,7 @@ class ExtractionPipeline:
                 )
                 cls._embedding_model = None
                 cls._embedding_failed_tiers.add(cls._embedding_active_tier or "sentence-transformers")
-                return cls._text_embedding(text, dim, _depth + 1)
+                return cls._text_embedding(text, dim, _depth + 1, prompt_name=prompt_name)
 
         # Hash fallback — deterministic, never fails
         tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())

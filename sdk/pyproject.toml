@@ -7,7 +7,7 @@ name = "mollygraph-sdk"
 version = "1.0.0"
 description = "Python SDK and MCP adapter for MollyGraph"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
   "httpx>=0.28,<0.29",
 ]

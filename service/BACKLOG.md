@@ -14,7 +14,7 @@ Use [docs/DOCS_MAP.md](/Users/brianmeyer/mollygraph/docs/DOCS_MAP.md) before tre
 
 ## Default local core
 
-This is the product MollyGraph is building now:
+This is the product MollyGraph is building:
 
 - local-first graph memory for agents
 - Ladybug graph backend
@@ -25,7 +25,7 @@ This is the product MollyGraph is building now:
 
 Everything else is secondary to this core. Audit chains, training loops, decision traces, GLiREL, and spaCy remain available as later-phase capabilities, but they are not required for the default runtime.
 
-## Completed recently
+## Completed
 
 - ✅ Snowflake local embedder is the default local path
 - ✅ Ladybug vector backend landed and tested
@@ -36,12 +36,12 @@ Everything else is secondary to this core. Audit chains, training loops, decisio
 - ✅ Ladybug core-flow API harness covering ingest -> process -> graph/vector write -> query/stats
 - ✅ root README rewritten around the local-first product story
 
-## P0 — Finish the default local core
+## P0 — Keep the default local core dependable
 
 ### 1) Local runtime install and test harness — 🔄
 - Keep the default setup boring and dependable for non-developers.
-- Normalize the expected Python/runtime path.
 - Reduce environment surprises between scripts, docs, and tests.
+- Keep `service/.venv`, `service/.env`, and the root pytest path aligned.
 
 ### 2) Shared Ladybug runtime owner — 📝
 - Decide whether graph and vector should keep separate `.lbug` files or move to one shared Ladybug-backed runtime owner.
@@ -49,7 +49,7 @@ Everything else is secondary to this core. Audit chains, training loops, decisio
 
 ### 3) Core API / MCP / SDK surface hardening — 🔄
 - Keep the default surface focused on ingest, query, entity context, cleanup, health, and stats.
-- Continue trimming legacy aliases and hiding unsupported experimental routes from the default docs.
+- Continue trimming compatibility-only surface and hiding unsupported experimental routes from the default docs.
 - Keep MCP tools aligned with the runtime capability set.
 
 ### 4) Source-routed extraction for the highest-value sources — 📝
@@ -86,9 +86,3 @@ Everything else is secondary to this core. Audit chains, training loops, decisio
 
 ### 12) GLiREL, spaCy, and extra enrichment layers — ⏸️
 - Optional quality layers, not required for the default product.
-
-## Next execution items
-
-1. Finish the docs/markdown cleanup so the repo tells one coherent story.
-2. Keep trimming the default API and MCP surface around the local core.
-3. Decide the next Ladybug storage step: shared runtime owner or keep the safe split longer.
